@@ -1,11 +1,13 @@
-//! `blockula hunt …` (bounties on GitHub issues) and `blockula contrib …` (Proof of Contribution:
-//! claims, vouches, Séance jury duty, rewards, and the Season 0 admin levers). Talks to any
-//! node's HTTP API and signs with the CLI wallet or a key file.
+//! `blockula hunt …` (bounties on GitHub issues), `blockula contrib …` (Proof of Contribution:
+//! claims, vouches, Séance jury duty, rewards, and the Season 0 admin levers), `blockula name …`
+//! (renew, transfer, release) and `blockula stake …` (delegating to validator pools). Talks to
+//! any node's HTTP API and signs with the CLI wallet or a key file.
 
-use crate::crypto::{self, Keys};
+use crate::cli_net::{ChainPin, Remote};
+use crate::crypto::Keys;
 use crate::types::*;
-use crate::validator_cli::{get, load_seed, parse_fang, rt, send_memo, wallet_keys};
-use anyhow::{anyhow, bail, Context, Result};
+use crate::validator_cli::{get, load_seed, own_address, parse_fang, rt, wallet_keys};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::Value;
 use std::io::{BufRead, IsTerminal, Write};
@@ -23,6 +25,9 @@ pub struct Signer {
     pub from: Option<String>,
     #[arg(long, default_value = "http://localhost:7070")]
     pub rpc: String,
+    /// The chain the node at --rpc must be on (WAL-4)
+    #[command(flatten)]
+    pub pin: ChainPin,
 }
 
 #[derive(Args, Clone)]
@@ -42,25 +47,58 @@ impl Signer {
     async fn from(&self, keys: &Keys) -> Result<String> {
         match &self.from {
             Some(a) => resolve(&self.rpc, a).await,
-            None => Ok(keys.address()),
+            None => own_address(&self.rpc, keys).await,
+        }
+    }
+
+    /// The node at `--rpc`, checked to be on the chain this command is for.
+    pub(crate) async fn connect(&self, dir: &Path) -> Result<Remote> {
+        Remote::connect(dir, &self.rpc, &self.pin).await
+    }
+
+    /// The account to sign for on `remote`'s chain: `--from`, or the key's own address. A name in
+    /// `--from` is resolved by the node, unproven; on mainnet that isn't enough to sign for
+    /// (audit gap-7-1): pass the address.
+    pub(crate) async fn acting_for(&self, remote: &Remote, keys: &Keys) -> Result<String> {
+        match &self.from {
+            Some(a) => from_on_chain(a, &remote.resolve(a).await?, &remote.chain_id, &remote.rpc),
+            None => Ok(remote.address(keys)),
         }
     }
 }
 
-async fn resolve(rpc: &str, who: &str) -> Result<String> {
-    if crypto::is_address(who) {
-        return Ok(who.to_string());
+/// `--from` as signed: an address as given; a name only off mainnet, where the CLI has printed
+/// the node's (unproven) answer for it. On mainnet the account every tx names must be one the
+/// user typed as an address, so one node can't pick it (audit gap-7-1).
+pub(crate) fn from_on_chain(given: &str, resolved: &str, chain_id: &str, rpc: &str) -> Result<String> {
+    if crate::crypto::is_address(given.trim()) || chain_id != crate::chain::MAINNET_CHAIN_ID {
+        return Ok(resolved.to_string());
     }
-    get(rpc, &format!("/account/{who}")).await?["account"]["address"].as_str().map(String::from).ok_or_else(|| anyhow!("can't resolve {who}"))
+    bail!("--from {given}: {rpc} says that's {resolved}, but that's one node's word, and on mainnet the CLI only signs for an account given as an address. Check the address with the account's owner and pass --from {resolved}. Nothing was signed.")
 }
 
-/// Signs and submits `action`, waits for it, and prints the summary and explorer link.
+/// An address the node resolves a name to, unproven (printed): only where an address is needed.
+async fn resolve(rpc: &str, who: &str) -> Result<String> {
+    crate::cli_net::resolve_unproven(rpc, who).await
+}
+
+/// Signs and submits `action` for the chain `s` pins, waits for it, and prints the summary and
+/// explorer link.
 fn submit(dir: &Path, s: &Signer, action: Action) -> Result<Value> {
+    submit_at(dir, s, |_, _| Ok(action))
+}
+
+/// [`submit`] for an action that carries an absolute height: `make(height, blocks_per_day)`
+/// builds it from the status read that sets `valid_until`, with the day length from the pinned
+/// genesis (audit gap-7-3).
+fn submit_at(dir: &Path, s: &Signer, make: impl FnOnce(u64, u64) -> Result<Action>) -> Result<Value> {
     let keys = s.keys(dir)?;
     let rt = rt()?;
     let tx = rt.block_on(async {
-        let from = s.from(&keys).await?;
-        send_memo(&s.rpc, &keys, &from, action, String::new()).await
+        let remote = s.connect(dir).await?;
+        let from = s.acting_for(&remote, &keys).await?;
+        let day = remote.blocks_per_day().await?;
+        crate::validator_cli::send_memo_with(&remote, &keys, &from, |height| make(height, day), String::new()).await
     })?;
     println!("✓ {}", tx["summary"].as_str().unwrap_or_default());
     println!("  {}/#/tx/{}", s.rpc.trim_end_matches('/'), tx["id"].as_str().unwrap_or_default());
@@ -71,7 +109,7 @@ fn name_of(v: &Value) -> String {
     v["name"].as_str().or(v["short"].as_str()).unwrap_or_default().to_string()
 }
 
-fn confirm(question: &str, yes: bool) -> Result<()> {
+pub(crate) fn confirm(question: &str, yes: bool) -> Result<()> {
     if yes {
         return Ok(());
     }
@@ -128,7 +166,7 @@ pub enum HuntCmd {
         #[command(flatten)]
         signer: Signer,
     },
-    /// Pay a hunt's bounty for a merged PR (the hunt's creator or a Season 0 admin). Checks on
+    /// Pay a hunt's bounty for a merged PR (only the hunt's creator can). Checks on
     /// GitHub that the PR merged into the hunt's repo, and pays the account its author linked
     /// with `link_github`, unless you name a recipient with --to.
     Award {
@@ -152,7 +190,7 @@ pub enum HuntCmd {
         #[command(flatten)]
         signer: Signer,
     },
-    /// Refund every funder (the creator after expiry, or an admin any time)
+    /// Refund every funder (the creator after expiry; on dev and test chains an admin any time)
     Cancel {
         id: u64,
         #[command(flatten)]
@@ -186,10 +224,10 @@ pub fn hunt(cmd: HuntCmd, dir: &Path) -> Result<()> {
         }
         HuntCmd::Create { repo, issue, amount, title, days, signer } => {
             check_repo(&repo)?;
-            let status = rt()?.block_on(get(&signer.rpc, "/status"))?;
-            let block_ms = status["block_time_ms"].as_u64().unwrap_or(1000).max(1);
-            let expires_at = status["height"].as_u64().unwrap_or(0) + days * 86_400_000 / block_ms;
-            submit(dir, &signer, Action::CreateHunt { repo, issue, amount: parse_fang(&amount)?, expires_at, title })?;
+            let amount = parse_fang(&amount)?;
+            // The expiry counts `days` days of the genesis's blocks from the status the tx is
+            // signed against, not a separate read or the node's block time (audit gap-7-3).
+            submit_at(dir, &signer, |height, day| Ok(Action::CreateHunt { repo, issue, amount, expires_at: height.saturating_add(days.saturating_mul(day)), title }))?;
             Ok(())
         }
         HuntCmd::Fund { id, amount, signer } => submit(dir, &signer, Action::FundHunt { hunt_id: id, amount: parse_fang(&amount)? }).map(|_| ()),
@@ -234,13 +272,18 @@ fn award(dir: &Path, id: u64, pr: u64, to: Option<String>, familiar: Option<Stri
         Some(p)
     };
     let recipient = match (&to, &pr_info) {
-        (Some(t), _) => rt.block_on(resolve(rpc, t))?,
+        // A name is signed as the name: the chain resolves it (audit gap-7-1).
+        (Some(t), _) => crate::cli_net::account_ref(t)?,
         (None, Some(p)) => {
             let link = rt.block_on(get(rpc, &format!("/github/{}", p.author))).map_err(|_| anyhow!("@{} hasn't linked a Blockula account (they can run link_github); or pass --to <name>", p.author))?;
             if link["verified"] != true {
                 bail!("@{}'s link isn't verified: {}. Pass --to to award anyway.", p.author, link["reason"].as_str().unwrap_or("unknown"));
             }
-            link["account"]["address"].as_str().map(String::from).ok_or_else(|| anyhow!("bad /api/github response"))?
+            let addr = link["account"]["address"].as_str().map(String::from).ok_or_else(|| anyhow!("bad /api/github response"))?;
+            ensure!(crate::crypto::is_address(&addr), "{rpc} linked @{} to {addr:?}, which isn't an address", p.author);
+            // The link is the node's word (audit gap-7-1): the address is printed and confirmed.
+            eprintln!("   @{} → {addr} (the account {rpc} says their GitHub link names, unproven: check the address, or pass --to)", p.author);
+            addr
         }
         (None, None) => unreachable!(),
     };
@@ -253,7 +296,7 @@ fn award(dir: &Path, id: u64, pr: u64, to: Option<String>, familiar: Option<Stri
             hit["key_id"].as_str().map(String::from)
         }
     };
-    confirm(&format!("Award {} (hunt #{id}, {repo}#{issue}) to {} for PR #{pr}{why}?", h["amount_display"].as_str().unwrap_or_default(), name_of(&acct["account"])), yes)?;
+    confirm(&format!("Award {} (hunt #{id}, {repo}#{issue}) to {} ({recipient}) for PR #{pr}{why}?", h["amount_display"].as_str().unwrap_or_default(), name_of(&acct["account"])), yes)?;
     submit(dir, signer, Action::AwardHunt { hunt_id: id, to: recipient, pr, familiar_key })?;
     Ok(())
 }
@@ -326,7 +369,9 @@ pub enum ContribCmd {
         signer: Signer,
     },
     /// Seal your judgment: one of a, b or = per pair, in order (e.g. "ab=a"). The salt is kept
-    /// in ~/.blockula/seances/ for `reveal`.
+    /// in ~/.blockula/seances/ for `reveal`. The judgment binds the pairs it was made on: pass
+    /// the pairs digest `contrib seance` printed (--digest), or check the pairs printed here.
+    #[command(alias = "commit")]
     Vote {
         seance: u64,
         #[arg(long)]
@@ -334,6 +379,13 @@ pub enum ContribCmd {
         /// Claim ids you think are spam (comma-separated)
         #[arg(long, value_delimiter = ',')]
         spam: Vec<u64>,
+        /// The pairs digest `contrib seance` printed with the pairs you judged: refused if the
+        /// node now gives other pairs (audit gap-7-6)
+        #[arg(long)]
+        digest: Option<String>,
+        /// Without --digest, don't ask for confirmation after printing the pairs it binds
+        #[arg(long)]
+        yes: bool,
         #[command(flatten)]
         signer: Signer,
     },
@@ -433,6 +485,34 @@ struct SealedVote {
     salt: String,
 }
 
+/// One claim of a Séance pair as a judgment binds it: (id, repo, PR number).
+type ClaimRef = (u64, String, u64);
+
+/// `account`'s assigned pairs in a Séance (the node's `/api/seance/{id}` answer), in order, each
+/// claim with its repo and PR: what a sealed judgment binds (`seance_pairs_digest`).
+pub(crate) fn seat_pairs(s: &Value, seance: u64, account: &str) -> Result<Vec<[ClaimRef; 2]>> {
+    let seat = s["jurors"].as_array().into_iter().flatten().find(|j| j["juror"]["address"] == account).ok_or_else(|| anyhow!("{account} isn't on the jury of Séance #{seance}"))?;
+    let claims: Vec<Value> = s["claims"].as_array().cloned().unwrap_or_default();
+    let claim = |id: &Value| -> Result<ClaimRef> {
+        let id = id.as_u64().ok_or_else(|| anyhow!("Séance #{seance} lists a pair with a bad claim id: {id}"))?;
+        let c = claims.iter().find(|c| c["id"] == id).ok_or_else(|| anyhow!("Séance #{seance} doesn't list claim #{id}"))?;
+        Ok((id, c["repo"].as_str().unwrap_or_default().to_string(), c["pr"].as_u64().unwrap_or_default()))
+    };
+    seat["assigned_pairs"].as_array().into_iter().flatten().map(|p| Ok([claim(&p[0])?, claim(&p[1])?])).collect()
+}
+
+/// `seance_pairs_digest` of a seat's pairs.
+pub(crate) fn pairs_digest(seance: u64, account: &str, pairs: &[[ClaimRef; 2]]) -> String {
+    let refs: Vec<[(u64, &str, u64); 2]> = pairs.iter().map(|[a, b]| [(a.0, a.1.as_str(), a.2), (b.0, b.1.as_str(), b.2)]).collect();
+    seance_pairs_digest(seance, account, &refs)
+}
+
+/// The pairs as a juror reads them: which claim and PR is `a`, which is `b`.
+pub(crate) fn pair_lines(pairs: &[[ClaimRef; 2]]) -> Vec<String> {
+    let pr = |c: &ClaimRef| format!("claim #{} {}#{} (https://github.com/{}/pull/{})", c.0, c.1, c.2, c.1, c.2);
+    pairs.iter().enumerate().map(|(i, [a, b])| format!("  {:>2}. a = {}\n      b = {}", i + 1, pr(a), pr(b))).collect()
+}
+
 fn sealed_path(dir: &Path, chain_id: &str, seance: u64, account: &str) -> PathBuf {
     dir.join("seances").join(format!("{chain_id}-{seance}-{account}.json"))
 }
@@ -463,7 +543,7 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
             let rt = rt()?;
             let who = match account.or(signer.from.clone()) {
                 Some(a) => a,
-                None => signer.keys(dir).map(|k| k.address()).map_err(|_| anyhow!("no wallet here; pass --account"))?,
+                None => rt.block_on(own_address(&signer.rpc, &signer.keys(dir).map_err(|_| anyhow!("no wallet here; pass --account"))?))?,
             };
             let v = rt.block_on(get(&signer.rpc, &format!("/account/{who}")))?;
             let p = &v["contribution"];
@@ -474,11 +554,11 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
             Ok(())
         }
         ContribCmd::Vouch { account, signer } => {
-            let to = rt()?.block_on(resolve(&signer.rpc, &account))?;
+            let to = crate::cli_net::account_ref(&account)?;
             submit(dir, &signer, Action::Vouch { account: to }).map(|_| ())
         }
         ContribCmd::Unvouch { account, signer } => {
-            let to = rt()?.block_on(resolve(&signer.rpc, &account))?;
+            let to = crate::cli_net::account_ref(&account)?;
             submit(dir, &signer, Action::Unvouch { account: to }).map(|_| ())
         }
         ContribCmd::JoinJury { bond, signer } => submit(dir, &signer, Action::JoinJury { bond: parse_fang(&bond)? }).map(|_| ()),
@@ -495,31 +575,58 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
             for c in &claims {
                 print_claim(c);
             }
-            let me = signer.keys(dir).ok().map(|k| k.address());
-            let me = match (&signer.from, me) {
+            let me = match (&signer.from, signer.keys(dir).ok()) {
                 (Some(f), _) => Some(rt.block_on(resolve(&signer.rpc, f))?),
-                (None, m) => m,
+                (None, Some(k)) => Some(rt.block_on(own_address(&signer.rpc, &k))?),
+                (None, None) => None,
             };
             let seat = s["jurors"].as_array().cloned().unwrap_or_default().into_iter().find(|j| me.as_deref().is_some_and(|m| j["juror"]["address"] == m));
             match seat {
                 Some(seat) => {
-                    let url = |id: &Value| claims.iter().find(|c| c["id"] == *id).map(|c| c["pr_url"].as_str().unwrap_or_default().to_string()).unwrap_or_default();
+                    // The pairs (and each claim's repo and PR) are what a judgment binds: printed
+                    // with their digest, which `contrib vote --digest` checks (audit gap-7-6).
+                    let me = me.unwrap_or_default();
+                    let pairs = seat_pairs(&s, id, &me)?;
                     println!("\nYou're on this jury. For each pair, which PR mattered more? a, b, or = (about equal):");
-                    for (i, p) in seat["assigned_pairs"].as_array().cloned().unwrap_or_default().iter().enumerate() {
-                        println!("  {:>2}. a = claim #{} {}\n      b = claim #{} {}", i + 1, p[0], url(&p[0]), p[1], url(&p[1]));
+                    for l in pair_lines(&pairs) {
+                        println!("{l}");
                     }
-                    println!("\nThen: blockula contrib vote {id} --votes <{} chars of a/b/=> [--spam <claim ids>]", seat["pairs"]);
+                    let d = pairs_digest(id, &me, &pairs);
+                    println!("\npairs digest: {d}");
+                    println!("Then: blockula contrib vote {id} --votes <{} chars of a/b/=> --digest {d} [--spam <claim ids>]", pairs.len());
                     println!("Status: {}", if seat["revealed"] == true { "revealed" } else if seat["committed"] == true { "sealed (reveal after the sealing phase)" } else { "not voted yet" });
                 }
                 None => println!("\n{} jurors: {}", s["jurors"].as_array().map(|a| a.len()).unwrap_or(0), s["jurors"].as_array().cloned().unwrap_or_default().iter().map(|j| format!("{}{}", name_of(&j["juror"]), if j["revealed"] == true { " ✓" } else if j["committed"] == true { " 🔒" } else { "" })).collect::<Vec<_>>().join(", ")),
             }
             Ok(())
         }
-        ContribCmd::Vote { seance, votes, spam, signer } => {
+        ContribCmd::Vote { seance, votes, spam, digest, yes, signer } => {
             let keys = signer.keys(dir)?;
             let rt = rt()?;
             let account = rt.block_on(signer.from(&keys))?;
             let chain_id = rt.block_on(get(&signer.rpc, "/status"))?["chain_id"].as_str().unwrap_or_default().to_string();
+            // The judgment binds the pairs and PRs, read again here. That read is the node's word
+            // too, so it must be what the juror judged: the pairs digest `contrib seance` printed
+            // (--digest), or the pairs printed here and confirmed (audit gap-7-6, review-r2-clients-3).
+            let s = rt.block_on(get(&signer.rpc, &format!("/seance/{seance}")))?;
+            let pairs = seat_pairs(&s, seance, &account)?;
+            if votes.len() != pairs.len() {
+                bail!("you have {} assigned pairs: pass one of a, b or = for each (`blockula contrib seance {seance}` lists them)", pairs.len());
+            }
+            let pairs_digest = pairs_digest(seance, &account, &pairs);
+            println!("Your judgment in Séance #{seance} binds these pairs, in order:");
+            for (l, v) in pair_lines(&pairs).iter().zip(votes.chars()) {
+                println!("{l}\n      your vote: {}", match v {
+                    'a' => "a",
+                    'b' => "b",
+                    '=' => "= (about equal)",
+                    _ => "(not a, b or =)",
+                });
+            }
+            println!("pairs digest: {pairs_digest}");
+            if !crate::gov_cli::check_digest(digest.as_deref(), &pairs_digest, &format!("Séance #{seance}'s pairs for you"))? {
+                confirm("Seal this judgment on exactly these pairs?", yes)?;
+            }
             let mut salt = [0u8; 16];
             getrandom::fill(&mut salt).map_err(|e| anyhow!("no randomness: {e}"))?;
             let salt = hex::encode(salt);
@@ -531,7 +638,7 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
             let tmp = path.with_extension("pending");
             std::fs::write(&tmp, serde_json::to_vec_pretty(&SealedVote { chain_id, seance, account, votes, spam, salt })?)?;
             // On failure the .pending file stays: if the commit lands anyway, `reveal` finds it.
-            submit(dir, &signer, Action::CommitVotes { seance_id: seance, commitment })?;
+            submit(dir, &signer, Action::CommitVotes { seance_id: seance, commitment, pairs_digest })?;
             std::fs::rename(&tmp, &path)?;
             println!("  sealed vote saved to {} — run `blockula contrib reveal {seance}` once revealing opens", path.display());
             Ok(())
@@ -557,25 +664,313 @@ pub fn contrib(cmd: ContribCmd, dir: &Path) -> Result<()> {
         ContribCmd::Admin { cmd } => match cmd {
             AdminCmd::SetRepo { repo, weight, signer } => submit(dir, &signer, Action::SetRepo { repo, weight }).map(|_| ()),
             AdminCmd::GrantSoul { account, soul, reason, signer } => {
-                let to = rt()?.block_on(resolve(&signer.rpc, &account))?;
+                let to = crate::cli_net::account_ref(&account)?;
                 submit(dir, &signer, Action::GrantSoul { to, amount: parse_soul(&soul)?, reason }).map(|_| ())
             }
             AdminCmd::Reject { claim, reason, signer } => submit(dir, &signer, Action::RejectClaim { claim_id: claim, reason }).map(|_| ()),
             AdminCmd::FlagSybil { account, reason, signer } => {
-                let who = rt()?.block_on(resolve(&signer.rpc, &account))?;
+                let who = crate::cli_net::account_ref(&account)?;
                 submit(dir, &signer, Action::FlagSybil { account: who, reason }).map(|_| ())
             }
             AdminCmd::Clawback { account, reason, signer } => {
-                let who = rt()?.block_on(resolve(&signer.rpc, &account))?;
+                let who = crate::cli_net::account_ref(&account)?;
                 submit(dir, &signer, Action::Clawback { account: who, reason }).map(|_| ())
             }
         },
     }
 }
 
+// ------------------------------------------------------------------------------------- names
+
+#[derive(Subcommand)]
+pub enum NameCmd {
+    /// Who owns a name and until when, or what it costs
+    Show {
+        name: String,
+        #[command(flatten)]
+        rpc: Rpc,
+    },
+    /// Extend a name you own (1–10 years, paid at the renewal price per year, burned)
+    Renew {
+        name: String,
+        #[arg(long, default_value = "1")]
+        years: u8,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Offer a name you own to another account (.boo name or address): it stays yours until they
+    /// accept it (`blockula name accept`). Offering it again replaces the offer
+    Transfer {
+        name: String,
+        to: String,
+        /// Don't ask for confirmation
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Accept a name offered to you: it becomes yours
+    Accept {
+        name: String,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Withdraw your offer of a name you own
+    Withdraw {
+        name: String,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Give up a name you own: anyone can register it afterwards
+    Release {
+        name: String,
+        /// Don't ask for confirmation
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        signer: Signer,
+    },
+}
+
+pub fn name(cmd: NameCmd, dir: &Path) -> Result<()> {
+    match cmd {
+        NameCmd::Show { name, rpc } => {
+            let v = rt()?.block_on(get(&rpc.rpc, &format!("/name/{name}")))?;
+            let n = v["name"].as_str().unwrap_or_default();
+            if v["available"] == true {
+                println!("{n} is available for {}", v["price_display"].as_str().unwrap_or_default());
+            } else {
+                println!("{n} belongs to {} (registered at block {})", v["owner"]["address"].as_str().unwrap_or_default(), v["registered_at"]);
+                // Expiry fields come with name renewals (DEC-11); older nodes don't report them.
+                if let Some(e) = v["expires_at"].as_u64() {
+                    println!("   expires at block {e}{}", v["grace_until"].as_u64().map(|g| format!(", renewable by its owner until block {g}")).unwrap_or_default());
+                }
+                if let Some(to) = v["offered_to"]["address"].as_str() {
+                    println!("   offered to {to}: theirs once they accept it (blockula name accept {n})");
+                }
+            }
+            Ok(())
+        }
+        NameCmd::Renew { name, years, signer } => {
+            if !(1..=MAX_RENEW_YEARS).contains(&years) {
+                bail!("renew for 1–{MAX_RENEW_YEARS} years");
+            }
+            submit(dir, &signer, Action::RenewName { name: normalize_name(&name)?, years }).map(|_| ())
+        }
+        NameCmd::Transfer { name, to, yes, signer } => {
+            let n = normalize_name(&name)?;
+            let to = crate::cli_net::account_ref(&to)?;
+            confirm(&format!("Offer {n}{NAME_SUFFIX} to {to}? Once they accept it, only they can give it back."), yes)?;
+            submit(dir, &signer, Action::TransferName { name: n, to }).map(|_| ())
+        }
+        // Both are a `TransferName` to the signer's own account: the chain tells them apart by
+        // whether it owns the name.
+        NameCmd::Accept { name, signer } | NameCmd::Withdraw { name, signer } => {
+            let me = rt()?.block_on(signer.from(&signer.keys(dir)?))?;
+            submit(dir, &signer, Action::TransferName { name: normalize_name(&name)?, to: me }).map(|_| ())
+        }
+        NameCmd::Release { name, yes, signer } => {
+            let n = normalize_name(&name)?;
+            confirm(&format!("Release {n}{NAME_SUFFIX}? Anyone can register it afterwards."), yes)?;
+            submit(dir, &signer, Action::ReleaseName { name: n }).map(|_| ())
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------- stake
+
+#[derive(Subcommand)]
+pub enum StakeCmd {
+    /// An account's stake: pools, shares, value and unbonding entries
+    Show {
+        /// Name or address (default: the wallet's account)
+        #[arg(long)]
+        account: Option<String>,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Delegate FANG to a validator's pool (it earns issuance and is slashed with the pool)
+    Delegate {
+        /// The validator's address
+        validator: String,
+        /// FANG, e.g. 100
+        amount: String,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Start unbonding stake (withdraw it after the unbonding period): an amount, pool shares, or all of it
+    Undelegate {
+        validator: String,
+        #[command(flatten)]
+        shares: Unbonding,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Move pool shares to another validator without unbonding
+    Redelegate {
+        /// The validator the shares leave (its own name: `from` is the signer's `--from`)
+        #[arg(value_name = "FROM")]
+        from_validator: String,
+        /// The validator they move to
+        #[arg(value_name = "TO")]
+        to_validator: String,
+        #[command(flatten)]
+        shares: Shares,
+        #[command(flatten)]
+        signer: Signer,
+    },
+    /// Pay out unbonding entries that have finished
+    Withdraw {
+        #[command(flatten)]
+        signer: Signer,
+    },
+}
+
+#[derive(Args, Clone)]
+#[group(required = true, multiple = false)]
+pub struct Shares {
+    /// How many pool shares (see `blockula stake show`)
+    #[arg(long)]
+    shares: Option<u64>,
+    /// Every share you hold in that pool
+    #[arg(long)]
+    all: bool,
+}
+
+/// What `stake undelegate` unbonds.
+#[derive(Args, Clone)]
+#[group(required = true, multiple = false)]
+pub struct Unbonding {
+    /// FANG, e.g. 10: the chain sells the shares worth that much at the pool's price when the tx
+    /// runs, so no node's report of the price decides how much unbonds
+    #[arg(long)]
+    amount: Option<String>,
+    /// How many pool shares (see `blockula stake show`)
+    #[arg(long)]
+    shares: Option<u64>,
+    /// Every share you hold in that pool
+    #[arg(long)]
+    all: bool,
+}
+
+/// The delegations in a `/api/staking/{account}` response, as (validator address, shares). Tolerant
+/// of the field names the endpoint has used: a validator label or address, shares as a string or
+/// number.
+/// `(validator, shares)` of each delegation in a `/api/staking/{account}` answer.
+fn delegations(v: &Value) -> Vec<(String, u64)> {
+    v["delegations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| Some((d["validator"]["address"].as_str()?.to_string(), d["shares"].as_str()?.parse().ok()?)))
+        .collect()
+}
+
+/// `--shares N`, or with `--all` every share `account` holds with `validator`.
+async fn shares_of(rpc: &str, account: &str, validator: &str, s: &Shares) -> Result<u64> {
+    if let Some(n) = s.shares {
+        return Ok(n);
+    }
+    let v = get(rpc, &format!("/staking/{account}")).await.with_context(|| format!("{rpc} doesn't serve /api/staking (is staking active on this chain?)"))?;
+    delegations(&v).into_iter().find(|(a, _)| a == validator).map(|(_, n)| n).filter(|n| *n > 0).ok_or_else(|| anyhow!("{account} has no stake with {validator}"))
+}
+
+pub fn stake(cmd: StakeCmd, dir: &Path) -> Result<()> {
+    match cmd {
+        StakeCmd::Show { account, signer } => {
+            let rt = rt()?;
+            let who = match account.or(signer.from.clone()) {
+                Some(a) => rt.block_on(resolve(&signer.rpc, &a))?,
+                None => rt.block_on(own_address(&signer.rpc, &signer.keys(dir).map_err(|_| anyhow!("no wallet here; pass --account"))?))?,
+            };
+            let v = rt.block_on(get(&signer.rpc, &format!("/staking/{who}"))).with_context(|| format!("{} doesn't serve /api/staking (is staking active on this chain?)", signer.rpc))?;
+            println!("{}", v["summary"].as_str().unwrap_or_default());
+            for d in v["delegations"].as_array().into_iter().flatten() {
+                println!("   {}  {} shares  worth {}{}", name_of(&d["validator"]), d["shares"].as_str().unwrap_or_default(), d["value_display"].as_str().unwrap_or_default(), if d["self_bond"] == true { "  (self-bond)" } else { "" });
+            }
+            for e in v["entries"].as_array().into_iter().flatten() {
+                match e["type"].as_str() {
+                    Some("unbonding") => println!("   unbonding {} from {}: {}", e["amount_display"].as_str().unwrap_or_default(), name_of(&e["validator"]), if e["ready"] == true { "ready to withdraw".to_string() } else { format!("free at block {}", e["release_at"]) }),
+                    _ => println!("   redelegated {} from {} to {} (slashable by the first until block {})", e["amount_display"].as_str().unwrap_or_default(), name_of(&e["from"]), name_of(&e["to"]), e["release_at"]),
+                }
+            }
+            Ok(())
+        }
+        StakeCmd::Delegate { validator, amount, signer } => submit(dir, &signer, Action::Delegate { validator, amount: parse_fang(&amount)? }).map(|_| ()),
+        StakeCmd::Undelegate { validator, shares: Unbonding { amount: Some(amount), .. }, signer } => {
+            let amount = parse_fang(&amount)?;
+            if amount == 0 {
+                bail!("undelegate more than 0 FANG");
+            }
+            submit(dir, &signer, Action::Undelegate { validator, shares: 0, amount }).map(|_| ())
+        }
+        StakeCmd::Undelegate { validator, shares: Unbonding { shares, all, .. }, signer } => {
+            let keys = signer.keys(dir)?;
+            let rt = rt()?;
+            let me = rt.block_on(signer.from(&keys))?;
+            let shares = rt.block_on(shares_of(&signer.rpc, &me, &validator, &Shares { shares, all }))?;
+            submit(dir, &signer, Action::Undelegate { validator, shares, amount: 0 }).map(|_| ())
+        }
+        StakeCmd::Redelegate { from_validator, to_validator, shares, signer } => {
+            let keys = signer.keys(dir)?;
+            let rt = rt()?;
+            let me = rt.block_on(signer.from(&keys))?;
+            let shares = rt.block_on(shares_of(&signer.rpc, &me, &from_validator, &shares))?;
+            submit(dir, &signer, Action::Redelegate { from_validator, to_validator, shares }).map(|_| ())
+        }
+        StakeCmd::Withdraw { signer } => submit(dir, &signer, Action::WithdrawUnbonded {}).map(|_| ()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/api/staking` is read tolerantly: labels or bare addresses, shares as strings or numbers.
+    #[test]
+    fn staking_responses_parse() {
+        // As node/src/api.rs serves it (`api::http_tests::validators_and_staking` checks the node's side).
+        let v = serde_json::json!({ "bonded": "47", "delegations": [{ "validator": { "address": "boo1v", "name": "v.boo" }, "shares": "40", "value": "40", "self_bond": false }, { "validator": { "address": "boo1w", "name": null }, "shares": "7", "value": "7", "self_bond": true }], "entries": [] });
+        assert_eq!(delegations(&v), vec![("boo1v".to_string(), 40), ("boo1w".to_string(), 7)]);
+        assert!(delegations(&serde_json::json!({})).is_empty());
+    }
+
+    /// Audit gap-7-1: `--from` by name is the node's word; on mainnet it's refused, by address it's fine.
+    #[test]
+    fn from_by_name_needs_the_address_on_mainnet() {
+        let a = crate::crypto::Keys::from_seed([5; 32]).address();
+        assert_eq!(from_on_chain("alice.boo", &a, "blockula-testnet-2", "http://n").unwrap(), a);
+        assert_eq!(from_on_chain(&a, &a, crate::chain::MAINNET_CHAIN_ID, "http://n").unwrap(), a);
+        let err = from_on_chain("alice.boo", &a, crate::chain::MAINNET_CHAIN_ID, "http://n").unwrap_err().to_string();
+        assert!(err.contains(&format!("pass --from {a}")) && err.contains("Nothing was signed"), "{err}");
+    }
+
+    /// `stake undelegate` takes exactly one of `--amount` (signed as an amount, converted by the
+    /// chain: audit gap-7-5), `--shares` or `--all`.
+    #[test]
+    fn undelegate_takes_an_amount_shares_or_all() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            cmd: StakeCmd,
+        }
+        let parse = |args: &[&str]| Cli::try_parse_from(["blockula"].iter().chain(args)).map(|c| c.cmd);
+        let Ok(StakeCmd::Undelegate { validator, shares: Unbonding { amount, shares, all }, .. }) = parse(&["undelegate", "boo1v", "--amount", "2.5"]) else { panic!("--amount parses") };
+        assert_eq!((validator.as_str(), amount.as_deref(), shares, all), ("boo1v", Some("2.5"), None, false));
+        assert!(matches!(parse(&["undelegate", "boo1v", "--shares", "7"]), Ok(StakeCmd::Undelegate { shares: Unbonding { shares: Some(7), amount: None, all: false }, .. })));
+        assert!(matches!(parse(&["undelegate", "boo1v", "--all"]), Ok(StakeCmd::Undelegate { shares: Unbonding { all: true, amount: None, shares: None }, .. })));
+        assert!(parse(&["undelegate", "boo1v"]).is_err(), "one of them is required");
+        assert!(parse(&["undelegate", "boo1v", "--amount", "1", "--all"]).is_err(), "only one");
+        assert!(parse(&["redelegate", "boo1v", "boo1w", "--amount", "1"]).is_err(), "redelegate moves shares");
+        // The validators are positionals of their own: the source used to share the id `from` with
+        // the signer's `--from` (a debug-build panic; in release the signer read the validator as
+        // the account to act for).
+        let Ok(StakeCmd::Redelegate { from_validator, to_validator, signer, .. }) = parse(&["redelegate", "boo1v", "boo1w", "--all"]) else { panic!("redelegate parses") };
+        assert_eq!((from_validator.as_str(), to_validator.as_str(), signer.from), ("boo1v", "boo1w", None));
+        let Ok(StakeCmd::Redelegate { from_validator, signer, .. }) = parse(&["redelegate", "boo1v", "boo1w", "--all", "--from", "vlad.boo"]) else { panic!("with --from") };
+        assert_eq!((from_validator.as_str(), signer.from.as_deref()), ("boo1v", Some("vlad.boo")));
+    }
 
     #[test]
     fn soul_amounts_parse() {

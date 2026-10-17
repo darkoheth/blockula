@@ -8,8 +8,6 @@
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Courier+Prime:wght@400;700&family=EB+Garamond:ital,wght@0,400..600;1,400&family=IM+Fell+English:ital@0;1&family=IM+Fell+English+SC&family=UnifrakturMaguntia&display=swap" />
-<!-- Animated ASCII backdrop (moon, fog, bats), bundled from web/lib/ascii. -->
-<script src="/haunt.js" defer></script>
 <style>
   /* Penny-dreadful print, same palette and faces as the web wallet (web/app/globals.css). */
   :root {
@@ -100,6 +98,11 @@
   .empty { font-style:italic; color:var(--dim); }
   details summary { cursor:pointer; color:var(--dim); margin-top:14px; font:400 16px var(--caps); letter-spacing:.06em; }
   pre.mono { background:var(--paper-hi); border:1px solid var(--hair); padding:12px; white-space:pre-wrap; }
+  .tally { display:flex; height:10px; border:1px solid var(--ink); margin:8px 0 4px; background:var(--paper-hi); }
+  .tally .aye { background:var(--moss); } .tally .nay { background:var(--blood); }
+  table.params { width:100%; border-collapse:collapse; font-size:16px; }
+  table.params td { padding:7px 8px 7px 0; border-bottom:1px solid var(--hair); vertical-align:baseline; }
+  table.params td:first-child { font-family:var(--mono); font-size:14px; word-break:break-all; width:42%; }
 
   @media (max-width:640px) {
     header { padding:12px 16px 10px; }
@@ -122,11 +125,15 @@
 <header>
   <a class="brand" href="#/"><span class="wordmark">Blockula</span><span class="edition">The Explorer</span></a>
   <form id="search" role="search"><input id="q" aria-label="Search" placeholder="Search names, addresses, blocks or transactions" autocomplete="off" /></form>
-  <nav><a href="#/">Blocks</a><a href="#/validators">Validators</a><a href="#/mempool">Mempool</a><a href="#/hunts">Hunts</a><a href="#/contribute">Contribute</a><a href="#/learn">Learn</a></nav>
+  <nav><a href="#/">Blocks</a><a href="#/validators">Validators</a><a href="#/governance">Governance</a><a href="#/mempool">Mempool</a><a href="#/hunts">Hunts</a><a href="#/contribute">Contribute</a><a href="#/params">Parameters</a><a href="#/learn">Learn</a></nav>
 </header>
 <main id="app"><div class="loading">Rising from the grave…</div></main>
-<footer>Post-quantum signatures · ML-DSA-65 · Not audited, test chains only<button type="button" class="motion-toggle" data-motion-toggle hidden></button></footer>
+<footer><span id="imprint">Post-quantum signatures · ML-DSA-65 · Not audited, test chains only</span><button type="button" class="motion-toggle" data-motion-toggle hidden></button></footer>
 <script>
+// The animated ASCII backdrop (moon, fog, bats), bundled from web/lib/ascii. This script adds it, not a
+// tag in the page: the CSP trusts only this script (by hash), and 'strict-dynamic' extends that trust to
+// the scripts it adds, never to markup.
+document.head.append(Object.assign(document.createElement("script"), { src: "/haunt.js" }));
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
 const api = async (p) => { const r = await fetch("/api" + p); const j = await r.json(); if (!r.ok) throw new Error(j.error); return j; };
@@ -155,7 +162,15 @@ const GLOSSARY = {
   vouch: "Staking FANG (and your Soul) on a newcomer being a real, distinct person. If they turn out to be a sybil, the voucher loses both. Newcomers can decline a vouch.",
   claim: "A merged PR submitted for the contribution pool. Validators check GitHub that it's merged and authored by the claimant's linked handle, then a Séance judges it.",
   vesting: "Rewards unlock gradually (about 90 days). Until then they can be clawed back, e.g. if the PR is reverted or the account turns out to be fake.",
-  pool: "FANG set aside to reward useful work. Each Séance pays out a quarter of it, split by jury scores, square-rooted per person so volume doesn't pay.",
+  pool: "FANG set aside to reward useful work. Each Séance pays out up to a quarter of it, split by jury scores. Per person, the best claim counts in full and each further one a quarter of the one before, so volume doesn't pay.",
+  stake: "FANG delegated to a validator's pool. The pool's stake decides whether it's in the active set; stakers share its rewards and its slashes.",
+  commission: "The share of a pool's rewards its validator keeps before the rest goes to everyone staked in it.",
+  jailed: "Taken out of the active set for missing too many of its turns (or for a missed beacon reveal). Its owner can unjail it after the jail period.",
+  proposal: "A change put to an on-chain vote: a parameter, a treasury spend, an upgrade, a distribution… The proposer bonds a deposit, returned once the proposal reaches quorum.",
+  conviction: "Voters lock the FANG they vote with. Locking longer counts more: 0.1× with no lock, then 1× to 6× for 1 to 32 lock periods.",
+  council: "Until the bootstrap period ends, a proposal also passes if two-thirds of the active validators approve it and token-weighted nays don't outweigh ayes.",
+  timelock: "A passed proposal waits this long before it executes, so anyone affected can see it coming.",
+  expiry: "Names are registered for a year at a time. After expiry there's a grace period when only the owner can renew; then anyone can register the name.",
 };
 const term = (key, text) => `<span class="term" data-tip="${esc(GLOSSARY[key])}">${esc(text ?? key)}</span>`;
 // The node labels unnamed system accounts ("🧛 validator", "🏛️ treasury"); show those as an italic label.
@@ -177,6 +192,26 @@ const fang = (display) => {
 const stat = (v, k) => `<div class="stat"><div class="v">${v}</div><div class="k">${k}</div></div>`;
 const card = (inner, cls = "") => `<section class="card ${cls}">${inner}</section>`;
 const plural = (n, one, many = one + "s") => `${n} ${n == 1 ? one : many}`;
+// Drops ("1500000000") → "1.5 FANG", for fields the node sends without a *_display twin.
+const fmtDrops = (d) => { if (!/^\d+$/.test(String(d ?? ""))) return "—"; const b = BigInt(d); const f = (b % 1000000000n).toString().padStart(9, "0").replace(/0+$/, ""); return `${b / 1000000000n}${f ? "." + f : ""} FANG`; };
+/** `o.k_display`, else `o.k` as drops; null when the node doesn't send it. Fields are read tolerantly: modules may add them later. */
+const amount = (o, ...keys) => { for (const k of keys) { if (o && o[k + "_display"] != null) return String(o[k + "_display"]); if (o && /^\d+$/.test(String(o[k] ?? ""))) return fmtDrops(o[k]); } return null; };
+const pick = (o, ...keys) => { for (const k of keys) if (o && o[k] != null) return o[k]; return undefined; };
+const pct = (bps) => `${(Number(bps) / 100).toLocaleString("en-US", { maximumFractionDigits: 2 })}%`;
+const span = (blocks, ms = 1000) => { const s = (Number(blocks) * ms) / 1000; return s < 90 ? `${Math.round(s)} seconds` : s < 5400 ? `${Math.round(s / 60)} minutes` : s < 172800 ? `${Math.round(s / 3600)} hours` : `${Math.round(s / 86400)} days`; };
+// Only https links from the chain become hrefs (never javascript: or data:).
+const link = (u, text) => /^https:\/\/[^\s"'<>]+$/.test(String(u ?? "")) ? `<a href="${esc(u)}" rel="noreferrer nofollow">${esc(text ?? u)}</a>` : esc(text ?? u ?? "");
+/** A label ({address, name, short}) or a bare address. */
+const whoAny = (x) => (x && typeof x === "object" ? who(x) : x ? `<a href="#/account/${esc(x)}" class="mono">${esc(String(x).slice(0, 12))}…</a>` : "—");
+const list = (r, ...keys) => (Array.isArray(r) ? r : (keys.map((k) => r && r[k]).find(Array.isArray) || []));
+/** "expires at block #N (in about 300 days)", with the grace period once it has passed. */
+const expiryText = (r, s) => {
+  if (r.expires_at == null) return "";
+  const left = Number(r.expires_at) - Number(s.height);
+  const grace = r.grace_until;
+  if (left > 0) return `${term("expiry", "expires")} at block #${esc(r.expires_at)} (in about ${span(left, s.block_time_ms)})`;
+  return `<span class="err">expired at block #${esc(r.expires_at)}</span>${grace != null ? `; its owner can renew it until block #${esc(grace)}` : ""}`;
+};
 
 const views = {
   async home() {
@@ -201,7 +236,7 @@ const views = {
         </div>
         <div class="health">
           <span><b class="${health.ok ? "ok" : "bad"}">${health.ok ? "● The network is healthy" : "● " + esc(health.reason || "unhealthy")}</b></span>
-          ${v ? `<span>${plural(v.blocks_until_next_epoch, "block")} until epoch ${v.epoch + 1}${v.pending.length ? ` · ${plural(v.pending.length, "validator")} awaiting approval` : ""}</span>` : ""}
+          ${v ? `<span>${plural(v.blocks_until_next_epoch, "block")} until epoch ${v.epoch + 1}${v.joining.length ? ` · ${plural(v.joining.length, "validator")} joining` : ""}</span>` : ""}
         </div>
         ${s.history_from > 1 ? `<div class="dim">This node fast-synced from a certified snapshot at #${s.fast_synced_from}; history before #${s.history_from} isn't available here.</div>` : ""}
       </section>
@@ -249,7 +284,9 @@ const views = {
     </div>`;
   },
   async account(id) {
-    const a = await api("/account/" + encodeURIComponent(id));
+    const [a, s] = await Promise.all([api("/account/" + encodeURIComponent(id)), api("/status")]);
+    // Expiry comes with name renewals; ask for the first few names only.
+    const nameInfo = await Promise.all(a.names.slice(0, 12).map((n) => api("/name/" + encodeURIComponent(n)).catch(() => null)));
     let gh = null;
     if (a.github) gh = await api("/github/" + encodeURIComponent(a.github.handle)).catch(() => null);
     const name = a.account.name ? (a.account.name.includes(" ") ? `<i>${esc(plain(a.account.name))}</i>` : esc(a.account.name)) : "Unnamed account";
@@ -269,8 +306,8 @@ const views = {
         ${stat(a.nonce, term("nonce", "transactions sent"))}
         ${stat(a.names.length, term("name", "names owned"))}
       </div>
-      ${pc && (pc.soul.points > 0 || pc.claims.length || pc.juror || pc.vouched_by || pc.vouching_for.length || pc.rewards.total_display !== "0 FANG") ? contributionCard(pc) : ""}
-      ${a.names.length ? card(`<h2>Names</h2>${a.names.map((n) => `<span class="pill">${esc(n)}</span>`).join(" ")}`) : ""}
+      ${pc && (pc.soul.points > 0 || pc.claims.length || pc.juror || pc.vouched_by || pc.vouching_for.length || pc.vouch_bonds_held?.length || pc.rewards.total_display !== "0 FANG") ? contributionCard(pc) : ""}
+      ${a.names.length ? card(`<h2>Names</h2><div class="rows">${a.names.map((n, i) => `<div class="row"><div><a href="#/name/${esc(n)}">${esc(n)}</a></div><span class="dim">${nameInfo[i] ? expiryText(nameInfo[i], s) : ""}</span></div>`).join("")}</div>`) : ""}
       ${a.hunts_won.length || a.familiars.length || a.hunts_created.length ? card(`<h2>Hunts</h2><div class="rows">
         ${a.hunts_won.map((h) => `<div class="row"><div><a href="#/hunt/${h.id}">${esc(h.repo)}#${h.issue}</a> won ${esc(h.amount_display)} for PR #${h.pr}${h.self_awarded ? ' <span class="pill pending">self-awarded</span>' : ""}</div></div>`).join("")}
         ${a.hunts_created.length ? `<div class="row dim"><div>Created ${a.hunts_created.map((id) => `<a href="#/hunt/${id}">#${id}</a>`).join(", ")}</div></div>` : ""}
@@ -279,8 +316,18 @@ const views = {
     </div>`;
   },
   async name(n) {
-    const r = await api("/name/" + n);
-    return card(`<span class="eyebrow">Unclaimed name</span><h1>${esc(r.name)}</h1><p>Anyone can register it for <b>${esc(r.price_display)}</b>. Shorter names cost more because they're scarcer. The fee goes to the community treasury.</p>
+    const [r, s] = await Promise.all([api("/name/" + encodeURIComponent(n)), api("/status")]);
+    if (!r.available) {
+      return card(`<span class="eyebrow">Name</span><h1>${esc(r.name)}</h1><dl>
+        <dt>Owner</dt><dd>${who(r.owner)}</dd>
+        <dt>Registered</dt><dd>block <a href="#/block/${esc(r.registered_at)}">#${esc(r.registered_at)}</a></dd>
+        ${r.offered_to ? `<dt>Offered to</dt><dd>${who(r.offered_to)} <span class="dim">(theirs once they accept it)</span></dd>` : ""}
+        ${r.expires_at != null ? `<dt>${term("expiry", "Expires")}</dt><dd>${expiryText(r, s)}</dd>` : ""}
+        ${r.renewal_price_display ? `<dt>Renewal</dt><dd>${esc(r.renewal_price_display)} a year</dd>` : ""}
+      </dl>`);
+    }
+    return card(`<span class="eyebrow">Unclaimed name</span><h1>${esc(r.name)}</h1><p>Anyone can register it for <b>${esc(r.price_display)}</b>${r.expires_at != null || r.registration_blocks ? " a year" : ""}. Shorter names cost more because they're scarcer.</p>
+      ${r.status === "reserved" ? `<p class="err">This name is reserved at genesis: nobody can register it.</p>` : ""}
       <p class="dim">Register it with the SDK: <span class="mono">await wallet.registerName("${esc(r.name)}")</span></p>`);
   },
   async learn() {
@@ -329,6 +376,7 @@ function contributionCard(pc) {
     <dt>${term("soul", "Soul")}</dt><dd>${esc(pc.soul.display)} <span class="dim">(${esc(pc.soul.earned_display)} earned in total; it decays slowly)</span></dd>
     ${pc.vouched_by ? `<dt>${term("vouch", "Vouched for by")}</dt><dd>${who(pc.vouched_by.voucher)} at block #${pc.vouched_by.at}</dd>` : ""}
     ${pc.vouching_for.length ? `<dt>${term("vouch", "Vouching for")}</dt><dd>${pc.vouching_for.map((v) => who(v.account)).join(", ")}</dd>` : ""}
+    ${pc.vouch_bonds_held?.length ? `<dt>${term("vouch", "Withdrawn vouches")}</dt><dd>${pc.vouch_bonds_held.map((v) => `${who(v.account)} <span class="dim">(${esc(v.bond_display)} held until block #${v.held_until}, longer while a sybil flag on them is proposed)</span>`).join(", ")}</dd>` : ""}
     ${pc.juror ? `<dt>${term("seance", "Juror")}</dt><dd>${pc.juror.active ? "in the pool" : "benched (missed a reveal; join again to return)"} · bond ${esc(pc.juror.bond_display)} · served on ${plural(pc.juror.served, "Séance")}</dd>` : ""}
     <dt>${term("vesting", "Rewards")}</dt><dd>${esc(r.withdrawable_display)} withdrawable · ${esc(r.unvested_display)} still vesting</dd>
     ${pc.sybil ? `<dt>Flagged</dt><dd class="err">as a sybil by ${who(pc.sybil.by)}: “${esc(pc.sybil.reason)}”</dd>` : ""}
@@ -354,11 +402,11 @@ views.contribute = async function () {
       <li><b>${term("claim", "Claim it")}</b> with a small refundable bond (${esc(r.claim_bond_display)}, more if you have several open). You need ${term("soul", "Soul")} or a ${term("vouch", "vouch")} from someone who has it.</li>
       <li><b>Validators check GitHub</b>: the PR must be merged and authored by your linked handle. ${r.claim_maturity_blocks ? `Then it waits ${r.claim_maturity_blocks.toLocaleString()} blocks in case it's reverted.` : ""}</li>
       <li><b>A ${term("seance", "Séance")} judges it.</b> Up to ${r.jury_size} jurors drawn at random compare pairs of claims, seal their votes, then reveal them. Jurors who agree with the outcome earn Soul and ${esc(r.juror_share)} of the payout; those who keep disagreeing lose Soul, and no-shows lose part of their bond.</li>
-      <li><b>Payout.</b> Each Séance distributes up to ${esc(r.pool_share_per_seance)} of the pool (the full share once it has 16 claims). Your share is the <i>square root</i> of your summed scores (per GitHub handle), so one solid PR beats a pile of tiny ones, and spam costs you. Rewards ${term("vesting", "vest")} over ${r.vesting_blocks.toLocaleString()} blocks.</li>
+      <li><b>Payout.</b> Each Séance distributes up to ${esc(r.pool_share_per_seance)} of the pool (the full share once it judges claims of ${r.full_budget_people || 16} people; one person's many claims count once). Your claims are scored against other people's, never each other, and count best first: your best in full, each next one a quarter of the one before (all together less than 4/3 of your best), so one solid PR beats a pile of tiny ones, and spam costs you. A person is the claimant account: every GitHub handle it links, and a sponsor's ${term("familiar", "Familiars")}, count together. Rewards ${term("vesting", "vest")} over ${r.vesting_blocks.toLocaleString()} blocks.</li>
     </ol><p class="dim">Agents can contribute as ${term("familiar", "Familiars")} of a human sponsor: the MCP's <span class="mono">submit_contribution</span>, or <span class="mono">blockula contrib claim owner/repo 123</span> from the CLI.</p>`, "learn")}
     ${card(`<h2>${s ? `Séance #${s.id} · ${phaseText(s)}` : "No Séance open"}</h2>
       ${s ? `<p>${plural(s.claims.length, "claim")} · ${plural(s.jurors.length, "juror")} · budget ${esc(s.budget_display)} · <a href="#/seance/${s.id}">details →</a></p>${s.jurors.map((j) => `<span class="pill ${j.revealed ? "" : "pending"}">${esc(plain(j.juror.name || j.juror.short))} · ${j.revealed ? "revealed" : j.committed ? "sealed" : "waiting"}</span>`).join(" ")}`
-        : `<p class="empty">The next one can open from block #${c.next_seance_at} once at least 2 verified claims have matured and ${r.min_jury} jurors are available.</p>`}`)}
+        : `<p class="empty">The next one can open from block #${c.next_seance_at} once matured claims of at least ${r.min_people || 2} people (not just one person's) and ${r.min_jury} jurors are available.</p>`}`)}
     ${c.recent_seances.length ? card(`<h2>Recent Séances</h2><div class="rows">${c.recent_seances.map((x) => `<div class="row"><div><a href="#/seance/${x.id}">Séance #${x.id}</a> <span class="dim">· ${plural(x.claims, "claim")} · ${plural(x.jurors, "juror")}${x.results ? ` · ${x.results.accepted} accepted, ${x.results.spam} spam` : ""}</span></div><div class="dim">paid ${esc(x.budget_display)} budget</div></div>`).join("")}</div>`) : ""}
     ${card(`<h2>Recent claims</h2>${claims.claims.length ? `<div class="rows">${claims.claims.map(claimRow).join("")}</div>` : '<p class="empty">No claims yet. Be the first.</p>'}`)}
     ${card(`<h2>Souls</h2>${souls.souls.length ? `<div class="rows">${souls.souls.map((x, i) => `<div class="row"><div><span class="dim">${i + 1}.</span> ${who(x.account)}${x.github ? ` <span class="dim">@${esc(x.github)}</span>` : ""}${x.juror ? ' <span class="pill">juror</span>' : ""}</div><div>${esc(x.soul.display)}</div></div>`).join("")}</div>` : '<p class="empty">Nobody has Soul yet.</p>'}`)}
@@ -402,36 +450,158 @@ views.mempool = async function () {
 
 views.validators = async function () {
   const v = await api("/validators");
-  const row = (x) => `<div class="row"><div>${who(x.validator)} <span class="dim">${esc(x.p2p_addr)}${x.genesis ? " · genesis" : ""}${x.bond !== "0" ? " · " + term("bond", "bond") + " " + esc(x.bond_display) : ""}</span></div><span class="pill">${esc(x.status)}</span></div>`;
-  const list = (title, xs, empty) => card(`<h2>${title} (${xs.length})</h2>${xs.length ? `<div class="rows">${xs.map(row).join("")}</div>` : `<p class="empty">${empty}</p>`}`);
-  const all = [...v.active, ...v.pending, ...v.approved, ...v.removed];
+  const status = (x) => (x.tombstoned_at != null ? "tombstoned" : x.jailed ? "jailed" : x.status);
+  const row = (x) => {
+    const bits = [esc(x.p2p_addr)];
+    if (x.genesis) bits.push("genesis");
+    bits.push(`${term("stake", "stake")} ${esc(x.stake_display)}`, `self-bond ${esc(x.self_bond_display)}`, `${term("commission", "commission")} ${esc(x.commission_display)}`);
+    if (x.liveness && x.liveness.recorded) bits.push(`missed ${esc(x.liveness.missed)} of its last ${esc(x.liveness.recorded)} turns`);
+    if (x.jailed) bits.push(`${term("jailed", "jailed")} until block ${esc(x.jailed.until)}: ${esc(x.jailed.reason)}`);
+    return `<div class="row"><div>${who(x.validator)} <span class="dim">${bits.join(" · ")}</span></div><span class="pill ${["jailed", "tombstoned", "removed"].includes(status(x)) ? "failed" : x.status === "candidate" ? "pending" : ""}">${esc(status(x))}</span></div>`;
+  };
+  const section = (title, xs, empty) => card(`<h2>${title} (${xs.length})</h2>${xs.length ? `<div class="rows">${xs.map(row).join("")}</div>` : `<p class="empty">${empty}</p>`}`);
+  const all = [...v.active, ...v.candidates, ...v.jailed, ...v.tombstoned, ...v.removed];
   const seen = new Set();
   const events = [];
   for (const x of all) {
     if (seen.has(x.validator.address)) continue;
     seen.add(x.validator.address);
-    if (x.registered_at && !x.genesis) events.push([x.registered_at, `${who(x.owner)} bonded ${esc(x.bond_display)} and registered validator ${who(x.validator)}`]);
-    if (x.approved_by) events.push([x.approved_at, `${who(x.approved_by)} approved validator ${who(x.validator)}${x.active_from_epoch != null ? `, active from ${term("epoch")} ${x.active_from_epoch}` : ", joining at the next epoch"}`]);
+    if (x.registered_at && !x.genesis) events.push([x.registered_at, `${who(x.owner)} registered validator ${who(x.validator)}${x.active_from_epoch != null ? `, active from ${term("epoch")} ${x.active_from_epoch}` : ""}`]);
+    if (x.approved_by) events.push([x.approved_at, `${who(x.approved_by)} pinned validator ${who(x.validator)} ahead of stake (test chains)`]);
     if (x.removed_by) events.push([x.removed_at, `${who(x.removed_by)} removed validator ${who(x.validator)}${x.active_until_epoch != null ? `, last active in epoch ${x.active_until_epoch}` : ", leaving at the next epoch"}`]);
+    if (x.jailed) events.push([x.jailed.at, `validator ${who(x.validator)} was jailed: ${esc(x.jailed.reason)}`]);
+    if (x.tombstoned_at != null) events.push([x.tombstoned_at, `validator ${who(x.validator)} double-signed: slashed ${esc(x.slashed_display)} and banned for good`]);
   }
   events.sort((a, b) => b[0] - a[0]);
+  const totalStake = v.active.reduce((t, x) => (/^\d+$/.test(String(x.stake ?? "")) ? t + BigInt(x.stake) : t), 0n);
   return `<div class="stack">
     <div><span class="eyebrow">Consensus</span><h1>Validators</h1></div>
     <div class="figures">
       ${stat(v.epoch, term("epoch", "current epoch"))}
-      ${stat(v.active.length, "active validators")}
+      ${stat(`${v.active.length}${v.max_validators ? `<small>of ${esc(v.max_validators)}</small>` : ""}`, "active validators")}
       ${stat(v.blocks_until_next_epoch, "blocks until the next epoch")}
-      ${stat(fang(v.min_bond_display), term("bond", "minimum bond"))}
+      ${stat(fang(fmtDrops(totalStake)), term("stake", "staked in the active set"))}
+      ${stat(fang(v.min_bond_display), term("bond", "minimum self-bond"))}
     </div>
     ${card(`<h2>What validators do</h2>
-      <p>Validators take turns proposing blocks and vote to finalize them. A block is final once more than two-thirds of the active validators have signed it with ML-DSA-65, a post-quantum signature. There are no confirmations to wait for.</p>
-      <p>The set only changes between ${term("epoch", "epochs")} (every ${v.epoch_blocks} blocks). In Season 0, anyone can bond FANG and register, and an admin (${v.admins.map(who).join(", ")}) approves them. Approved validators join when the next epoch starts.</p>`, "learn")}
-    ${list("Active this epoch", v.active, "—")}
-    ${list("Next epoch", v.next_epoch, "—")}
-    ${list("Waiting for approval", v.pending, "Nobody is waiting. Run <span class=\"mono\">blockula validator init</span> to become a validator.")}
-    ${v.approved.length ? list("Approved, joining soon", v.approved, "") : ""}
-    ${v.removed.length ? list("Removed", v.removed, "") : ""}
-    ${card(`<h2>Admin actions</h2>${events.length ? `<div class="rows">${events.map(([h, t]) => `<div class="row"><div>${t}</div><a class="dim" href="#/block/${h}">block #${h}</a></div>`).join("")}</div>` : '<p class="empty">No changes since genesis.</p>'}`)}
+      <p>Validators take turns proposing blocks and vote to finalize them. A block is final once more than two-thirds of the active validators have signed it with ML-DSA-65, a post-quantum signature. There are no confirmations to wait for. Every active validator's vote counts the same.</p>
+      <p>Anyone can run one: register with a self-bond of at least ${esc(v.min_bond_display)}, and anyone can ${term("stake", "delegate")} FANG to its pool. At the end of each ${term("epoch")} (every ${v.epoch_blocks} blocks) the top ${v.max_validators} by stake make the next set, ${v.churn_limit ? `with at most ${v.churn_limit} newcomer${v.churn_limit === 1 ? "" : "s"} at a time (the rest must reach a quorum on their own)` : "though a set this small takes no newcomers (they'd be needed for a quorum before they've synced)"}. Signing two different blocks costs ${esc(v.slash_double_sign_display)} of the stake and a permanent ban; missing too many turns gets a validator ${term("jailed")} (${esc(v.slash_downtime_display)}) until it unjails.${v.admins.length ? ` On this test chain an admin (${v.admins.map(who).join(", ")}) may also pin or remove validators.` : ""}</p>`, "learn")}
+    ${section("Active this epoch", v.active, "—")}
+    ${v.joining.length || v.leaving.length ? section("Changing at the next epoch", [...v.joining, ...v.leaving], "") : ""}
+    ${section("Candidates", v.candidates, "Nobody is waiting. Run <span class=\"mono\">blockula validator init</span> to become a validator.")}
+    ${v.jailed.length ? section("Jailed", v.jailed, "") : ""}
+    ${v.tombstoned.length ? section("Tombstoned", v.tombstoned, "") : ""}
+    ${v.removed.length ? section("Removed", v.removed, "") : ""}
+    ${card(`<h2>Changes</h2>${events.length ? `<div class="rows">${events.map(([h, t]) => `<div class="row"><div>${t}</div><a class="dim" href="#/block/${h}">block #${h}</a></div>`).join("")}</div>` : '<p class="empty">No changes since genesis.</p>'}`)}
+  </div>`;
+};
+
+// ---- Governance (MAINNET-DESIGN 3.5), as node/src/api.rs `proposal_json` serves it. ----
+
+const proposalOf = (p, rules) => {
+  const t = p.tally || null;
+  const council = list(p.council);
+  const aye = (p.ayes && p.ayes.weight) || { drops: "0", display: "0 FANG" };
+  const nay = (p.nays && p.nays.weight) || { drops: "0", display: "0 FANG" };
+  const turnout = BigInt((p.ayes && p.ayes.amount && p.ayes.amount.drops) || "0") + BigInt((p.nays && p.nays.amount && p.nays.amount.drops) || "0");
+  return {
+    id: p.id, title: p.title || `Proposal #${p.id}`, url: p.url || "", status: String(p.status || "unknown"),
+    summary: p.summary || (p.kind && p.kind.type) || "",
+    proposer: p.proposer,
+    deposit: p.deposit_display || null,
+    aye: aye.drops, nay: nay.drops, ayeShown: aye.display, nayShown: nay.display,
+    turnout: fmtDrops(turnout.toString()),
+    quorum: t ? t.quorum.display : null, quorumReached: t ? t.quorum_reached : null,
+    council: { ayes: council.filter((c) => c.aye).length, nays: council.filter((c) => !c.aye).length, of: t ? t.council_size : null },
+    endsAt: p.voting_end, executesAt: p.execute_at,
+    threshold: p.supermajority ? (rules && rules.supermajority_bps) || "supermajority" : null,
+    outcome: p.outcome || "",
+  };
+};
+const statusPill = (st) => `<span class="pill ${/reject|fail/.test(st) ? "failed" : /voting|queued/.test(st) ? "pending" : ""}">${esc(st.replace(/_/g, " "))}</span>`;
+const tallyBar = (p) => {
+  const [a, n] = [BigInt(/^\d+$/.test(String(p.aye)) ? p.aye : 0), BigInt(/^\d+$/.test(String(p.nay)) ? p.nay : 0)];
+  const total = a + n;
+  const w = total > 0n ? Number((a * 1000n) / total) / 10 : 0;
+  return total > 0n ? `<div class="tally" title="aye ${esc(p.ayeShown || "")} · nay ${esc(p.nayShown || "")}"><span class="aye" style="width:${w}%"></span><span class="nay" style="width:${100 - w}%"></span></div>` : "";
+};
+const councilText = (c) => c && (c.ayes || c.nays) ? `${term("council", "council")}: ${c.ayes} validator${c.ayes === 1 ? "" : "s"} approve${c.nays ? `, ${c.nays} reject` : ""}${c.of ? ` (of ${c.of})` : ""}` : "";
+const thresholdText = (p) => (p.threshold == null ? "a simple majority" : typeof p.threshold === "number" ? `${pct(p.threshold)} of the weight` : "a supermajority");
+
+views.governance = async function () {
+  let r;
+  try { r = await api("/proposals?limit=50"); }
+  catch (e) { return card(`<span class="eyebrow">Governance</span><h1>Proposals</h1><p class="empty">This node doesn't serve proposals (${esc(e.message)}). On-chain governance arrives with protocol v1.</p>`, "learn"); }
+  const rules = r.params || {};
+  const ps = list(r, "proposals").map((p) => proposalOf(p, rules));
+  const row = (p) => `<div class="row"><div><a href="#/proposal/${esc(p.id)}"><b>#${esc(p.id)}</b> ${esc(p.title)}</a> <span class="dim">· ${esc(p.summary)}</span>
+    ${tallyBar(p)}<span class="dim">${[`aye ${esc(p.ayeShown)}`, `nay ${esc(p.nayShown)}`, p.quorum ? `turnout ${esc(p.turnout)} of ${esc(p.quorum)} quorum` : `turnout ${esc(p.turnout)}`, councilText(p.council), p.status === "voting" ? `voting ends at block #${esc(p.endsAt)}` : "", p.executesAt != null ? `${p.status === "queued" ? "executes" : "ran"} at block #${esc(p.executesAt)}` : "", p.status !== "voting" && p.outcome ? esc(p.outcome) : ""].filter(Boolean).join(" · ")}</span></div>${statusPill(p.status)}</div>`;
+  return `<div class="stack">
+    ${card(`<span class="eyebrow">Governance</span><h1>Proposals</h1><p>There are no admin keys: parameter changes, treasury spends, upgrades and community distributions are ${term("proposal", "proposals")} that FANG holders vote on, locking what they vote with (${term("conviction", "conviction")}). Voting lasts ${esc(span(rules.voting_blocks, 1000))}; passed proposals wait out a ${term("timelock", "timelock")} before they execute. ${r.council_active ? `Until block #${esc(rules.bootstrap_end_height)} a proposal also passes if two-thirds of the active validators approve it (the ${term("council", "bootstrap council")}) and token-weighted nays don't outweigh the ayes.` : ""}</p>
+      <p class="dim">Vote from the wallet, the SDK (<span class="mono">wallet.vote(id, true, "10", 2)</span>), the MCP's <span class="mono">vote</span> tool, or <span class="mono">blockula gov vote</span>.</p>`, "learn")}
+    <div class="figures">
+      ${stat(fang(r.treasury ? r.treasury.balance_display : "—"), "treasury")}
+      ${stat(fang(r.community ? r.community.balance_display : "—"), "community distributions")}
+      ${stat(fang(rules.proposal_deposit_display || "—"), "deposit to propose")}
+    </div>
+    ${card(`<h2>All proposals (${ps.length})</h2>${ps.length ? `<div class="rows">${ps.map(row).join("")}</div>` : '<p class="empty">No proposals yet.</p>'}`)}
+  </div>`;
+};
+
+views.proposal = async function (id) {
+  const [raw, r] = await Promise.all([api("/proposal/" + encodeURIComponent(id)), api("/proposals?limit=1").catch(() => ({}))]);
+  const p = proposalOf(raw, r.params);
+  const votes = list(raw.votes);
+  const council = list(raw.council);
+  const voteRow = (x) => `<div class="row"><div>${whoAny(x.voter)} <span class="dim">· ${x.aye ? "aye" : "nay"} with ${esc(x.amount_display)} at ${x.conviction == 0 ? "0.1" : esc(x.conviction)}× ${term("conviction", "conviction")} = ${esc(x.weight.display)} of weight${x.council ? ` (also validator ${whoAny(x.council)}'s council vote)` : ""}</span></div><span class="dim">locked until #${esc(x.locked_until)}</span></div>`;
+  const councilRow = (x) => `<div class="row"><div>validator ${whoAny(x.validator)} <span class="dim">· ${x.aye ? "aye" : "nay"} (cast by ${whoAny(x.voter)})</span></div></div>`;
+  return `<div class="stack">
+    ${card(`<span class="eyebrow">Proposal #${esc(p.id)}</span><div class="summary">${esc(p.title)}</div><p>${esc(p.summary)}</p>${statusPill(p.status)} ${p.url ? `<span class="dim">· full text: ${link(p.url)}</span>` : ""}`)}
+    ${card(`<dl>
+      <dt>Proposed by</dt><dd>${whoAny(p.proposer)} at block <a href="#/block/${esc(raw.created_at)}">#${esc(raw.created_at)}</a></dd>
+      ${p.deposit ? `<dt>Deposit</dt><dd>${esc(p.deposit)} <span class="dim">(refunded once it reaches quorum, burned if it doesn't)</span></dd>` : ""}
+      <dt>Tally</dt><dd>${tallyBar(p)}${esc(p.ayeShown)} aye · ${esc(p.nayShown)} nay <span class="dim">(conviction-weighted) · needs ${thresholdText(p)}</span></dd>
+      <dt>Quorum</dt><dd>${esc(p.turnout)} voted${p.quorum ? ` of ${esc(p.quorum)} needed${p.quorumReached ? " ✓" : ""}` : " <span class=\"dim\">(the quorum is set when voting closes)</span>"}</dd>
+      ${councilText(p.council) ? `<dt>${term("council", "Bootstrap council")}</dt><dd>${councilText(p.council)}</dd>` : ""}
+      <dt>Voting ends</dt><dd>block #${esc(p.endsAt)}</dd>
+      ${p.executesAt != null ? `<dt>${term("timelock", p.status === "queued" ? "Executes" : "Ran")}</dt><dd>block #${esc(p.executesAt)}</dd>` : ""}
+      ${p.outcome ? `<dt>Outcome</dt><dd>${esc(p.outcome)}</dd>` : ""}
+      ${raw.distribution ? `<dt>Distribution</dt><dd><span class="mono">${esc(raw.distribution)}</span></dd>` : ""}
+    </dl>
+    <details><summary>What exactly it does</summary><pre class="mono">${esc(JSON.stringify(raw.kind ?? null, null, 2))}</pre></details>`)}
+    ${council.length ? card(`<h2>Council votes (${council.length})</h2><div class="rows">${council.map(councilRow).join("")}</div>`) : ""}
+    ${card(`<h2>Votes (${votes.length})</h2>${votes.length ? `<div class="rows">${votes.map(voteRow).join("")}</div>` : raw.votes_swept && raw.voters ? `<p class="empty">Voting closed: the tally above is final, and the ${esc(raw.voters)} vote records were cleared from the state (each vote's tx stays in its block).</p>` : '<p class="empty">No votes yet.</p>'}`)}
+  </div>`;
+};
+
+// ---- Chain parameters (node/src/params.rs), changeable only by ParamChange proposals. ----
+
+const PARAM_GROUPS = [["staking", /^(min_self_bond|max_validators|unbonding|slash|downtime|jail|reporter|commission|insider|evidence)/], ["fees", /^(base_fee|target_fullness|max_block_bytes|account_creation|max_tx_validity)/], ["issuance", /^issuance/], ["governance", /^(proposal|voting|timelock|quorum|supermajority|treasury|lock_period|governance|bootstrap)/], ["names", /^name_/], ["beacon", /^beacon/], ["Ghost Mode", /^ghost/]];
+const paramValue = (k, v, ms) => {
+  if (!/^\d+$/.test(String(v))) return esc(v);
+  const n = Number(v);
+  if (/_bps$/.test(k)) return `${pct(v)} <span class="dim">(${esc(v)} bps)</span>`;
+  if (/_ppm$/.test(k)) return `${(n / 10000).toLocaleString("en-US", { maximumFractionDigits: 4 })}% <span class="dim">(${esc(v)} ppm)</span>`;
+  if (/_bytes$/.test(k)) return `${n >= 1048576 ? `${n / 1048576} MiB` : n >= 1024 ? `${n / 1024} KiB` : `${n} bytes`}`;
+  if (/(_blocks|_height)$/.test(k)) return `${n.toLocaleString("en-US")} blocks <span class="dim">(${k.endsWith("_height") ? "≈ " : ""}${span(n, ms)})</span>`;
+  if (/^(min_self_bond|account_creation_fee|proposal_deposit|quorum_floor|name_price_\d|ghost_pool_cap|base_fee_floor_flat)$/.test(k)) return esc(fmtDrops(v));
+  return n.toLocaleString("en-US");
+};
+
+views.params = async function () {
+  const [r, s, fees] = await Promise.all([api("/params").catch(() => null), api("/status"), api("/fees").catch(() => null)]);
+  if (!r) return card(`<span class="eyebrow">Chain parameters</span><h1>Parameters</h1><p class="empty">This node doesn't serve its parameters yet (protocol v1).</p>`, "learn");
+  const entries = Object.entries(r.params || {});
+  const groups = PARAM_GROUPS.map(([g, re]) => [g, entries.filter(([k]) => re.test(k))]);
+  const other = entries.filter(([k]) => !PARAM_GROUPS.some(([, re]) => re.test(k)));
+  if (other.length) groups.push(["other", other]);
+  // The base fee fixed for the next blocks (`suggested` covers any of them): flat drops plus a rate in milli-drops per byte.
+  const sug = fees && fees.suggested;
+  const transfer = sug ? BigInt(sug.flat) + (BigInt(sug.rate) * 5400n) / 1000n : null;
+  const feeLine = sug ? [`base fee ${esc(fmtDrops(sug.flat))} + ${esc((Number(sug.rate) / 1000).toLocaleString("en-US"))} drops per byte`, `a transfer (~5.4 KB) costs about ${esc(fmtDrops(transfer.toString()))}`, `opening an account burns ${esc(fees.account_creation_fee_display)}`].join(" · ") : "";
+  return `<div class="stack">
+    ${card(`<span class="eyebrow">Chain parameters</span><h1>Parameters</h1><p>The rules of <b>${esc(s.chain_id)}</b> that can change without new software: only a ${term("proposal", "ParamChange proposal")} that passes changes one, within bounds written into the code. Durations are in blocks of ${esc(s.block_time_ms)} ms.</p>${feeLine ? `<p class="dim">Right now: ${feeLine}.</p>` : ""}`, "learn")}
+    ${groups.filter(([, xs]) => xs.length).map(([g, xs]) => card(`<h2>${esc(g)}</h2><table class="params">${xs.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${paramValue(k, v, s.block_time_ms)}</td></tr>`).join("")}</table>`)).join("")}
   </div>`;
 };
 
@@ -441,12 +611,17 @@ function txRow(t) {
 
 async function route() {
   const [, view = "", id = ""] = location.hash.split("/");
-  const fn = views[view] || views.home;
+  // Own views only: `views["constructor"]` is Object, which hands the route id back unescaped.
+  const fn = Object.hasOwn(views, view) ? views[view] : views.home;
   // Detail pages (a block, tx, account, name) don't belong to one section; a single hunt does.
-  const section = { block: null, tx: null, account: null, name: null, hunt: "hunts", claim: "contribute", seance: "contribute" }[view];
-  const current = section === undefined ? view : section;
+  const sections = { block: null, tx: null, account: null, name: null, hunt: "hunts", claim: "contribute", seance: "contribute", proposal: "governance" };
+  const current = Object.hasOwn(sections, view) ? sections[view] : view;
   document.querySelectorAll("nav a").forEach((a) => a.toggleAttribute("aria-current", current !== null && a.getAttribute("href") === `#/${current}`));
-  try { $("#app").innerHTML = await fn(decodeURIComponent(id)); }
+  try {
+    const html = await fn(decodeURIComponent(id));
+    // Views build HTML strings with every value escaped; anything else is never markup.
+    $("#app").innerHTML = typeof html === "string" ? html : "";
+  }
   catch (e) { $("#app").innerHTML = card(`<span class="eyebrow">Not found</span><p class="err">${esc(e.message)}</p>`); }
 }
 
@@ -457,6 +632,8 @@ $("#search").addEventListener("submit", async (e) => {
 });
 window.addEventListener("hashchange", route);
 route();
+// Test chains say so in the footer; mainnet doesn't.
+api("/status").then((s) => { if (s.chain_id === "blockula-1") $("#imprint").textContent = "Post-quantum signatures · ML-DSA-65"; }).catch(() => {});
 setInterval(() => { if (!location.hash || location.hash === "#/") route(); }, 3000);
 </script>
 </body>

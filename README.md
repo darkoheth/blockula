@@ -7,8 +7,9 @@ Quantum entanglement is literally "spooky action at a distance". We took that pe
 | | |
 |---|---|
 | Token | **FANG** (1 FANG = 10⁹ drops 🩸) |
-| Signatures | **ML-DSA-65** (NIST FIPS 204), no elliptic curves anywhere |
+| Signatures | **ML-DSA-65** (NIST FIPS 204), no elliptic curves on-chain |
 | Hashing | BLAKE3-256 |
+| Network | Validators key their channels with hybrid X25519 + **ML-KEM-768** (FIPS 203) and authenticate with ML-DSA-65 |
 | Addresses | `boo1…` = bech32m(BLAKE3(public key)), or just `yourname.boo` |
 | Privacy (Phase 2) | 👻 **Ghost Mode** shielded transfers + 🪦 **The Crypt** encrypted storage, built on hash-based STARKs + ML-KEM |
 
@@ -22,6 +23,8 @@ Quantum entanglement is literally "spooky action at a distance". We took that pe
 
 What it is, on one page: [docs/ONE_PAGER.md](docs/ONE_PAGER.md).
 
+**It's a testnet.** Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.
+
 ## npm packages
 
 ```bash
@@ -34,7 +37,7 @@ claude mcp add blockula -- npx -y @blockula/mcp   # MCP server for coding agents
 | [`@blockula/sdk`](https://www.npmjs.com/package/@blockula/sdk) | `npm install @blockula/sdk` | TypeScript SDK: `Wallet` (ML-DSA-65 signing), `Client` (reads), `.boo` names, session keys, Hunts. Passkey wallets for the browser live at `@blockula/sdk/passkey`. |
 | [`@blockula/mcp`](https://www.npmjs.com/package/@blockula/mcp) | `npx -y @blockula/mcp`, or `npm install -g @blockula/mcp` for a `blockula-mcp` binary | MCP server so any coding agent can hold a wallet, send FANG, claim names and list Hunts. |
 
-Both need Node 20 or newer. The MCP server finds the public testnet on its own when no local node is running. The SDK's `Client` defaults to `http://localhost:7070`, so pass the testnet explicitly: `new Client("https://blockula-testnet.fly.dev")`.
+Both need Node 20 or newer. The MCP server uses the public testnet unless its configuration names another network (`--network local` for `blockula dev`; see the [MCP README](mcp/README.md)), and it never switches networks on its own. The SDK's `Client` defaults to `http://localhost:7070`, so pass the testnet explicitly: `new Client("https://blockula-testnet.fly.dev")`.
 
 ## Install the node (no Rust needed)
 
@@ -43,13 +46,15 @@ curl -fsSL https://github.com/jackdishman/blockula/releases/latest/download/inst
 blockula dev          # local chain + explorer at http://localhost:7070
 ```
 
-Prebuilt for macOS (Apple Silicon and Intel) and Linux (x64 and arm64), with SHA-256 checksums verified. Agents can call the MCP's `install_node` tool instead.
+Prebuilt for macOS (Apple Silicon and Intel) and Linux (x64 and arm64). The script checks the version, the SHA-256 checksum, build provenance (with a logged-in `gh`) and the offline release signature (with an installed `blockula`). It's still the release's own script, though, so validators don't use it: they install and upgrade with `blockula release install vX.Y.Z`, which checks the release against the release key id they pinned at their first install and never runs the release's scripts ([OPERATIONS.md "Installing and upgrading"](docs/OPERATIONS.md#installing-and-upgrading)). Agents can call the MCP's `install_node` tool instead.
 
-## Contribute and earn
+## Contribute
 
-Open **Hunts** are [issues labeled `hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt), each with acceptance criteria and a FANG bounty. Agents are welcome as Familiars. See [CONTRIBUTING.md](CONTRIBUTING.md).
+> Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.
 
-Bounties live on-chain: the FANG is escrowed in a Hunt, anyone can add to it, and the creator (or a Season 0 admin) awards it for the merged PR. Browse them in the explorer's Hunts page or `GET /api/hunts`.
+Open **Hunts** are [issues labeled `hunt`](https://github.com/jackdishman/blockula/issues?q=is%3Aopen+label%3Ahunt), each with acceptance criteria and a testnet FANG bounty. Agents are welcome as Familiars. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Bounties live on-chain: the FANG is escrowed in a Hunt, anyone can add to it, and only its creator awards it for the merged PR (nobody else can move the escrow; governance can only refund the funders). Browse them in the explorer's Hunts page or `GET /api/hunts`.
 
 ```ts
 await wallet.linkGithub("vlad", "<gist id>");  // a public gist by @vlad containing your boo1 address verifies it
@@ -62,22 +67,22 @@ Awarding from the CLI checks GitHub first: the PR must be merged into the hunt's
 
 ```bash
 blockula hunt award 3 --pr 34 --rpc https://blockula-testnet.fly.dev            # signs with ~/.blockula/wallet.json
-blockula hunt award 3 --pr 34 --key admin.key --rpc …                           # or a Season 0 admin key
+blockula hunt award 3 --pr 34 --key creator.key --rpc …                         # or the creator's key file
 blockula hunt list | show | create | fund | cancel
 ```
 
-**Beyond Hunts, the contribution pool pays for any merged PR to a pool repo** (Proof of Contribution, [docs/PLAN.md](docs/PLAN.md#-proof-of-contribution-rewarding-useful-work)):
+**Beyond Hunts, the contribution pool pays testnet FANG for any merged PR to a pool repo** (Proof of Contribution, [docs/PLAN.md](docs/PLAN.md#-proof-of-contribution-rewarding-useful-work)):
 - Claim a merged PR you authored. Validators check it on GitHub.
 - A **Séance** judges it: a random jury of people with **Soul** (reputation you can't buy) compares claims in pairs, sealing their votes before revealing them.
-- Payouts are square-rooted per person (so volume doesn't pay) and vest over ~90 days with clawback.
+- Payouts count a person's claims best first, each next one a quarter of the one before (so volume doesn't pay), and vest over ~90 days with clawback.
 
 ```bash
 blockula contrib link-github vlad <gist id>       # once
 blockula contrib claim jackdishman/blockula 34    # after the PR merges
 blockula contrib status                           # the pool, its repos, the open Séance
 blockula contrib join-jury                        # jurors need 5 Soul and bond 10 FANG
-blockula contrib seance                           # your assigned pairs, with PR links
-blockula contrib vote 2 --votes ab=a --spam 17    # seal, then later:
+blockula contrib seance                           # your assigned pairs, with PR links and their digest
+blockula contrib vote 2 --votes ab=a --spam 17 --digest <pairs digest>   # seal exactly those pairs, then later:
 blockula contrib reveal 2
 blockula contrib withdraw                         # vested rewards
 ```
@@ -134,8 +139,9 @@ blockula summon mynet --validators 4
 blockula run --home ~/.blockula/mynet/v0     # repeat for v1, v2, v3 (each prints its URL)
 
 # a full node: serves the API + explorer right away, fast-syncs from the newest certified
-# snapshot (add --full to replay from genesis), then follows finalized blocks
-blockula join --genesis http://127.0.0.1:<v0 http port> --home ~/.blockula/mynet-full --port 7171
+# snapshot (add --full to replay from genesis), then follows finalized blocks. It pins the
+# genesis hash `summon` printed (required for chains this binary doesn't know)
+blockula join --genesis http://127.0.0.1:<v0 http port> --genesis-hash <hash> --home ~/.blockula/mynet-full --port 7171
 ```
 
 **On public servers:**
@@ -145,7 +151,9 @@ blockula join --genesis http://127.0.0.1:<v0 http port> --home ~/.blockula/mynet
    - The node listens on the bind address and advertises its genesis addresses.
    - Public addresses use the `recommended` p2p preset; private ones use `local` (override with `--p2p-preset`).
 
-Full nodes: `blockula join --genesis genesis.json --home full --bind 0.0.0.0 --port 7171`.
+Full nodes: `blockula join --genesis genesis.json --genesis-hash <hash> --home full --bind 0.0.0.0 --port 7171` (`blockula checkpoint --genesis genesis.json` prints the hash). On a chain older than ~10 days, also pass a recent `--checkpoint` ([OPERATIONS.md, Weak subjectivity](docs/OPERATIONS.md#weak-subjectivity)).
+
+**A real genesis** (mainnet, dry runs) isn't summoned: each operator runs `blockula genesis operator` offline to write its public entry (consensus key, owner, addresses, proof of possession), and `blockula genesis build --spec spec.toml --out genesis.json` turns a reviewed spec (allocations by bucket with their vesting, the operators, parameters, reserved names) into the same `genesis.json` and hash on every machine. See `deploy/mainnet/genesis-spec.example.toml` and [docs/GENESIS_CEREMONY.md](docs/GENESIS_CEREMONY.md).
 
 Any node accepts txs, which are gossiped to the leader. On chains with a faucet, any node also accepts faucet requests: genesis validators pay from their own accounts, and other nodes forward the request. A forwarded request is never forwarded again.
 
@@ -180,32 +188,42 @@ blockula wallet name vlad --rpc https://<node>
 blockula wallet balance --rpc https://<node>
 ```
 
+Every command that signs (`wallet send|name`, `stake`, `gov`, `multisig`, `name`, `hunt`, `contrib`, `validator`) first checks which chain the node at `--rpc` is on, as the MCP does: `--network testnet` (or the public testnet's URL) and `--network mainnet` pin their chain id and prefix, `--chain-id` and `--genesis-hash` (or `BLOCKULA_NETWORK`, `BLOCKULA_CHAIN_ID`, `BLOCKULA_GENESIS_HASH`) pin any node, and whatever isn't pinned is pinned on first use and remembered in `~/.blockula/known-chains.json` (not for a node on this machine). A node on another chain is refused before anything is signed, and mainnet is never assumed: a node that reports `blockula-1` is refused unless you passed `--network mainnet`. Plain `http://` only works for this machine or a private network. Names you send to are resolved by the node, and the CLI prints the address it got.
+
 ## Become a validator
 
-Season 0 is allowlisted: anyone can bond and register, and a validator admin listed in genesis approves. Everything is on-chain and visible in the explorer's Validators page.
+Validators are permissionless: anyone can register one with a self-bond, anyone can delegate to it, and at each epoch boundary the top `max_validators` by stake make the set (newcomers at most a third of it). Double-signing is slashed and banned for good; missing too many turns gets a validator jailed until it unjails. Everything is on-chain and visible in the explorer's Validators page.
 
 ```bash
 # 1. Create a validator home: fetches genesis, generates the ML-DSA-65 key, records your public addresses
-blockula validator init --home ~/val --genesis https://<any node> \
+blockula validator init --home ~/val --genesis https://<any node> --genesis-hash <the chain's genesis hash> \
   --public-p2p-addr <your-ip>:30300 --public-http-addr <your-ip>:7070
-# 2. Fund the printed address with the minimum bond plus fees (testnets: the faucet, POST /api/faucet)
-# 3. Bond and register, signed by the validator's own account. The consensus key also signs a
+# 2. Fund the printed address with the minimum self-bond plus fees (testnets: the faucet, POST /api/faucet)
+# 3. Start the node: it syncs now and votes once it's in the active set
+blockula run --home ~/val --bind 0.0.0.0
+# 4. Bond and register, signed by the validator's own account. The consensus key also signs a
 #    proof of possession, so nobody can register a key they don't hold.
-#    (Registering from another account? `blockula validator pop --home ~/val --owner boo1…`
+#    (Registering from another owner account? `blockula validator pop --home ~/val --owner boo1…`
 #    prints the `pop` field for the SDK's `registerValidator`.)
 blockula validator register --home ~/val --rpc https://<any node>
-# 4. Start the node: it syncs now and starts voting from its activation epoch
-blockula run --home ~/val --bind 0.0.0.0
-# Admin (Season 0): approve, remove, list
+# Stake: delegate, start unbonding, withdraw what's free, see an account's stake
+blockula stake delegate boo1… 1000 --key wallet.json --rpc https://<any node>
+blockula stake undelegate boo1… --amount 250 --key wallet.json --rpc https://<any node>   # or --all, or --shares N
+blockula stake withdraw --key wallet.json --rpc https://<any node>
+blockula stake show --account <address or name> --rpc https://<any node>
+# Operators: commission (moves a little per epoch), unjail after downtime
+blockula validator commission 500 --key ~/val/validator.key --rpc https://<any node>
+blockula validator unjail boo1… --key ~/val/validator.key --rpc https://<any node>
+blockula validator list --rpc https://<any node>
+# Dev and test chains only (admins): pin a validator ahead of stake, or remove one
 blockula validator approve boo1… --key admin.key --rpc https://<any node>
 blockula validator remove  boo1… --key admin.key --rpc https://<any node>
-blockula validator list --rpc https://<any node>
-# After removal, the owner reclaims the bond one epoch after the validator left
-blockula validator unbond boo1… --key ~/val/validator.key --rpc https://<any node>
 ```
 
-**Testnet only.** The p2p transport authenticates peers with ML-DSA-65 but encrypts with
-X25519 + ChaCha20-Poly1305, which is not post-quantum (see [docs/PLAN.md](docs/PLAN.md#known-limits)).
+The p2p transport authenticates peers with ML-DSA-65 and derives its ChaCha20-Poly1305 keys from a
+hybrid X25519 + ML-KEM-768 exchange, so recorded traffic stays private unless both are broken
+([docs/PQ-TRANSPORT.md](docs/PQ-TRANSPORT.md)). Builds with the older X25519-only transport (the
+v0.4 public testnet) can't peer with it.
 
 ## Layout
 
@@ -216,9 +234,10 @@ sdk-ts/   @blockula/sdk: wallets, tx signing, client, passkey (WebAuthn PRF) hel
 mcp/      @blockula/mcp: MCP server for coding agents
 web/      Passkey web wallet (Next.js), deployed at blockula-wallet.vercel.app
 deploy/   Fly.io testnet: Dockerfile, entrypoint, launch.sh
-docs/     ONE_PAGER.md (what this is), PLAN.md (architecture, tokenomics, roadmap)
+docs/     ONE_PAGER.md (what this is), PLAN.md (architecture, tokenomics, roadmap), MAINNET.md (launch readiness),
+          MAINNET-DESIGN.md (mainnet decisions and spec), TOKENOMICS.md (mainnet supply and allocation)
 ```
 
 ## Status
 
-Public testnet live (Phase 1), Hunts and Proof of Contribution v1 built (Phases 1.5–2). An internal four-track security and product review was completed and its findings fixed. **No third-party audit yet: test value only.** See [docs/PLAN.md](docs/PLAN.md).
+Public testnet live (Phase 1), with Hunts and Proof of Contribution v1 (Phases 1.5–2). An internal four-track security and product review was completed and its findings fixed. **No third-party audit yet: test value only.** See [docs/PLAN.md](docs/PLAN.md), and [docs/MAINNET.md](docs/MAINNET.md) for what stands between this and a mainnet. Report vulnerabilities privately: [SECURITY.md](SECURITY.md).

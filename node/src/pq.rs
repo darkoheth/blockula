@@ -6,6 +6,8 @@
 //! * Commonware's namespace becomes the FIPS 204 context string (domain separation). Namespaces
 //!   longer than 255 bytes are hashed down to 32 bytes first.
 //! * Certificates are a signer bitmap plus one 3309-byte signature per signer (no aggregation).
+//! * A validator's scheme checks every vote with its slashing protection before signing it
+//!   (`protection.rs`): a refused vote isn't signed at all, and simplex treats it as not cast.
 
 use bytes::{Buf, BufMut};
 use commonware_codec::{EncodeSize, Error as CodecError, FixedSize, Read, ReadRangeExt, Write, types::lazy::Lazy};
@@ -70,9 +72,9 @@ impl PublicKey {
         let enc = EncodedVerifyingKey::<MlDsa65>::try_from(&raw[..]).ok()?;
         Some(Self { raw: Box::new(raw), vk: Arc::new(VerifyingKey::<MlDsa65>::decode(&enc)) })
     }
-    /// The `boo1…` address of this key.
-    pub fn address(&self) -> String {
-        crate::crypto::address_from_public_key(&self.raw[..])
+    /// This key's address on a chain whose addresses use `prefix`.
+    pub fn address(&self, prefix: &str) -> String {
+        crate::crypto::address_with_prefix(prefix, &self.raw[..])
     }
 }
 impl Read for PublicKey {
@@ -217,15 +219,22 @@ pub struct MlDsaScheme {
     participants: Set<PublicKey>,
     signer: Option<(Participant, PrivateKey)>,
     namespace: Namespace,
+    /// Consulted (and updated) before every signature.
+    protection: Option<Arc<crate::protection::Protection>>,
 }
 
 impl MlDsaScheme {
     pub fn signer(namespace: &[u8], participants: Set<PublicKey>, key: PrivateKey) -> Option<Self> {
         let idx = participants.position(&key.public_key())?;
-        Some(Self { participants, signer: Some((Participant::from_usize(idx), key)), namespace: Namespace::derive(namespace) })
+        Some(Self { participants, signer: Some((Participant::from_usize(idx), key)), namespace: Namespace::derive(namespace), protection: None })
     }
     pub fn verifier(namespace: &[u8], participants: Set<PublicKey>) -> Self {
-        Self { participants, signer: None, namespace: Namespace::derive(namespace) }
+        Self { participants, signer: None, namespace: Namespace::derive(namespace), protection: None }
+    }
+    /// Signs only what `protection` allows.
+    pub fn with_protection(mut self, protection: Option<Arc<crate::protection::Protection>>) -> Self {
+        self.protection = protection;
+        self
     }
     fn check(&self, subject: &Subject<'_, impl Digest>, signer: Participant, sig: &Lazy<Signature>) -> bool {
         let Some(pk) = self.participants.get(usize::from(signer)) else { return false };
@@ -271,7 +280,14 @@ impl certificate::Scheme for MlDsaScheme {
     }
     fn sign<D: Digest>(&self, subject: Subject<'_, D>) -> Option<Attestation<Self>> {
         let (idx, key) = self.signer.as_ref()?;
-        let sig = key.sign(subject.namespace(&self.namespace), &subject.message());
+        let message = subject.message();
+        if let Some(p) = &self.protection {
+            let (kind, round) = crate::protection::subject_parts(&subject);
+            if !p.check_and_record(round.epoch().get(), round.view().get(), kind, &message) {
+                return None;
+            }
+        }
+        let sig = key.sign(subject.namespace(&self.namespace), &message);
         Some(Attestation { signer: *idx, signature: sig.into() })
     }
     fn verify_attestation<R: CryptoRng, D: Digest>(&self, _rng: &mut R, subject: Subject<'_, D>, a: &Attestation<Self>, _strategy: &impl Strategy) -> bool {
@@ -315,10 +331,33 @@ mod tests {
         let seed = [9u8; 32];
         let a = crate::crypto::Keys::from_seed(seed);
         let b = PrivateKey::from_seed_bytes(seed);
-        assert_eq!(a.address(), b.public_key().address());
+        assert_eq!(a.address(), b.public_key().address("boo"));
         let sig = b.sign(b"ns", b"msg");
         assert!(b.public_key().verify(b"ns", b"msg", &sig));
         assert!(!b.public_key().verify(b"other", b"msg", &sig));
         assert_eq!(sig, b.sign(b"ns", b"msg"), "deterministic");
+    }
+
+    /// Votes go through slashing protection: a conflicting one is never signed at all.
+    #[test]
+    fn the_scheme_signs_only_what_slashing_protection_allows() {
+        use commonware_consensus::simplex::types::{Notarize, Nullify, Proposal};
+        use commonware_consensus::types::{Epoch, Round, View};
+        use commonware_cryptography::{blake3::Digest, certificate::Scheme as _};
+        let key = PrivateKey::from_seed_bytes([3; 32]);
+        let set = Set::try_from(vec![key.public_key()]).unwrap();
+        let p = crate::protection::Protection::in_memory(key.public_key().as_ref(), crate::protection::Timing::for_block_time(1_000));
+        p.enter_epoch(1, Some(0), 1, 0);
+        let scheme = MlDsaScheme::signer(b"ns", set, key).unwrap().with_protection(Some(p.clone()));
+        let round = Round::new(Epoch::new(1), View::new(4));
+        let proposal = |d: u8| Proposal::new(round, View::new(3), Digest([d; 32]));
+        let a = Notarize::sign(&scheme, proposal(1)).expect("first notarize");
+        assert!(Notarize::sign(&scheme, proposal(1)) == Some(a), "the identical vote again (deterministic)");
+        assert!(Notarize::sign(&scheme, proposal(2)).is_none(), "a conflicting notarize is never signed");
+        assert!(Nullify::sign::<Digest>(&scheme, round).is_some());
+        let recorded = hex::encode(crate::crypto::hash(&Subject::Notarize { proposal: &proposal(1) }.message()));
+        assert_eq!(p.record().votes[&4].notarize, Some(recorded));
+        // A verifier-only scheme never consults it.
+        assert!(MlDsaScheme::verifier(b"ns", Set::try_from(vec![PrivateKey::from_seed_bytes([4; 32]).public_key()]).unwrap()).sign::<Digest>(Subject::Nullify { round }).is_none());
     }
 }

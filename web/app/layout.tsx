@@ -1,9 +1,12 @@
 import type { Metadata, Viewport } from "next";
 import { Courier_Prime, EB_Garamond, IM_Fell_English, IM_Fell_English_SC, UnifrakturMaguntia } from "next/font/google";
+import { connection } from "next/server";
 import type { ReactNode } from "react";
+import { ChainGate } from "@/components/ChainGate";
 import { Haunt, MotionToggle } from "@/components/Haunt";
 import { Header } from "@/components/Header";
 import { Ornament } from "@/components/Ornament";
+import { IS_MAINNET_BUILD } from "@/lib/config";
 import { WalletProvider } from "@/lib/wallet";
 import "./globals.css";
 
@@ -22,18 +25,21 @@ export const metadata: Metadata = {
 
 export const viewport: Viewport = { themeColor: "#ece3cd", width: "device-width", initialScale: 1 };
 
-export default function RootLayout({ children }: { children: ReactNode }) {
+export default async function RootLayout({ children }: { children: ReactNode }) {
+  // Render per request: the CSP nonce (proxy.ts) is new on every response, so no page is static.
+  await connection();
   return (
     <html lang="en" className={`${fell.variable} ${fellSc.variable} ${garamond.variable} ${courier.variable} ${fraktur.variable}`}>
       <body>
         <Haunt />
         <WalletProvider>
           <Header />
-          {children}
+          <ChainGate>{children}</ChainGate>
           <footer className="imprint">
             <Ornament kind="bat" />
             <span className="caps">Quantum-safe ML-DSA-65 keys · Unlocked by passkeys</span>
-            <span>Not audited. For test chains only.</span>
+            {/* Mainnet builds are for real money (after the audit, WAL-3); test builds say what they are. */}
+            <span data-testid="imprint-note">{IS_MAINNET_BUILD ? "Self-custodial: your key is derived on this device and never leaves it." : "Not audited. For test chains only."}</span>
             <MotionToggle />
           </footer>
         </WalletProvider>

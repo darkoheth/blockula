@@ -49,6 +49,14 @@ header nav { display: flex; gap: 22px; align-items: center; flex-wrap: wrap; fon
 header nav a { color: var(--ink-soft); text-decoration: none; padding: 2px 0; border-bottom: 2px solid transparent; }
 header nav a:hover { color: var(--ink); border-bottom-color: var(--hair); }
 header nav a.active { color: var(--ink); border-bottom-color: var(--blood); }
+/* The network, stamped beside the masthead on every screen: plain ink for mainnet, a red rubber stamp for anything else. */
+.masthead { display: inline-flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; }
+.net-badge { display: inline-flex; align-items: baseline; gap: 8px; padding: 1px 9px 2px; border: 1.5px solid var(--ink); font: 400 14px/1.4 var(--caps); letter-spacing: 0.1em; text-transform: lowercase; white-space: nowrap; }
+.net-badge .net-chain { font: 400 13px var(--mono); letter-spacing: 0; text-transform: none; color: var(--dim); }
+.net-badge.test { border-style: dashed; border-color: var(--blood); color: var(--blood); transform: rotate(-1.5deg); }
+.net-badge.test .net-chain { color: var(--blood); }
+.net-badge.custom { background: var(--blood); border-color: var(--blood); color: var(--paper-hi); }
+.net-badge.custom .net-chain { color: var(--paper-hi); }
 .net-select { font: 400 15px var(--caps); letter-spacing: 0.04em; background: transparent; color: var(--ink); border: 1px solid var(--hair); border-radius: 0; padding: 3px 6px; cursor: pointer; }
 .net-select:hover { border-color: var(--ink); }
 main { flex: 1; width: 100%; padding: 44px 20px 64px; }
@@ -101,6 +109,17 @@ main > .banner { margin: 0; border: 1px solid var(--ink); }
 .haunt { position: fixed; inset: 0; width: 100%; height: 100%; z-index: -1; pointer-events: none; }
 .apparition { display: block; flex: none; align-self: center; max-width: 100%; height: auto; margin: -6px 0 4px; }
 .balance-card .apparition { margin: -14px 0 -4px; }
+/* Each prop's display size, CSS px (here, not in a style attribute: the CSP refuses those). */
+.apparition-key { width: 340px; aspect-ratio: 340 / 136; }
+.apparition-moon { width: 200px; aspect-ratio: 200 / 190; }
+.apparition-pumpkin { width: 240px; aspect-ratio: 240 / 214; }
+.apparition-candle { width: 170px; aspect-ratio: 170 / 214; }
+.apparition-bat { width: 340px; aspect-ratio: 340 / 150; }
+.apparition-coin { width: 180px; aspect-ratio: 180 / 166; }
+.apparition-coffin { width: 340px; aspect-ratio: 340 / 180; }
+.apparition-grave { width: 220px; aspect-ratio: 220 / 236; }
+.apparition-cauldron { width: 230px; aspect-ratio: 230 / 224; }
+.apparition-cat { width: 200px; aspect-ratio: 200 / 236; }
 .motion-toggle { margin-top: 8px; font: 400 14px var(--caps); letter-spacing: 0.06em; }
 .graveyard h2 { margin: 0; }
 @media print { .haunt { display: none; } }
@@ -164,6 +183,7 @@ input.mono { font-family: var(--mono); font-size: 16px; }
 .address.small { font-size: 13px; padding: 8px 12px; }
 .qr-frame { align-self: center; width: min(100%, 280px); border: 1.5px solid var(--ink); box-shadow: 4px 4px 0 var(--ink); }
 .qr { display: block; width: 100%; height: auto; }
+.qr-too-long { aspect-ratio: 1; display: flex; align-items: center; justify-content: center; padding: 1.5rem; text-align: center; background: #fff; color: #000; }
 
 /* Activity, as a ledger */
 .activity { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--ink); }
@@ -220,6 +240,18 @@ input.mono { font-family: var(--mono); font-size: 16px; }
 .section-head { display: flex; flex-direction: column; gap: 6px; }
 .section-head h1 { margin: 0; }
 
+/* Recovery kit: a printed certificate */
+.kit-sheet { display: flex; flex-direction: column; gap: 18px; }
+.kit-title { font: italic 400 30px/1.1 var(--display); letter-spacing: 0; margin: 0; word-break: break-all; }
+.kit-words { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(4, 1fr); gap: 0 14px; border-top: 1px solid var(--ink); border-bottom: 1px solid var(--ink); }
+.kit-words li { display: flex; align-items: baseline; gap: 8px; padding: 7px 2px; border-bottom: 1px solid var(--hair); }
+.kit-n { font: 400 13px var(--mono); color: var(--blood); min-width: 18px; text-align: right; }
+.kit-w { font: 700 17px var(--mono); }
+.kit-facts { font-size: 15px; }
+.kit-warning { font-style: italic; color: var(--blood); margin: 0; text-align: center; }
+textarea { width: 100%; padding: 10px; border: 1.5px solid var(--ink); border-radius: 0; background: var(--paper-hi); color: var(--ink); font: 400 17px/1.6 var(--mono); resize: vertical; }
+textarea:focus { outline: none; border-color: var(--blood); box-shadow: 0 0 0 1px var(--blood); }
+
 /* Onboarding: each intro step is a chapter opening */
 .onboarding { min-height: 62vh; justify-content: center; }
 .chapter-body { text-align: left; max-width: 500px; font-size: 20px; line-height: 1.55; color: var(--ink-soft); }
@@ -249,6 +281,33 @@ input.mono { font-family: var(--mono); font-size: 16px; }
   .kv { grid-template-columns: 100px 1fr; }
   .chapter-body { font-size: 18px; }
 }
+@media (max-width: 520px) {
+  .kit-words { grid-template-columns: repeat(2, 1fr); }
+}
+/* Printing shows the recovery kit alone, in black ink on white. */
+@media print {
+  html, body { background: #fff; }
+  body * { visibility: hidden; }
+  .kit-sheet, .kit-sheet * { visibility: visible; }
+  .card.plate.kit-sheet { position: absolute; inset: 0 0 auto 0; background: #fff; }
+  .no-print { display: none !important; }
+}
 @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
 
 .break { word-break: break-all; }
+
+/* Stake and governance */
+.figures-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); border-top: 3px solid var(--ink); border-bottom: 1px solid var(--ink); }
+.figures-row > div { padding: 10px 14px 8px; border-right: 1px solid var(--hair); }
+.figures-row > div:last-child { border-right: 0; }
+.figure { font: 500 26px/1.15 var(--serif); font-variant-numeric: lining-nums tabular-nums; }
+.figure-k { color: var(--dim); font: 400 15px var(--caps); letter-spacing: 0.06em; }
+.pool-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--hair); flex-wrap: wrap; }
+.pool-row:last-child { border-bottom: 0; }
+.tally { display: flex; height: 10px; border: 1px solid var(--ink); background: var(--paper-hi); margin: 6px 0 2px; }
+.tally .aye { background: var(--moss); }
+.tally .nay { background: var(--blood); }
+.vote-choice { display: flex; gap: 10px; }
+.vote-choice .btn.on { background: var(--ink); color: var(--paper-hi); }
+select.field-select { font: 400 18px var(--serif); background: transparent; color: var(--ink); border: 0; border-bottom: 1.5px solid var(--ink); padding: 6px 2px; }
+

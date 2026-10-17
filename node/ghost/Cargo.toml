@@ -1,0 +1,67 @@
+[package]
+name = "blockula-ghost"
+version = "0.1.0"
+edition = "2024"
+description = "Ghost Mode cryptographic core: keys, notes, the commitment tree, the Action STARK and note encryption. NOT AUDITED."
+license = "MIT"
+publish = false
+
+# Its own workspace root for now. The node will depend on it by path (MAINNET-DESIGN.md §6).
+[workspace]
+
+# Plonky3 is pinned to one version, like Commonware: its API changes every minor release and the
+# proof format with it. Upgrades are deliberate and change CIRCUIT_ID.
+[dependencies]
+p3-air = "=0.8.0"
+p3-challenger = "=0.8.0"
+p3-commit = "=0.8.0"
+p3-dft = "=0.8.0"
+p3-field = "=0.8.0"
+p3-fri = "=0.8.0"
+p3-koala-bear = "=0.8.0"
+p3-matrix = "=0.8.0"
+p3-merkle-tree = "=0.8.0"
+p3-poseidon2-air = "=0.8.0"
+p3-symmetric = "=0.8.0"
+p3-uni-stark = "=0.8.0"
+p3-security = "=0.8.0"
+blake3 = "1.8.7"
+# `zeroize`: the expanded decapsulation key (held by `TrialDecryptor`) wipes itself on drop.
+ml-kem = { version = "=0.3.2", features = ["zeroize"] }
+# Wipes the key types' secret bytes on drop (ml-kem's `zeroize` feature needs it anyway).
+zeroize = { version = "=1.9.1", default-features = false }
+chacha20poly1305 = { version = "0.11.0", features = ["alloc"] }
+rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "sys_rng"] }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+
+# The STARK prover is unusably slow unoptimized; keep our crate debuggable but optimize deps.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Plonky3's prover re-checks the constraints and panics under debug assertions. Our `prove`
+# checks them itself, and the soundness tests need the prover to go ahead with a bad trace (to
+# show the verifier rejects the result), as it would in a release build.
+[profile.dev.package.p3-uni-stark]
+debug-assertions = false
+
+# Tests prove a lot; our own crate's constraint evaluation is hot.
+[profile.test]
+opt-level = 2
+
+# Value arithmetic must never wrap silently, here or in Plonky3's verifier.
+#
+# These profiles apply only while this crate is its own workspace root (tests, fuzzing, the
+# measurements in docs/GHOST-MODE.md). A crate that depends on it, like the node, builds it with
+# ITS OWN profile, so the node's Cargo.toml must set, to match what was tested:
+#
+#     [profile.release]
+#     overflow-checks = true    # blockula-ghost and every p3-* crate, not just `blockula`
+#     # and keep panic = "unwind" (the default): `verify` relies on catch_unwind.
+#
+# (Or at least `[profile.release.package.blockula-ghost] overflow-checks = true` plus one entry
+# per p3-* crate.) The crate refuses to compile with panic = "abort" (src/lib.rs), and its own
+# arithmetic on untrusted sizes, positions and values is checked explicitly, so it doesn't
+# depend on overflow checks for correctness; Plonky3's robustness evidence was gathered with
+# them on.
+[profile.release]
+overflow-checks = true

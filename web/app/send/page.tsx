@@ -7,13 +7,15 @@ import { Suspense, useEffect, useState } from "react";
 import { PreflightView } from "@/components/explorer/PreflightView";
 import { RequireWallet } from "@/components/Gate";
 import { Apparition } from "@/components/Haunt";
+import { PayLinkNotice } from "@/components/PayLinkNotice";
 import { ErrorNote, ExplorerLink, Spinner, Tip } from "@/components/ui";
-import { explorer } from "@/lib/config";
+import { explorer, MAINNET_PREFIX, NETWORK } from "@/lib/config";
 import { friendly } from "@/lib/errors";
 import { checkTx } from "@/lib/explorer/check";
 import type { Preflight } from "@/lib/explorer/preflight";
 import { shortAddr } from "@/lib/format";
-import type { NameView, TxView } from "@/lib/types";
+import { checkLinkChain, linkChain } from "@/lib/paylink";
+import type { TxView } from "@/lib/types";
 import { useUnlocked } from "@/lib/wallet";
 
 export default function SendPage() {
@@ -29,7 +31,8 @@ export default function SendPage() {
 type Recipient =
   | { state: "empty" }
   | { state: "checking" }
-  | { state: "ok"; address: string; display: string; detail: string }
+  /** `signed`: what goes in the transfer; `byChain`: it's the name, and `address` only the node's current answer. */
+  | { state: "ok"; signed: string; address: string; display: string; detail: string; proven?: boolean; byChain?: boolean }
   | { state: "bad"; msg: string };
 
 const utf8Len = (s: string) => new TextEncoder().encode(s).length;
@@ -40,19 +43,26 @@ function useRecipient(input: string): Recipient {
   useEffect(() => {
     const q = input.trim().toLowerCase();
     if (!q) return setR({ state: "empty" });
-    if (q.startsWith("boo1")) {
+    // This chain's address prefix (DEC-7): another network's address is refused, never "converted".
+    const hrp = client.pin.prefix ?? MAINNET_PREFIX;
+    const prefix = q.match(/^([a-z]+)1[a-z0-9]{40,}$/)?.[1];
+    if (prefix && prefix !== hrp) return setR({ state: "bad", msg: `That's an address on another network (${prefix}1…). ${NETWORK.label} addresses start with ${hrp}1.` });
+    if (q.startsWith(`${hrp}1`)) {
       if (!isAddress(q)) return setR({ state: "bad", msg: "That address doesn't look right. Check for typos." });
       const label = status?.validator.address === q ? "the validator" : "an address";
-      return setR({ state: "ok", address: q, display: shortAddr(q), detail: label });
+      return setR({ state: "ok", signed: q, address: q, display: shortAddr(q), detail: label, proven: true });
     }
     setR({ state: "checking" });
     let live = true;
     const t = setTimeout(async () => {
       try {
-        const v = (await client.name(q)) as NameView;
+        // With the network's witnesses the name's proven owner is signed. Without them the name
+        // itself is signed, and the chain pays whoever owns it when the transfer runs, so the node
+        // can't redirect it; what it says the owner is, is shown as just that (audit gap-7-1).
+        const res = await client.recipient(q);
         if (!live) return;
-        if (v.available || !v.owner) setR({ state: "bad", msg: `${v.name} isn't registered. Check the spelling.` });
-        else setR({ state: "ok", address: v.owner.address, display: v.name, detail: v.owner.short });
+        const detail = res.byChain ? `the chain pays its owner when this runs · your node says ${shortAddr(res.address)} (not proven)` : `${shortAddr(res.address)} · proven by ${client.witnesses.length} other node${client.witnesses.length === 1 ? "" : "s"}`;
+        setR({ state: "ok", signed: res.signed, address: res.address, display: `${res.name}.boo`, detail, proven: res.proven, byChain: res.byChain });
       } catch (e) {
         if (live) setR({ state: "bad", msg: friendly(e) });
       }
@@ -68,11 +78,24 @@ function useRecipient(input: string): Recipient {
 function Send() {
   const { wallet, account, client, refresh } = useUnlocked();
   const params = useSearchParams();
-  const [to, setTo] = useState(params.get("to") ?? "");
-  const [amount, setAmount] = useState(params.get("amount") ?? "");
-  const [memo, setMemo] = useState(params.get("memo") ?? "");
   const prefilled = params.has("to") || params.has("amount") || params.has("memo");
-  const [review, setReview] = useState<{ tx: Tx; display: string; pf: Preflight | null; blockMs: number } | null>(null);
+  // A payment link says which chain it was made for: a check, never a switch. A .boo name can be
+  // someone else's on another network, so a link from another chain fills nothing and can't be
+  // reviewed; until the wallet knows its own chain, it can't be reviewed either (audit main-11-1).
+  const link = prefilled ? linkChain(params) : null;
+  const linkCheck = prefilled ? checkLinkChain(link, client.pin) : null;
+  const refused = linkCheck?.state === "mismatch";
+  const fromLink = (key: string) => (refused ? "" : (params.get(key) ?? ""));
+  const [to, setTo] = useState(() => fromLink("to"));
+  const [amount, setAmount] = useState(() => fromLink("amount"));
+  const [memo, setMemo] = useState(() => fromLink("memo"));
+  useEffect(() => {
+    if (!refused) return;
+    setTo("");
+    setAmount("");
+    setMemo("");
+  }, [refused]);
+  const [review, setReview] = useState<{ tx: Tx; display: string; proven: boolean; byChain: boolean; nodeSays: string; pf: Preflight | null; blockMs: number } | null>(null);
   const [sent, setSent] = useState<TxView | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -91,7 +114,7 @@ function Send() {
   }
   const memoErr = utf8Len(memo) > 256 ? "Memos are limited to 256 bytes." : null;
   const self = recipient.state === "ok" && recipient.address === wallet.account;
-  const canReview = recipient.state === "ok" && drops !== null && !amountErr && !memoErr && !self;
+  const canReview = recipient.state === "ok" && drops !== null && !amountErr && !memoErr && !self && !refused && linkCheck?.state !== "pending";
 
   const toReview = async () => {
     if (recipient.state !== "ok" || drops === null) return;
@@ -99,10 +122,18 @@ function Send() {
     setError(null);
     try {
       // Build and sign now so the fee shown is exactly what will be paid.
-      const tx = await wallet.build({ type: "transfer", to: recipient.address, amount: drops.toString() }, memo);
+      const tx = await wallet.build({ type: "transfer", to: recipient.signed, amount: drops.toString() }, memo);
       // What it will do and whether the chain will take it; the review still works without it.
       const check = await checkTx(tx, wallet.keyId).catch(() => null);
-      setReview({ tx, display: recipient.display, pf: check?.pf ?? null, blockMs: check?.blockMs ?? 1000 });
+      setReview({
+        tx,
+        display: recipient.display,
+        proven: recipient.proven === true,
+        byChain: recipient.byChain === true,
+        nodeSays: recipient.address,
+        pf: check?.pf ?? null,
+        blockMs: check?.blockMs ?? 1000,
+      });
     } catch (e) {
       setError(friendly(e));
     } finally {
@@ -159,8 +190,14 @@ function Send() {
             <dt>To</dt>
             <dd>
               {review.display}
-              {/* Always show the exact address being signed, not just the name. */}
-              <div className="mono small break">{review.tx.action.type === "transfer" ? review.tx.action.to : ""}</div>
+              {/* Always show exactly what's signed: the address, or the name the chain resolves. */}
+              <div className="mono small break" data-testid="signed-to">{review.tx.action.type === "transfer" ? review.tx.action.to : ""}</div>
+              {review.byChain && (
+                <div className="small" data-testid="by-chain">
+                  Signed as the name: the chain pays whoever owns {review.display} when this transaction runs, so no node can send it elsewhere. Your node says that&apos;s <span className="mono break">{review.nodeSays}</span> (not proven).
+                </div>
+              )}
+              {!review.proven && !review.byChain && <div className="warn small">Looked up on your node only, not proven. For a large payment, check this address with the person you&apos;re paying.</div>}
             </dd>
             <dt>Amount</dt>
             <dd>{formatFang(amt)}</dd>
@@ -195,15 +232,11 @@ function Send() {
     <main className="narrow stack-lg">
       <Link href="/" className="back">← Home</Link>
       <h1>Send FANG</h1>
-      {prefilled && (
-        <div className="banner">
-          A link filled in this payment. Double-check who it goes to and how much before sending.
-        </div>
-      )}
+      {linkCheck && <PayLinkNotice check={linkCheck} link={link} wallet={client.pin} />}
       <section className="card stack">
         <label className="field">
           <span>To</span>
-          <input value={to} onChange={(e) => setTo(e.target.value)} placeholder="alice.boo or boo1…" autoCapitalize="none" autoCorrect="off" spellCheck={false} />
+          <input value={to} onChange={(e) => setTo(e.target.value)} placeholder={`alice.boo or ${client.pin.prefix ?? MAINNET_PREFIX}1…`} autoCapitalize="none" autoCorrect="off" spellCheck={false} />
         </label>
         <div className="name-status" aria-live="polite">
           {recipient.state === "checking" && <Spinner>Looking up…</Spinner>}
@@ -231,7 +264,11 @@ function Send() {
         </button>
         <ErrorNote error={error} />
       </section>
-      <Tip>Names are checked live against the chain, so you&apos;ll see who you&apos;re paying before you sign anything.</Tip>
+      <Tip>
+        {client.witnesses.length
+          ? <>Names are proven against {client.witnesses.length + 1} independent nodes before you sign, and the review shows the exact address that gets paid.</>
+          : <>A name is signed as the name: the chain pays whoever owns it when the transaction runs, so the node you&apos;re connected to can&apos;t point it at someone else. The review shows exactly what gets signed.</>}
+      </Tip>
     </main>
   );
 }

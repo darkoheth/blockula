@@ -16,6 +16,10 @@ export interface Status {
   faucet: boolean;
   supply_display: string;
   burned_display: string;
+  genesis_hash?: string;
+  /** bech32m address prefix, on nodes that report it (protocol v1). */
+  address_prefix?: string;
+  prefix?: string;
 }
 
 export interface TxView {
@@ -68,4 +72,34 @@ export interface NameView {
 export interface KeyAccounts {
   key_id: string;
   accounts: { account: Label; role: Role; label: string }[];
+  /** The next page's `after` (`null` at the end). */
+  next?: string | null;
+}
+
+/** A validator in `/api/validators` (active, next_epoch, candidates, …), as node/src/api.rs serves it. */
+export interface ValidatorView {
+  validator: Label;
+  owner: Label;
+  /** `candidate`, `active`, `removed` or `tombstoned`. */
+  status: string;
+  /** The pool's total stake and the owner's self-bond, in drops. */
+  stake: string;
+  stake_display: string;
+  self_bond: string;
+  self_bond_display: string;
+  commission_bps: number;
+  commission_display: string;
+  /** Selectable at the next boundary (registered, bonded enough, not jailed or tombstoned). */
+  eligible: boolean;
+  jailed: { at: number; until: number; reason: string } | null;
+  tombstoned_at: number | null;
+}
+
+export interface ValidatorsView {
+  epoch: number;
+  active: ValidatorView[];
+  next_epoch: ValidatorView[];
+  candidates: ValidatorView[];
+  jailed: ValidatorView[];
+  max_validators: number;
 }

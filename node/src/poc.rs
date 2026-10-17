@@ -1,22 +1,32 @@
 //! 🪦 Proof of Contribution: Souls (reputation that can't be bought), vouching, claims on merged
 //! PRs that validators check against GitHub, Séances (random commit-reveal review juries) and the
-//! contribution pool, paid per sponsor as a square root and vested with clawback.
+//! contribution pool, paid per sponsor (a person's best claim counts fully, each further one a
+//! quarter of the one before) and vested with clawback.
 //!
 //! Lifecycle of a claim: `submit_claim` (bonded) → validators attest what GitHub says → verified
-//! once a BFT quorum agrees on the merge commit → after `claim_maturity_blocks` it enters the next
-//! Séance → jurors compare pairs of claims ("which mattered more?"), commit, then reveal → the
-//! Séance closes: scores, Soul, rewards (vesting) and bonds are settled.
+//! once a BFT quorum agrees on the merge commit → for `claim_maturity_blocks` validators watch for
+//! a revert (a quorum rejects it, beacon.rs) → then it enters the next Séance → jurors compare
+//! pairs of claims ("which mattered more?"), commit, then reveal → the Séance closes: scores,
+//! Soul, rewards (vesting) and bonds are settled.
 //!
-//! Everything here is deterministic integer math over `BTreeMap`s; the open/close of Séances runs
+//! Séances open only at the last block of every `n`th epoch (`State::next_seance_height`, fixed
+//! in advance), and draw their jury and pairs from the randomness beacon (`beacon::seance_seed`)
+//! over jurors and claims that were eligible before anyone could know it
+//! (`State::seance_cutoff`). So neither the opening block's proposer nor anyone who joins,
+//! leaves or times a claim can steer the draw.
+//!
+//! Everything here is deterministic integer math over ordered maps; the open/close of Séances runs
 //! in `end_block`, after a block's txs, on every node. The constants below (and the default
 //! timings) are consensus rules: changing one changes every chain that uses it.
 
 use crate::chain::{short, Journal, State};
 use crate::crypto;
+use crate::state::{JMap, TMap};
 use crate::types::*;
 use anyhow::{anyhow, bail, Result};
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Soul is counted in milli-Soul.
 pub const SOUL: u64 = 1_000;
@@ -29,13 +39,24 @@ pub const JUROR_BOND: u64 = 10 * DROPS_PER_FANG;
 /// Claim bond is this times (1 + the claimant's open claims).
 pub const CLAIM_BOND: u64 = DROPS_PER_FANG;
 pub const MAX_SEANCE_CLAIMS: usize = 64;
-/// A Séance's budget scales with its claims, reaching the full share at this many (so a two-claim
-/// Séance can't take a quarter of the pool).
-pub const FULL_BUDGET_CLAIMS: u64 = 16;
+/// A Séance's budget scales with the people whose claims it judges (claimant accounts, so a
+/// sponsor and its Familiars are one), reaching the full share at this many: a two-person Séance
+/// can't take a quarter of the pool, and one person's extra claims don't add to it (audit
+/// xcut-economic-opus-1).
+pub const FULL_BUDGET_PEOPLE: u64 = 16;
 pub const JURY_SIZE: usize = 7;
 /// Jurors needed to seat a Séance, and reveals needed to settle it (otherwise claims carry over).
 pub const MIN_JURY: usize = 3;
 pub const PAIRS_PER_JUROR: usize = 24;
+/// Most grants one account holds at once. Past it, the fully vested ones are paid out to make
+/// room (as `WithdrawVested` would), and a reward that still doesn't fit goes back to the pool.
+/// At the default timings an account gets at most ~1,700 grants per vesting period (64 claims,
+/// 64 vouch cuts and a jury seat per weekly Séance), so only odd genesis timings can reach it;
+/// it keeps the grants record far below `state::MAX_VALUE_BYTES` whatever the timings.
+pub const MAX_GRANTS: usize = 4_096;
+/// Most validator attestations one claim records (about twice the largest active set governance
+/// can set), so a claim that waits through many set changes still has a bounded record.
+pub const MAX_CLAIM_ATTESTATIONS: usize = 2_048;
 /// Share of the pool's balance each Séance distributes, in basis points.
 pub const SEANCE_POOL_BPS: u64 = 2_500;
 /// Share of a Séance's budget paid to jurors (by agreement).
@@ -51,8 +72,16 @@ pub const TIE_MARGIN_PPM: u64 = 50_000;
 /// below `BAD_AGREEMENT_PPM` they lose Soul. (Voting "=" on everything scores 50%: no reward.)
 pub const GOOD_AGREEMENT_PPM: u64 = 600_000;
 pub const BAD_AGREEMENT_PPM: u64 = 400_000;
-/// Soul for a claim at a perfect score (scaled by its score).
+/// Soul for a claim at a perfect score (scaled by its score, and by its rank among its claimant's
+/// claims in the Séance: [`CLAIM_RANK_SHIFT`]).
 pub const CLAIM_SOUL: u64 = 10 * SOUL;
+/// Volume doesn't pay (audit xcut-economic-opus-1): within one Séance a person's accepted claims
+/// count best first, each a quarter (`>> 2`) of the one ranked above it, for its payout weight and
+/// for its Soul. All of them together count for less than 4/3 of the best one alone, so a pile of
+/// claims each judged worse than someone's solid PR can't add up past it: a win rate puts a claim
+/// that ties the field near half the best one's, which a bonus near 2× would match, and the Soul
+/// boost (up to 1.5×) and the luck of the best of many noisy scores come on top.
+pub const CLAIM_RANK_SHIFT: u32 = 2;
 pub const JUROR_GOOD_SOUL: u64 = SOUL;
 pub const JUROR_BAD_SOUL: u64 = 2 * SOUL;
 /// Not revealing costs at least as much as revealing a ballot that diverges (plus the bond slash),
@@ -60,13 +89,18 @@ pub const JUROR_BAD_SOUL: u64 = 2 * SOUL;
 pub const NO_SHOW_SOUL: u64 = JUROR_BAD_SOUL;
 pub const NO_SHOW_SLASH_BPS: u64 = 1_000;
 pub const SPAM_SOUL: u64 = 20 * SOUL;
+/// A spam verdict needs at least this many flags, and more than half of the jurors who saw the
+/// claim (audit F23: with 64 claims and 24 pairs per seat, most claims are seen by 2–4 of the 7
+/// jurors, so "2 and a majority of viewers" let two colluding seats slash competitors). A claim
+/// fewer than this many jurors saw can't be marked spam: on ambiguity it's scored, never slashed.
+pub const SPAM_MIN_FLAGS: u64 = 3;
 pub const SYBIL_VOUCHER_SOUL: u64 = 50 * SOUL;
 /// Soul at which the payout boost maxes out (1.5×).
 pub const BOOST_CAP_SOUL: u64 = 100 * SOUL;
 
 /// The contribution pool's system account. Anyone can fund it; only Séances pay out of it.
-pub fn pool_address() -> String {
-    crypto::system_address("contribution-pool")
+pub fn pool_address(prefix: &str) -> String {
+    crypto::system_address(prefix, "contribution-pool")
 }
 
 pub fn fmt_soul(milli: u64) -> String {
@@ -75,7 +109,7 @@ pub fn fmt_soul(milli: u64) -> String {
 }
 
 /// Timings, in blocks. From genesis (`contribution`), or derived from the block time.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct PocTimes {
     /// Length of a Séance: the first two thirds for sealed votes, the rest for reveals.
     pub seance_blocks: u64,
@@ -116,14 +150,9 @@ impl PocTimes {
     pub fn reveal_blocks(&self) -> u64 {
         self.seance_blocks.saturating_sub(self.commit_blocks()).max(1)
     }
-    /// How long to wait before trying again when a Séance can't open (too few claims/jurors):
-    /// about an hour for a week-long Séance.
-    pub fn retry_blocks(&self) -> u64 {
-        (self.seance_blocks / 168).max(1)
-    }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Soul {
     /// milli-Soul as of height `at`; it decays from there (half-life `soul_half_life_blocks`).
     pub points: u64,
@@ -145,7 +174,7 @@ pub fn decay(points: u64, elapsed: u64, half_life: u64) -> u64 {
     v - (v as u128 * (elapsed % hl) as u128 / (2 * hl as u128)) as u64
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Vouch {
     pub voucher: String,
     #[serde(with = "u64_str")]
@@ -153,14 +182,48 @@ pub struct Vouch {
     pub at: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// A withdrawn vouch, kept while it still counts (audits xcut-economic-opus-2 and
+/// review-fix-poc-2), under [`vouch_key`]. Until the vouch's lock would have ended, and while a
+/// `FlagSybil` proposal names the vouchee, its voucher still answers for the vouchee: the bond
+/// stays held (`bond`) and its slot taken, and a sybil flag on the vouchee costs the voucher the
+/// bond and `SYBIL_VOUCHER_SOUL` as if the vouch were live. And the two stay tied for any Séance
+/// whose cutoff came before the withdrawal (`State::conflicted`), so dropping a vouch once a seed
+/// is public changes nobody's seat. Epoch boundaries hand back bonds that are free and forget
+/// records no Séance can need (`State::sweep_dropped_vouches`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct DroppedVouch {
+    /// Still held (0 once handed back).
+    #[serde(with = "u64_str")]
+    pub bond: u64,
+    /// When the vouch was made (its lock runs `vouch_lock_blocks` from here), and withdrawn.
+    pub at: u64,
+    pub dropped_at: u64,
+}
+
+/// `vouchee/voucher`, the key of a [`DroppedVouch`] (addresses never contain `/`), so a vouchee's
+/// records are one range.
+pub fn vouch_key(vouchee: &str, voucher: &str) -> String {
+    format!("{vouchee}/{voucher}")
+}
+
+/// A GitHub handle held for one account after governance unlinked it at that account's request
+/// (`ProposalKind::UnlinkGithub`, audit xcut-economic-4): until `until`, only `account` can link
+/// it, so the squatter can't simply link it again the next block. Keyed by lowercase handle;
+/// cleared when the handle is next linked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct HandleHold {
+    pub account: String,
+    pub until: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Sybil {
     pub at: u64,
     pub by: String,
     pub reason: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimStatus {
     /// Waiting for validators to check GitHub.
@@ -181,7 +244,7 @@ impl ClaimStatus {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Attestation {
     pub ok: bool,
     pub merge_sha: String,
@@ -191,7 +254,7 @@ pub struct Attestation {
     pub note: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Claim {
     pub id: u64,
     pub claimant: String,
@@ -220,7 +283,7 @@ pub struct Claim {
     pub reason: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Juror {
     #[serde(with = "u64_str")]
     pub bond: u64,
@@ -230,7 +293,7 @@ pub struct Juror {
     pub served: u64,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct JurySeat {
     /// Pairs of claim ids to compare, in the order votes refer to them.
     pub pairs: Vec<[u64; 2]>,
@@ -246,7 +309,7 @@ pub struct JurySeat {
     pub soul_delta: i64,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct SeanceResults {
     pub accepted: usize,
     pub below_threshold: usize,
@@ -260,7 +323,7 @@ pub struct SeanceResults {
     pub returned: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Seance {
     pub id: u64,
     pub opened_at: u64,
@@ -278,7 +341,7 @@ pub struct Seance {
     pub results: Option<SeanceResults>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GrantSource {
     Claim { claim_id: u64 },
@@ -288,7 +351,7 @@ pub enum GrantSource {
 }
 
 /// A reward that vests linearly from `start` to `end`. Unvested FANG can be clawed back.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Grant {
     pub id: u64,
     #[serde(with = "u64_str")]
@@ -309,39 +372,52 @@ impl Grant {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// What `Poc::claims` indexes as it changes: claims still pending or verified (not yet in a
+/// Séance or settled), so the epoch-boundary steps walk those instead of every claim ever made.
+pub struct OpenClaims;
+
+impl crate::state::Aggregate<Claim> for OpenClaims {
+    fn indexed(c: &Claim) -> bool {
+        matches!(c.status, ClaimStatus::Pending | ClaimStatus::Verified)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct Poc {
     /// Lowercase `owner/name` → weight.
-    pub repos: BTreeMap<String, u64>,
-    pub souls: BTreeMap<String, Soul>,
+    pub repos: TMap<String, u64>,
+    pub souls: TMap<String, Soul>,
     /// Vouchee → the vouch.
-    pub vouches: BTreeMap<String, Vouch>,
-    pub sybils: BTreeMap<String, Sybil>,
-    pub claims: BTreeMap<u64, Claim>,
+    pub vouches: TMap<String, Vouch>,
+    /// Withdrawn vouches that still count, by [`vouch_key`].
+    pub dropped_vouches: TMap<String, DroppedVouch>,
+    pub sybils: TMap<String, Sybil>,
+    pub claims: TMap<u64, Claim, OpenClaims>,
     /// `repo#pr` → claim id, so a PR is claimed once (cleared when validators reject it).
-    pub claim_by_pr: BTreeMap<String, u64>,
+    pub claim_by_pr: TMap<String, u64>,
     /// Lowercase GitHub handle → the account its first verified claim credited. A handle's work
-    /// is always credited to one account, so relinking it can't split one person's √ payout.
-    #[serde(default)]
-    pub handles: BTreeMap<String, String>,
-    pub jurors: BTreeMap<String, Juror>,
-    pub seances: BTreeMap<u64, Seance>,
+    /// is always credited to one account, so relinking it can't split one person's payout.
+    pub handles: TMap<String, String>,
+    /// Lowercase GitHub handle → who may link it while governance holds it ([`HandleHold`]).
+    pub handle_holds: TMap<String, HandleHold>,
+    pub jurors: TMap<String, Juror>,
+    pub seances: TMap<u64, Seance>,
     /// Account → grant id → grant.
-    pub grants: BTreeMap<String, BTreeMap<u64, Grant>>,
+    pub grants: TMap<String, BTreeMap<u64, Grant>>,
     pub next_claim_id: u64,
     pub next_seance_id: u64,
     pub next_grant_id: u64,
-    /// BLAKE3 chain over every block hash since Proof of Contribution was first used.
-    pub seed: String,
     pub open_seance: Option<u64>,
-    /// Earliest height the next Séance may open.
+    /// The next height on the cadence where a Séance may open (display; see
+    /// `State::next_seance_height`).
     pub next_seance_at: u64,
 }
 
 impl Poc {
-    /// False on chains that never used it, so their state roots are unchanged.
+    /// False until Proof of Contribution is first used; until then the end-of-block step
+    /// (Séances) doesn't run.
     pub fn is_active(&self) -> bool {
-        !(self.seed.is_empty() && self.repos.is_empty() && self.souls.is_empty() && self.vouches.is_empty() && self.sybils.is_empty() && self.claims.is_empty() && self.jurors.is_empty() && self.grants.is_empty() && self.handles.is_empty())
+        !(self.repos.is_empty() && self.souls.is_empty() && self.vouches.is_empty() && self.dropped_vouches.is_empty() && self.sybils.is_empty() && self.claims.is_empty() && self.jurors.is_empty() && self.grants.is_empty() && self.handles.is_empty() && self.seances.is_empty())
     }
 
     pub fn has_open_claims(&self, account: &str) -> usize {
@@ -351,51 +427,19 @@ impl Poc {
 
 // ------------------------------------------------------------------------------------ journal
 
-/// Old values of touched entries, for rollback (first touch wins).
-pub struct JMap<K, V>(HashMap<K, Option<V>>);
-
-impl<K, V> Default for JMap<K, V> {
-    fn default() -> Self {
-        Self(HashMap::new())
-    }
-}
-
-impl<K: Ord + std::hash::Hash + Clone, V: Clone> JMap<K, V> {
-    fn touch(&mut self, map: &BTreeMap<K, V>, k: &K) {
-        if !self.0.contains_key(k) {
-            self.0.insert(k.clone(), map.get(k).cloned());
-        }
-    }
-    fn absorb(&mut self, other: Self) {
-        for (k, v) in other.0 {
-            self.0.entry(k).or_insert(v);
-        }
-    }
-    fn restore(self, map: &mut BTreeMap<K, V>) {
-        for (k, old) in self.0 {
-            match old {
-                Some(v) => {
-                    map.insert(k, v);
-                }
-                None => {
-                    map.remove(&k);
-                }
-            }
-        }
-    }
-}
-
-type Scalars = (u64, u64, u64, String, Option<u64>, u64);
+type Scalars = (u64, u64, u64, Option<u64>, u64);
 
 #[derive(Default)]
 pub struct PocJournal {
     repos: JMap<String, u64>,
     souls: JMap<String, Soul>,
     vouches: JMap<String, Vouch>,
+    dropped_vouches: JMap<String, DroppedVouch>,
     sybils: JMap<String, Sybil>,
     claims: JMap<u64, Claim>,
     claim_by_pr: JMap<String, u64>,
     handles: JMap<String, String>,
+    handle_holds: JMap<String, HandleHold>,
     jurors: JMap<String, Juror>,
     seances: JMap<u64, Seance>,
     grants: JMap<String, BTreeMap<u64, Grant>>,
@@ -407,10 +451,12 @@ impl PocJournal {
         self.repos.absorb(o.repos);
         self.souls.absorb(o.souls);
         self.vouches.absorb(o.vouches);
+        self.dropped_vouches.absorb(o.dropped_vouches);
         self.sybils.absorb(o.sybils);
         self.claims.absorb(o.claims);
         self.claim_by_pr.absorb(o.claim_by_pr);
         self.handles.absorb(o.handles);
+        self.handle_holds.absorb(o.handle_holds);
         self.jurors.absorb(o.jurors);
         self.seances.absorb(o.seances);
         self.grants.absorb(o.grants);
@@ -423,22 +469,24 @@ impl PocJournal {
         self.repos.restore(&mut p.repos);
         self.souls.restore(&mut p.souls);
         self.vouches.restore(&mut p.vouches);
+        self.dropped_vouches.restore(&mut p.dropped_vouches);
         self.sybils.restore(&mut p.sybils);
         self.claims.restore(&mut p.claims);
         self.claim_by_pr.restore(&mut p.claim_by_pr);
         self.handles.restore(&mut p.handles);
+        self.handle_holds.restore(&mut p.handle_holds);
         self.jurors.restore(&mut p.jurors);
         self.seances.restore(&mut p.seances);
         self.grants.restore(&mut p.grants);
-        if let Some((a, b, c, seed, open, next)) = self.scalars {
-            (p.next_claim_id, p.next_seance_id, p.next_grant_id, p.seed, p.open_seance, p.next_seance_at) = (a, b, c, seed, open, next);
+        if let Some((a, b, c, open, next)) = self.scalars {
+            (p.next_claim_id, p.next_seance_id, p.next_grant_id, p.open_seance, p.next_seance_at) = (a, b, c, open, next);
         }
     }
 }
 
 // ------------------------------------------------------------------------------- randomness
 
-/// Deterministic stream from the Séance seed (BLAKE3 XOF, domain-separated per use).
+/// Deterministic stream from a Séance's seed (BLAKE3 XOF, domain-separated per use).
 struct Rng(blake3::OutputReader);
 
 impl Rng {
@@ -465,18 +513,10 @@ impl Rng {
     }
 }
 
-/// Integer square root (Newton's method), floor.
-fn isqrt(n: u128) -> u128 {
-    if n < 2 {
-        return n;
-    }
-    let mut x = n;
-    let mut y = x / 2 + x % 2;
-    while y < x {
-        x = y;
-        y = (x + n / x) / 2;
-    }
-    x
+/// What a claim's `weight` counts for at `rank` (0 = its claimant's best in the Séance):
+/// `weight / 4^rank` ([`CLAIM_RANK_SHIFT`]), 0 once the shift passes the width.
+fn ranked(weight: u128, rank: usize) -> u128 {
+    u32::try_from(rank).ok().and_then(|r| r.checked_mul(CLAIM_RANK_SHIFT)).and_then(|sh| weight.checked_shr(sh)).unwrap_or(0)
 }
 
 fn bps(amount: u64, bps: u64) -> u64 {
@@ -519,6 +559,25 @@ impl State {
         (self.soul_of(account, height) / (10 * SOUL)).min(10) as usize
     }
 
+    /// The vouches `voucher` answers for: its live ones, and the withdrawn ones whose bond is
+    /// still held ([`DroppedVouch`]). They count against [`State::max_vouches`].
+    pub fn vouches_held_by(&self, voucher: &str) -> usize {
+        let live = self.poc.vouches.values().filter(|v| v.voucher == voucher).count();
+        live + self.poc.dropped_vouches.iter().filter(|(k, d)| d.bond > 0 && k.rsplit_once('/').is_some_and(|(_, by)| by == voucher)).count()
+    }
+
+    /// A vouchee's withdrawn vouches that still count: (voucher, record).
+    pub fn dropped_vouches_of(&self, vouchee: &str) -> Vec<(String, DroppedVouch)> {
+        self.poc.dropped_vouches.range(format!("{vouchee}/")..format!("{vouchee}0")).filter_map(|(k, d)| Some((k.rsplit_once('/')?.1.to_string(), d.clone()))).collect()
+    }
+
+    /// Whether a `FlagSybil` proposal naming `account` is being voted on or waiting out its
+    /// timelock (its account was resolved to an address when it was proposed).
+    pub fn sybil_flag_proposed(&self, account: &str) -> bool {
+        let g = &self.governance;
+        g.open_proposals.iter().filter_map(|id| g.proposals.get(id)).any(|p| matches!(&p.kind, ProposalKind::FlagSybil { account: a, .. } if a == account))
+    }
+
     /// The bond the next claim from `account` costs.
     pub fn claim_bond(&self, account: &str) -> u64 {
         CLAIM_BOND.saturating_mul(1 + self.poc.has_open_claims(account) as u64)
@@ -540,7 +599,7 @@ impl State {
     fn pj<'j>(&self, j: &'j mut Journal) -> &'j mut PocJournal {
         if j.poc.scalars.is_none() {
             let p = &self.poc;
-            j.poc.scalars = Some((p.next_claim_id, p.next_seance_id, p.next_grant_id, p.seed.clone(), p.open_seance, p.next_seance_at));
+            j.poc.scalars = Some((p.next_claim_id, p.next_seance_id, p.next_grant_id, p.open_seance, p.next_seance_at));
         }
         &mut j.poc
     }
@@ -593,6 +652,45 @@ impl State {
         self.poc.grants.entry(key).or_default()
     }
 
+    fn set_dropped_vouch(&mut self, j: &mut Journal, key: &str, d: Option<DroppedVouch>) {
+        let key = key.to_string();
+        self.pj(j).dropped_vouches.touch(&self.poc.dropped_vouches, &key);
+        match d {
+            Some(d) => self.poc.dropped_vouches.insert(key, d),
+            None => self.poc.dropped_vouches.remove(&key),
+        };
+    }
+
+    /// Withdraws the live vouch for `to`. Its voucher answers for `to` until the lock would have
+    /// ended, and while a `FlagSybil` proposal names `to`: the bond stays held until then. Either
+    /// way the withdrawal is recorded, so the two stay tied for the Séances whose draw could be
+    /// known when it happened ([`DroppedVouch`]).
+    fn drop_vouch(&mut self, j: &mut Journal, to: &str, height: u64) {
+        let Some(v) = self.poc.vouches.get(to).cloned() else { return };
+        let key = vouch_key(to, &v.voucher);
+        let mut d = self.poc.dropped_vouches.get(&key).cloned().unwrap_or(DroppedVouch { bond: 0, at: v.at, dropped_at: height });
+        if height < v.at.saturating_add(self.params.poc.vouch_lock_blocks) || self.sybil_flag_proposed(to) {
+            d.bond += v.bond;
+            d.at = d.at.max(v.at);
+        } else {
+            self.j_credit(j, &v.voucher, v.bond);
+        }
+        d.dropped_at = height;
+        self.set_dropped_vouch(j, &key, Some(d));
+        self.pj(j).vouches.touch(&self.poc.vouches, to);
+        self.poc.vouches.remove(to);
+    }
+
+    /// Sets or clears the hold on a GitHub handle (lowercase).
+    pub(crate) fn set_handle_hold(&mut self, j: &mut Journal, handle: &str, hold: Option<HandleHold>) {
+        let key = handle.to_string();
+        self.pj(j).handle_holds.touch(&self.poc.handle_holds, &key);
+        match hold {
+            Some(h) => self.poc.handle_holds.insert(key, h),
+            None => self.poc.handle_holds.remove(&key),
+        };
+    }
+
     fn set_claim_by_pr(&mut self, j: &mut Journal, key: &str, id: Option<u64>) {
         let key = key.to_string();
         self.pj(j).claim_by_pr.touch(&self.poc.claim_by_pr, &key);
@@ -602,19 +700,43 @@ impl State {
         };
     }
 
-    fn add_grant(&mut self, j: &mut Journal, account: &str, amount: u64, height: u64, source: GrantSource) -> u64 {
+    /// Grants `amount` to `account`, vesting from `height`. `None` if the account holds
+    /// `MAX_GRANTS` still-vesting grants: the amount went back to the pool instead.
+    fn add_grant(&mut self, j: &mut Journal, account: &str, amount: u64, height: u64, source: GrantSource) -> Option<u64> {
         self.pj(j);
+        if self.poc.grants.get(account).is_some_and(|g| g.len() >= MAX_GRANTS) {
+            // Make room: pay out what has fully vested.
+            let grants = self.grants_mut(j, account);
+            let mut paid = 0u64;
+            for g in grants.values_mut().filter(|g| g.vested(height) == g.amount) {
+                paid += g.amount - g.withdrawn;
+                g.withdrawn = g.amount;
+            }
+            grants.retain(|_, g| g.withdrawn < g.amount);
+            let full = grants.len() >= MAX_GRANTS;
+            if grants.is_empty() {
+                self.poc.grants.remove(account);
+            }
+            if paid > 0 {
+                self.j_credit(j, account, paid);
+            }
+            if full {
+                self.to_pool(j, amount);
+                return None;
+            }
+        }
         let id = self.poc.next_grant_id;
         self.poc.next_grant_id += 1;
         let end = height.saturating_add(self.params.poc.vesting_blocks);
         self.grants_mut(j, account).insert(id, Grant { id, amount, withdrawn: 0, start: height, end, source });
-        id
+        Some(id)
     }
 
     /// Returns `amount` to the pool account.
     fn to_pool(&mut self, j: &mut Journal, amount: u64) {
         if amount > 0 {
-            self.j_credit(j, &pool_address(), amount);
+            let pool = self.pool();
+            self.j_credit(j, &pool, amount);
         }
     }
 
@@ -656,6 +778,7 @@ impl State {
     /// Applies a Proof of Contribution action.
     pub(crate) fn apply_poc(&mut self, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &crate::chain::KeyRecord, height: u64) -> Result<()> {
         let admin = self.params.admins.iter().any(|a| a == sender);
+        let no_admins = self.params.admins.is_empty();
         let owner = key.role == KeyRole::Owner;
         let need_owner = |what: &str| -> Result<()> {
             if !owner {
@@ -663,7 +786,12 @@ impl State {
             }
             Ok(())
         };
+        // GOV-3: the admin levers exist only on chains with admins (dev and test); elsewhere they
+        // are governance proposals.
         let need_admin = |what: &str| -> Result<()> {
+            if no_admins {
+                bail!("only validator admins can {what}, and this chain has none: put it to a governance proposal");
+            }
             if !admin {
                 bail!("only validator admins can {what} (Season 0)");
             }
@@ -672,28 +800,11 @@ impl State {
         match &tx.action {
             Action::SetRepo { repo, weight } => {
                 need_admin("set pool repos")?;
-                let k = repo.to_ascii_lowercase();
-                self.pj(j).repos.touch(&self.poc.repos, &k);
-                if *weight == 0 {
-                    self.poc.repos.remove(&k).ok_or_else(|| anyhow!("{repo} isn't in the contribution pool"))?;
-                    // Claims waiting on it would be stuck: refund and close them.
-                    let stuck: Vec<(u64, u64)> = self.poc.claims.values().filter(|c| c.repo == k && matches!(c.status, ClaimStatus::Pending | ClaimStatus::Verified)).map(|c| (c.id, c.pr)).collect();
-                    for (id, pr) in stuck {
-                        self.settle_bond(j, id, true);
-                        self.set_status(j, id, ClaimStatus::Rejected, height, Some("the repo left the contribution pool; bond refunded".into()));
-                        self.set_claim_by_pr(j, &format!("{k}#{pr}"), None);
-                    }
-                } else {
-                    self.poc.repos.insert(k, *weight);
-                }
+                self.exec_set_repo(j, repo, *weight, height)?;
             }
             Action::GrantSoul { to, amount, .. } => {
                 need_admin("grant Soul")?;
-                let to = self.resolve(to)?;
-                if self.is_sybil(&to) {
-                    bail!("{} is flagged as a sybil", short(&to));
-                }
-                self.add_soul(j, &to, *amount as i64, height);
+                self.exec_grant_soul(j, to, *amount, height)?;
             }
             Action::Vouch { account } => {
                 need_owner("vouch")?;
@@ -715,9 +826,9 @@ impl State {
                 if self.soul_of(&to, height) > 0 || self.poc.claims.values().any(|c| c.claimant == to && c.status == ClaimStatus::Scored) {
                     bail!("{} isn't a newcomer (they already have Soul or judged work)", short(&to));
                 }
-                let mine = self.poc.vouches.values().filter(|v| v.voucher == sender).count();
-                if mine >= self.max_vouches(sender, height) {
-                    bail!("your Soul allows {} active vouches (one per 10 Soul)", self.max_vouches(sender, height));
+                // A withdrawn vouch still takes its slot while its bond is held (`DroppedVouch`).
+                if self.vouches_held_by(sender) >= self.max_vouches(sender, height) {
+                    bail!("your Soul allows {} active vouches (one per 10 Soul; a withdrawn vouch counts until its lock is over)", self.max_vouches(sender, height));
                 }
                 self.j_debit(j, sender, VOUCH_BOND)?;
                 self.pj(j).vouches.touch(&self.poc.vouches, &to);
@@ -737,20 +848,21 @@ impl State {
                         bail!("this vouch is locked until block {unlock}");
                     }
                 }
-                self.pj(j).vouches.touch(&self.poc.vouches, &to);
-                self.poc.vouches.remove(&to);
-                self.j_credit(j, &v.voucher, v.bond);
+                // The vouch itself can always go, so a newcomer can decline an unwanted one even
+                // with a claim open (a lock would let a voucher force its cut). What it doesn't
+                // undo (`DroppedVouch`): the voucher answers for the newcomer until the lock is
+                // over (audit xcut-economic-opus-2: otherwise a sybil drops its vouch before the
+                // flag and its voucher loses nothing), and the two stay off each other's claims
+                // in any Séance whose seed could be known when it went (audits F53 and
+                // review-fix-poc-2), without moving anyone's seat.
+                self.drop_vouch(j, &to, height);
             }
             Action::FlagSybil { account, reason } => {
                 need_admin("flag sybils")?;
-                let who = self.resolve(account)?;
-                if self.is_sybil(&who) {
-                    bail!("{} is already flagged", short(&who));
-                }
-                if self.params.admins.contains(&who) {
+                if self.params.admins.contains(&self.resolve(account)?) {
                     bail!("admins can't be flagged");
                 }
-                self.flag_sybil(j, &who, sender, reason, height);
+                self.exec_flag_sybil(j, account, sender, reason, height)?;
             }
             Action::SubmitClaim { repo, pr, familiar_key } => {
                 if self.is_sybil(sender) {
@@ -808,19 +920,22 @@ impl State {
                 self.set_claim_by_pr(j, &pr_key, Some(id));
             }
             Action::AttestClaim { claim_id, ok, merge_sha, note } => {
-                let set = self.active_sets.get(&self.params.epoch_of(height)).cloned().unwrap_or_default();
-                if !set.iter().any(|v| v == sender) {
-                    bail!("only active validators can attest claims");
-                }
+                let epoch = self.params.epoch_of(height);
+                let set = self.active_sets.get(&epoch).cloned().unwrap_or_default();
+                // The validator this signer acts for: itself, or (SF-13) its owner paying the fee.
+                let validator = crate::staking::validator_for_signer(self, sender, signer, epoch).ok_or_else(|| anyhow!("only active validators can attest claims"))?;
                 let c = self.poc.claims.get(claim_id).ok_or_else(|| anyhow!("no claim #{claim_id}"))?;
                 if c.status != ClaimStatus::Pending {
                     bail!("claim #{claim_id} is {:?}, not pending", c.status);
                 }
-                if c.attestations.contains_key(sender) {
+                if c.attestations.contains_key(&validator) {
                     bail!("this validator already attested claim #{claim_id}");
                 }
+                if c.attestations.len() >= MAX_CLAIM_ATTESTATIONS {
+                    bail!("claim #{claim_id} has {MAX_CLAIM_ATTESTATIONS} attestations already");
+                }
                 let c = self.claim_mut(j, *claim_id).unwrap();
-                c.attestations.insert(sender.to_string(), Attestation { ok: *ok, merge_sha: merge_sha.clone(), at: height, note: note.clone() });
+                c.attestations.insert(validator, Attestation { ok: *ok, merge_sha: merge_sha.clone(), at: height, note: note.clone() });
                 // A BFT quorum of the current set settles it either way.
                 let n = set.len();
                 let quorum = n - (n - 1) / 3;
@@ -864,27 +979,7 @@ impl State {
             }
             Action::RejectClaim { claim_id, reason } => {
                 need_admin("reject claims")?;
-                let c = self.poc.claims.get(claim_id).cloned().ok_or_else(|| anyhow!("no claim #{claim_id}"))?;
-                match c.status {
-                    // Never verified: the PR wasn't proven to be theirs, so its author can still claim it.
-                    ClaimStatus::Pending => {
-                        self.settle_bond(j, *claim_id, false);
-                        self.set_claim_by_pr(j, &format!("{}#{}", c.repo, c.pr), None);
-                    }
-                    ClaimStatus::Verified | ClaimStatus::InSeance => self.settle_bond(j, *claim_id, false),
-                    ClaimStatus::Scored => {
-                        if let Some(g) = c.grant {
-                            self.claw_back(j, &c.claimant, Some(g), height);
-                        }
-                        let cuts: Vec<(String, u64)> = self.poc.grants.iter().flat_map(|(a, gs)| gs.values().filter(|g| g.source == GrantSource::Vouch { claim_id: *claim_id }).map(move |g| (a.clone(), g.id))).collect();
-                        for (voucher, g) in cuts {
-                            self.claw_back(j, &voucher, Some(g), height);
-                        }
-                        self.add_soul(j, &c.claimant, -(c.soul_awarded as i64), height);
-                    }
-                    ClaimStatus::Spam | ClaimStatus::Rejected => bail!("claim #{claim_id} is already {:?}", c.status),
-                }
-                self.set_status(j, *claim_id, ClaimStatus::Rejected, height, Some(reason.clone()));
+                self.exec_reject_claim(j, *claim_id, reason, height)?;
             }
             Action::JoinJury { bond } => {
                 need_owner("join the jury pool")?;
@@ -904,7 +999,11 @@ impl State {
                 self.pj(j).jurors.touch(&self.poc.jurors, &key);
                 let r = self.poc.jurors.entry(key).or_insert(Juror { bond: 0, joined_at: height, active: true, served: 0 });
                 r.bond = total;
-                r.active = true;
+                if !r.active {
+                    // A benched juror coming back is new to the draw (`State::seance_cutoff`).
+                    r.joined_at = height;
+                    r.active = true;
+                }
             }
             Action::LeaveJury {} => {
                 need_owner("leave the jury pool")?;
@@ -919,16 +1018,18 @@ impl State {
                 self.poc.jurors.remove(sender);
                 self.j_credit(j, sender, r.bond);
             }
-            Action::CommitVotes { seance_id, commitment } => {
+            Action::CommitVotes { seance_id, commitment, pairs_digest } => {
                 let s = self.poc.seances.get(seance_id).ok_or_else(|| anyhow!("no Séance #{seance_id}"))?;
                 if s.closed {
                     bail!("Séance #{seance_id} is closed");
                 }
-                if !s.jurors.contains_key(sender) {
-                    bail!("you're not on the jury of Séance #{seance_id}");
-                }
+                let Some(seat) = s.jurors.get(sender) else { bail!("you're not on the jury of Séance #{seance_id}") };
                 if height > s.commit_until {
                     bail!("sealed votes for Séance #{seance_id} closed at block {}; reveal now", s.commit_until);
+                }
+                // The judgment is for the pairs (and PRs) its juror compared (audit gap-7-6).
+                if seat_pairs_digest(self, *seance_id, sender, &seat.pairs) != *pairs_digest {
+                    bail!("the pairs this judgment was made on aren't your seat's in Séance #{seance_id} (claims or PRs differ): the node they were read from may be misreporting them");
                 }
                 let seat = self.seance_mut(j, *seance_id).unwrap().jurors.get_mut(sender).unwrap();
                 seat.commitment = Some(commitment.clone());
@@ -991,14 +1092,112 @@ impl State {
             }
             Action::Clawback { account, .. } => {
                 need_admin("claw back rewards")?;
-                let who = self.resolve(account)?;
-                if self.claw_back(j, &who, None, height) == 0 {
-                    bail!("{} has no unvested rewards", short(&who));
-                }
+                self.exec_clawback(j, account, height)?;
             }
             _ => bail!("not a contribution action"),
         }
         Ok(())
+    }
+
+    // ---- levers: the bodies of the former admin actions, with no signer checks. Admin-signed
+    // txs (dev and test chains) call them after checking the signer; governance proposals
+    // (`ProposalKind`, P-GOV) call them when they execute. See chain.rs for the others.
+
+    /// Puts a repo in the contribution pool with `weight` (1–`MAX_REPO_WEIGHT`), or with 0 takes
+    /// it out, refunding and closing the claims that waited on it.
+    pub(crate) fn exec_set_repo(&mut self, j: &mut Journal, repo: &str, weight: u64, height: u64) -> Result<()> {
+        if weight > MAX_REPO_WEIGHT {
+            bail!("repo weight must be 0–{MAX_REPO_WEIGHT} (0 removes the repo)");
+        }
+        let k = repo.to_ascii_lowercase();
+        self.pj(j).repos.touch(&self.poc.repos, &k);
+        if weight == 0 {
+            self.poc.repos.remove(&k).ok_or_else(|| anyhow!("{repo} isn't in the contribution pool"))?;
+            // Claims waiting on it would be stuck: refund and close them.
+            let stuck: Vec<(u64, u64)> = self.poc.claims.values().filter(|c| c.repo == k && matches!(c.status, ClaimStatus::Pending | ClaimStatus::Verified)).map(|c| (c.id, c.pr)).collect();
+            for (id, pr) in stuck {
+                self.settle_bond(j, id, true);
+                self.set_status(j, id, ClaimStatus::Rejected, height, Some("the repo left the contribution pool; bond refunded".into()));
+                self.set_claim_by_pr(j, &format!("{k}#{pr}"), None);
+            }
+        } else {
+            self.poc.repos.insert(k, weight);
+        }
+        Ok(())
+    }
+
+    /// Grants Soul (milli-Soul, 1–`MAX_SOUL_GRANT` per grant). Sybils get none.
+    pub(crate) fn exec_grant_soul(&mut self, j: &mut Journal, to: &str, amount: u64, height: u64) -> Result<()> {
+        if amount == 0 || amount > MAX_SOUL_GRANT {
+            bail!("a Soul grant is 1–{MAX_SOUL_GRANT} milli-Soul");
+        }
+        let to = self.resolve(to)?;
+        if self.is_sybil(&to) {
+            bail!("{} is flagged as a sybil", short(&to));
+        }
+        self.add_soul(j, &to, amount as i64, height);
+        Ok(())
+    }
+
+    /// Flags an account as a sybil (`by`: who decided, e.g. an admin or a proposal): zeroes its
+    /// Soul, rejects its open claims, claws back its unvested rewards, slashes whoever vouched.
+    pub(crate) fn exec_flag_sybil(&mut self, j: &mut Journal, account: &str, by: &str, reason: &str, height: u64) -> Result<()> {
+        let who = self.resolve(account)?;
+        if self.is_sybil(&who) {
+            bail!("{} is already flagged", short(&who));
+        }
+        self.flag_sybil(j, &who, by, reason, height);
+        Ok(())
+    }
+
+    /// Lifts a sybil flag (`UnflagSybil`, the appeal path for `FlagSybil`, audit F54): the account
+    /// can vouch, be vouched for, claim (its GitHub handle stays credited to it), earn Soul and
+    /// join juries again. Nothing the flag took comes back (Soul, bonds, rejected claims,
+    /// clawed-back rewards, voided vouches); governance can grant Soul separately.
+    pub(crate) fn exec_unflag_sybil(&mut self, j: &mut Journal, account: &str) -> Result<()> {
+        let who = self.resolve(account)?;
+        if !self.is_sybil(&who) {
+            bail!("{} isn't flagged as a sybil", short(&who));
+        }
+        self.pj(j).sybils.touch(&self.poc.sybils, &who);
+        self.poc.sybils.remove(&who);
+        Ok(())
+    }
+
+    /// Rejects a claim (say, its PR was reverted): slashes the bond, or for a scored claim claws
+    /// back its unvested reward (and its vouchers' cuts) and the Soul it earned.
+    pub(crate) fn exec_reject_claim(&mut self, j: &mut Journal, claim_id: u64, reason: &str, height: u64) -> Result<()> {
+        let c = self.poc.claims.get(&claim_id).cloned().ok_or_else(|| anyhow!("no claim #{claim_id}"))?;
+        match c.status {
+            // Never verified: the PR wasn't proven to be theirs, so its author can still claim it.
+            ClaimStatus::Pending => {
+                self.settle_bond(j, claim_id, false);
+                self.set_claim_by_pr(j, &format!("{}#{}", c.repo, c.pr), None);
+            }
+            ClaimStatus::Verified | ClaimStatus::InSeance => self.settle_bond(j, claim_id, false),
+            ClaimStatus::Scored => {
+                if let Some(g) = c.grant {
+                    self.claw_back(j, &c.claimant, Some(g), height);
+                }
+                let cuts: Vec<(String, u64)> = self.poc.grants.iter().flat_map(|(a, gs)| gs.values().filter(|g| g.source == GrantSource::Vouch { claim_id }).map(move |g| (a.clone(), g.id))).collect();
+                for (voucher, g) in cuts {
+                    self.claw_back(j, &voucher, Some(g), height);
+                }
+                self.add_soul(j, &c.claimant, -(c.soul_awarded as i64), height);
+            }
+            ClaimStatus::Spam | ClaimStatus::Rejected => bail!("claim #{claim_id} is already {:?}", c.status),
+        }
+        self.set_status(j, claim_id, ClaimStatus::Rejected, height, Some(reason.to_string()));
+        Ok(())
+    }
+
+    /// Returns an account's unvested rewards to the pool. Returns what came back (never 0).
+    pub(crate) fn exec_clawback(&mut self, j: &mut Journal, account: &str, height: u64) -> Result<u64> {
+        let who = self.resolve(account)?;
+        match self.claw_back(j, &who, None, height) {
+            0 => bail!("{} has no unvested rewards", short(&who)),
+            back => Ok(back),
+        }
     }
 
     fn flag_sybil(&mut self, j: &mut Journal, who: &str, by: &str, reason: &str, height: u64) {
@@ -1022,7 +1221,9 @@ impl State {
             self.poc.jurors.remove(who);
             self.to_pool(j, r.bond);
         }
-        // Whoever vouched for it loses the bond and Soul; vouches it gave are void.
+        // Whoever vouched for it loses the bond and Soul; vouches it gave are void. That covers
+        // a vouch withdrawn while its voucher still answers for it (`DroppedVouch`, audit
+        // xcut-economic-opus-2): its bond is still held.
         let touched: Vec<String> = self.poc.vouches.iter().filter(|(to, v)| *to == who || v.voucher == who).map(|(to, _)| to.clone()).collect();
         for to in touched {
             let v = self.poc.vouches.get(&to).cloned().unwrap();
@@ -1033,12 +1234,26 @@ impl State {
                 self.add_soul(j, &v.voucher, -(SYBIL_VOUCHER_SOUL as i64), height);
             }
         }
+        let dropped: Vec<(String, DroppedVouch)> = self.poc.dropped_vouches.iter().filter(|(k, _)| k.split_once('/').is_some_and(|(to, by)| to == who || by == who)).map(|(k, d)| (k.clone(), d.clone())).collect();
+        for (key, d) in dropped {
+            self.set_dropped_vouch(j, &key, None);
+            self.to_pool(j, d.bond);
+            if d.bond > 0 && key.split_once('/').is_some_and(|(to, _)| to == who) {
+                self.add_soul(j, key.rsplit_once('/').unwrap().1, -(SYBIL_VOUCHER_SOUL as i64), height);
+            }
+        }
+        // And its vouchers' cuts of its rewards go back with its own (as `exec_reject_claim`).
+        let mine: BTreeSet<u64> = self.poc.claims.values().filter(|c| c.claimant == who).map(|c| c.id).collect();
+        let cuts: Vec<(String, u64)> = self.poc.grants.iter().flat_map(|(a, gs)| gs.values().filter(|g| matches!(g.source, GrantSource::Vouch { claim_id } if mine.contains(&claim_id))).map(move |g| (a.clone(), g.id))).collect();
+        for (voucher, g) in cuts {
+            self.claw_back(j, &voucher, Some(g), height);
+        }
     }
 
     /// Plain-English summary of a contribution tx (see `State::describe`).
-    pub fn describe_poc(&self, tx: &Tx, from: &str) -> String {
+    pub fn describe_poc(&self, tx: &Tx, from: &str, primary_name: &dyn Fn(&str) -> Option<String>) -> String {
         let who = |a: &str| match self.resolve(a) {
-            Ok(addr) => self.primary_name(&addr).unwrap_or_else(|| short(&addr)),
+            Ok(addr) => primary_name(&addr).unwrap_or_else(|| short(&addr)),
             Err(_) => a.to_string(),
         };
         let claim = |id: &u64| self.poc.claims.get(id).map(|c| format!("claim #{id} ({}#{})", c.repo, c.pr)).unwrap_or_else(|| format!("claim #{id}"));
@@ -1072,72 +1287,149 @@ impl State {
 
     // ------------------------------------------------------------------------------ Séances
 
-    /// After every block's txs: advance the randomness, then close and open Séances.
-    pub fn poc_end_block(&mut self, height: u64, block_hash: &str) {
+    /// Séances may open every this many epochs: the fewest a Séance fits in, so each one closes
+    /// by the next opening.
+    pub fn seance_every_epochs(&self) -> u64 {
+        self.params.poc.seance_blocks.div_ceil(self.params.epoch_blocks.max(2)).max(1)
+    }
+
+    /// The first height at or after `height` where a Séance may open: the last block of every
+    /// [`State::seance_every_epochs`]th epoch. Fixed in advance; nothing on chain moves it.
+    pub fn next_seance_height(&self, height: u64) -> u64 {
+        let n = self.seance_every_epochs();
+        let epoch = (self.params.epoch_of(height) + 1).div_ceil(n) * n - 1;
+        self.params.last_of(epoch)
+    }
+
+    /// Jurors and claims a Séance opening at the end of `epoch` may draw on became eligible
+    /// before this height (joined; revert window over): the start of `epoch - 1`. The Séance's
+    /// seed, `value(epoch)`, comes from the reveals of `epoch - 1`, so whoever could still add a
+    /// juror or time a claim couldn't know how they'd be drawn. Before epoch 2 nothing is.
+    pub fn seance_cutoff(&self, epoch: u64) -> u64 {
+        epoch.saturating_sub(1).saturating_mul(self.params.epoch_blocks.max(2))
+    }
+
+    /// After every block's txs: close the open Séance once its reveals are over; at an epoch
+    /// boundary, refund stale claims and, on the cadence, open the next Séance.
+    pub fn poc_end_block(&mut self, height: u64) {
         if !self.poc.is_active() {
             return;
         }
-        let mut h = blake3::Hasher::new_derive_key("blockula poc seed v1");
-        h.update(self.poc.seed.as_bytes());
-        h.update(block_hash.as_bytes());
-        self.poc.seed = h.finalize().to_hex().to_string();
         if let Some(id) = self.poc.open_seance {
             if self.poc.seances.get(&id).is_some_and(|s| height >= s.reveal_until) {
                 self.close_seance(id, height);
             }
         }
-        if self.poc.open_seance.is_none() && height >= self.poc.next_seance_at {
-            self.open_seance(height);
+        if self.params.is_boundary(height) {
+            self.refund_stale_claims(height);
+            if self.poc.open_seance.is_none() && self.next_seance_height(height) == height {
+                self.open_seance(height, self.params.epoch_of(height));
+            }
+            self.sweep_dropped_vouches(height);
+        }
+        if self.poc.next_seance_at <= height {
+            self.poc.next_seance_at = self.next_seance_height(height + 1);
         }
     }
 
-    /// Claims a juror mustn't judge: their own, and those of people they vouched for or who
-    /// vouched for them.
-    fn conflicted(&self, juror: &str, claimant: &str) -> bool {
-        juror == claimant || self.poc.vouches.get(claimant).is_some_and(|v| v.voucher == juror) || self.poc.vouches.get(juror).is_some_and(|v| v.voucher == claimant)
+    /// At an epoch boundary (after any Séance opens): hands back the held bonds of withdrawn
+    /// vouches whose lock is over and whose vouchee no `FlagSybil` proposal names, and forgets
+    /// the records no Séance can need any more (every later opening's cutoff is after them).
+    fn sweep_dropped_vouches(&mut self, height: u64) {
+        if self.poc.dropped_vouches.is_empty() {
+            return;
+        }
+        let mut j = Journal::default();
+        let lock = self.params.poc.vouch_lock_blocks;
+        let next_cutoff = self.seance_cutoff(self.params.epoch_of(height) + 1);
+        let all: Vec<(String, DroppedVouch)> = self.poc.dropped_vouches.iter().map(|(k, d)| (k.clone(), d.clone())).collect();
+        for (key, d) in all {
+            let Some((to, voucher)) = key.rsplit_once('/') else { continue };
+            let mut next = d.clone();
+            if d.bond > 0 && height >= d.at.saturating_add(lock) && !self.sybil_flag_proposed(to) {
+                self.j_credit(&mut j, voucher, d.bond);
+                next.bond = 0;
+            }
+            if next.bond == 0 && next.dropped_at < next_cutoff {
+                self.set_dropped_vouch(&mut j, &key, None);
+            } else if next != d {
+                self.set_dropped_vouch(&mut j, &key, Some(next));
+            }
+        }
     }
 
-    fn open_seance(&mut self, height: u64) {
+    /// Claims claimants can't help (validators never settled them) are refunded after
+    /// `claim_ttl_blocks`.
+    fn refund_stale_claims(&mut self, height: u64) {
         let mut j = Journal::default();
-        let times = self.params.poc.clone();
-        // Pending claims validators never settled are refunded (not the claimant's fault).
-        let stale: Vec<(u64, String)> = self.poc.claims.values().filter(|c| c.status == ClaimStatus::Pending && height >= c.submitted_at.saturating_add(times.claim_ttl_blocks)).map(|c| (c.id, format!("{}#{}", c.repo, c.pr))).collect();
+        let ttl = self.params.poc.claim_ttl_blocks;
+        // Open claims only (an index, `OpenClaims`), in id order like the claims themselves.
+        let open = self.poc.claims.indexed();
+        let stale: Vec<(u64, String)> = open.iter().filter_map(|id| self.poc.claims.get(id)).filter(|c| c.status == ClaimStatus::Pending && height >= c.submitted_at.saturating_add(ttl)).map(|c| (c.id, format!("{}#{}", c.repo, c.pr))).collect();
         for (id, pr_key) in stale {
             self.settle_bond(&mut j, id, true);
             self.set_status(&mut j, id, ClaimStatus::Rejected, height, Some("validators didn't settle it in time; bond refunded".into()));
             self.set_claim_by_pr(&mut j, &pr_key, None);
         }
-        let claims: Vec<(u64, String)> = self
-            .poc
-            .claims
-            .values()
-            .filter(|c| c.status == ClaimStatus::Verified && c.verified_at.is_some_and(|v| height >= v.saturating_add(times.claim_maturity_blocks)) && !self.is_sybil(&c.claimant) && self.poc.repos.contains_key(&c.repo))
+    }
+
+    /// Claims a juror mustn't judge in a Séance with this `cutoff`: their own, and those of people
+    /// they vouch for or who vouch for them, counting vouches withdrawn at or after the cutoff
+    /// ([`DroppedVouch`]): a Séance's seed is public before it opens, so a conflict dropped then
+    /// would seat a juror on a claim it mustn't judge (audit F53), and ejecting the juror instead
+    /// would let the vouchee steer the draw (audit review-fix-poc-2). Conflicts are as of the
+    /// cutoff, when nobody could know the draw.
+    fn conflicted(&self, juror: &str, claimant: &str, cutoff: u64) -> bool {
+        let tied = |vouchee: &str, voucher: &str| self.poc.vouches.get(vouchee).is_some_and(|v| v.voucher == voucher) || self.poc.dropped_vouches.get(&vouch_key(vouchee, voucher)).is_some_and(|d| d.dropped_at >= cutoff);
+        juror == claimant || tied(claimant, juror) || tied(juror, claimant)
+    }
+
+    /// Opens a Séance at the end of `epoch` if claims of at least 2 people and `MIN_JURY` jurors
+    /// are eligible (see [`State::seance_cutoff`]); otherwise the next chance is the next opening
+    /// on the cadence. A claim is only ever compared with another person's (audit
+    /// xcut-economic-opus-1: two of one person's claims tie, which would float weak claims over
+    /// the threshold), so a person alone with their claims waits for company.
+    fn open_seance(&mut self, height: u64, epoch: u64) {
+        let mut j = Journal::default();
+        let times = self.params.poc.clone();
+        let cutoff = self.seance_cutoff(epoch);
+        let open = self.poc.claims.indexed();
+        let claims: Vec<(u64, String)> = open
+            .iter()
+            .filter_map(|id| self.poc.claims.get(id))
+            .filter(|c| c.status == ClaimStatus::Verified && c.verified_at.is_some_and(|v| v.saturating_add(times.claim_maturity_blocks) < cutoff) && !self.is_sybil(&c.claimant) && self.poc.repos.contains_key(&c.repo))
             .take(MAX_SEANCE_CLAIMS)
             .map(|c| (c.id, c.claimant.clone()))
             .collect();
-        let retry = |s: &mut State| s.poc.next_seance_at = height + times.retry_blocks();
-        if claims.len() < 2 {
-            return retry(self);
+        let people = claims.iter().map(|(_, who)| who).collect::<BTreeSet<_>>().len() as u64;
+        if people < 2 {
+            return;
         }
-        let seed = self.poc.seed.clone();
-        let mut pool: Vec<String> = self.poc.jurors.iter().filter(|(a, r)| r.active && !self.is_sybil(a) && self.soul_of(a, height) >= JUROR_MIN_SOUL).map(|(a, _)| a.clone()).collect();
         let id = self.poc.next_seance_id;
-        let mut rng = Rng::new(&seed, &[b"jury".as_slice(), &id.to_le_bytes()].concat());
-        rng.shuffle(&mut pool);
+        let Some(seed) = crate::beacon::seance_seed(self, epoch, id).map(hex::encode) else { return };
+        // Sortition: each eligible juror gets its own rank from the seed and the best-ranked who
+        // can judge a pair sit, so a juror joining or leaving can't reshuffle anyone else.
+        let mut pool: Vec<(u64, String)> = self
+            .poc
+            .jurors
+            .iter()
+            .filter(|(a, r)| r.active && r.joined_at < cutoff && !self.is_sybil(a) && self.soul_of(a, height) >= JUROR_MIN_SOUL)
+            .map(|(a, _)| (Rng::new(&seed, &[b"jury".as_slice(), a.as_bytes()].concat()).next(), a.clone()))
+            .collect();
+        pool.sort();
         let mut seats = BTreeMap::new();
-        for juror in pool {
+        for (_, juror) in pool {
             if seats.len() >= JURY_SIZE {
                 break;
             }
-            let allowed: Vec<u64> = claims.iter().filter(|(_, who)| !self.conflicted(&juror, who)).map(|(id, _)| *id).collect();
-            if allowed.len() < 2 {
-                continue;
+            // Pairs of claims by two different people, neither of whom the juror is tied to.
+            let allowed: Vec<&(u64, String)> = claims.iter().filter(|(_, who)| !self.conflicted(&juror, who, cutoff)).collect();
+            let mut pairs = vec![];
+            for (i, (a, who)) in allowed.iter().enumerate() {
+                pairs.extend(allowed[i + 1..].iter().filter(|(_, other)| other != who).map(|(b, _)| [*a, *b]));
             }
-            let mut pairs = Vec::with_capacity(allowed.len() * (allowed.len() - 1) / 2);
-            for (i, a) in allowed.iter().enumerate() {
-                for b in &allowed[i + 1..] {
-                    pairs.push([*a, *b]);
-                }
+            if pairs.is_empty() {
+                continue;
             }
             let mut rng = Rng::new(&seed, &[b"pairs".as_slice(), &id.to_le_bytes(), juror.as_bytes()].concat());
             rng.shuffle(&mut pairs);
@@ -1150,10 +1442,10 @@ impl State {
             seats.insert(juror, JurySeat { pairs, ..Default::default() });
         }
         if seats.len() < MIN_JURY {
-            return retry(self);
+            return;
         }
-        let pool_addr = pool_address();
-        let budget = (bps(self.account(&pool_addr).balance, SEANCE_POOL_BPS) as u128 * (claims.len() as u64).min(FULL_BUDGET_CLAIMS) as u128 / FULL_BUDGET_CLAIMS as u128) as u64;
+        let pool_addr = self.pool();
+        let budget = (bps(self.account(&pool_addr).balance, SEANCE_POOL_BPS) as u128 * people.min(FULL_BUDGET_PEOPLE) as u128 / FULL_BUDGET_PEOPLE as u128) as u64;
         if budget > 0 {
             let _ = self.j_debit(&mut j, &pool_addr, budget);
         }
@@ -1217,6 +1509,28 @@ impl State {
             }
         }
         let score: BTreeMap<u64, u64> = comps.iter().map(|(c, n)| (*c, wins2.get(c).copied().unwrap_or(0) * PPM / (2 * n))).collect();
+        let spam_verdict = |c: &u64| {
+            let f = flags.get(c).copied().unwrap_or(0);
+            f >= SPAM_MIN_FLAGS && 2 * f > seen.get(c).copied().unwrap_or(0)
+        };
+        // Each claim's rank among its claimant's accepted claims, best score first (ties by id):
+        // its Soul counts `>> CLAIM_RANK_SHIFT` per rank (audit xcut-economic-opus-1).
+        let soul_rank: BTreeMap<u64, usize> = {
+            let mut by_person: BTreeMap<&str, Vec<(u64, u64)>> = BTreeMap::new();
+            for c in &live {
+                if let Some(sc) = score.get(c).copied().filter(|sc| *sc >= MIN_SCORE_PPM && !spam_verdict(c)) {
+                    by_person.entry(self.poc.claims[c].claimant.as_str()).or_default().push((sc, *c));
+                }
+            }
+            by_person
+                .into_values()
+                .flat_map(|mut cs| {
+                    cs.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                    cs.into_iter().enumerate().map(|(rank, (_, c))| (c, rank))
+                })
+                .collect()
+        };
+        let mut spam: BTreeSet<u64> = BTreeSet::new();
         let mut results = SeanceResults::default();
         let mut accepted: Vec<u64> = vec![];
         let mut soul_changes: Vec<(String, i64, Option<u64>)> = vec![];
@@ -1232,10 +1546,11 @@ impl State {
             };
             let f = flags.get(c).copied().unwrap_or(0);
             self.claim_mut(&mut j, *c).unwrap().score_ppm = Some(sc);
-            if f >= 2 && 2 * f > seen.get(c).copied().unwrap_or(0) {
+            if spam_verdict(c) {
                 self.settle_bond(&mut j, *c, false);
                 self.set_status(&mut j, *c, ClaimStatus::Spam, height, Some(format!("{f} of the jurors who saw it flagged it as spam")));
                 soul_changes.push((claimant, -(SPAM_SOUL as i64), None));
+                spam.insert(*c);
                 results.spam += 1;
             } else if sc < MIN_SCORE_PPM {
                 self.settle_bond(&mut j, *c, true);
@@ -1244,7 +1559,7 @@ impl State {
             } else {
                 self.settle_bond(&mut j, *c, true);
                 self.set_status(&mut j, *c, ClaimStatus::Scored, height, None);
-                soul_changes.push((claimant, (CLAIM_SOUL as u128 * sc as u128 / PPM as u128) as i64, Some(*c)));
+                soul_changes.push((claimant, (ranked(CLAIM_SOUL as u128 * sc as u128, soul_rank[c]) / PPM as u128) as i64, Some(*c)));
                 accepted.push(*c);
                 results.accepted += 1;
             }
@@ -1276,6 +1591,13 @@ impl State {
                 points += if v == outcome { 2 } else if v == b'=' || outcome == b'=' { 1 } else { 0 };
                 total += 2;
             }
+            // Spam flags are graded too (F23): a flag on a claim enough jurors saw to decide
+            // (`SPAM_MIN_FLAGS`) that the jury didn't uphold counts as a disagreement, so
+            // flagging everything costs agreement, Soul and the jury reward. Upheld flags and
+            // flags on claims too few saw neither add nor cost.
+            let saw: BTreeSet<u64> = seat.pairs.iter().filter(|[a, b]| live.contains(a) && live.contains(b)).flatten().copied().collect();
+            let overruled = seat.spam.iter().filter(|c| saw.contains(c) && score.contains_key(c) && seen.get(c).copied().unwrap_or(0) >= SPAM_MIN_FLAGS && !spam.contains(c)).count() as u64;
+            total += 2 * overruled;
             if total == 0 {
                 seat_updates.push((juror.clone(), None, 0));
                 continue;
@@ -1288,28 +1610,37 @@ impl State {
             soul_changes.push((juror.clone(), delta, None));
             seat_updates.push((juror.clone(), Some(agreement), delta));
         }
-        // Rewards: jurors by agreement; claims by score × repo weight, square-rooted per person
-        // (per GitHub handle, so a sponsor's Familiars and relinked accounts are one person),
-        // boosted up to 1.5× by the claimant's Soul.
+        // Rewards: jurors by agreement; claims by score × repo weight, per person the best claim in
+        // full and each further one a quarter of the one ranked above it (`ranked`: together under
+        // 4/3 of the best, so volume doesn't pay: audit xcut-economic-opus-1), boosted up to 1.5×
+        // by the person's Soul. A person is the claimant account (audit xcut-economic-opus-3): a
+        // sponsor's Familiars claim as the sponsor, and every handle an account linked counts
+        // together (each handle credits one account, `Poc::handles`).
         let juror_budget = if juror_weights.is_empty() { 0 } else { bps(s.budget, JUROR_SHARE_BPS) };
         let claims_budget = if accepted.is_empty() { 0 } else { s.budget - juror_budget };
         let mut raw: BTreeMap<String, Vec<(u64, u128)>> = BTreeMap::new();
         for c in &accepted {
             let cl = &self.poc.claims[c];
             let w = self.poc.repos.get(&cl.repo).copied().unwrap_or(0) as u128 * score[c] as u128;
-            raw.entry(cl.handle.to_ascii_lowercase()).or_default().push((*c, w));
+            raw.entry(cl.claimant.clone()).or_default().push((*c, w));
+        }
+        for cs in raw.values_mut() {
+            cs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            for (rank, (_, w)) in cs.iter_mut().enumerate() {
+                *w = ranked(*w, rank);
+            }
         }
         let person_weights: Vec<(String, u128)> = raw
             .iter()
-            .map(|(handle, cs)| {
-                let soul = cs.iter().map(|(c, _)| self.soul_of(&self.poc.claims[c].claimant, height)).max().unwrap_or(0).min(BOOST_CAP_SOUL) as u128;
+            .map(|(who, cs)| {
+                let soul = self.soul_of(who, height).min(BOOST_CAP_SOUL) as u128;
                 let boost = PPM as u128 + soul * (PPM as u128 / 2) / BOOST_CAP_SOUL as u128;
-                (handle.clone(), isqrt(cs.iter().map(|(_, w)| w).sum::<u128>()) * boost / PPM as u128)
+                (who.clone(), cs.iter().map(|(_, w)| w).sum::<u128>() * boost / PPM as u128)
             })
             .collect();
         let mut paid = 0u64;
-        for (handle, amount) in split(claims_budget, &person_weights) {
-            let per_claim: Vec<(String, u128)> = raw[&handle].iter().map(|(c, w)| (c.to_string(), *w)).collect();
+        for (person, amount) in split(claims_budget, &person_weights) {
+            let per_claim: Vec<(String, u128)> = raw[&person].iter().map(|(c, w)| (c.to_string(), *w)).collect();
             for (c, p) in split(amount, &per_claim) {
                 let c: u64 = c.parse().unwrap();
                 if p == 0 {
@@ -1324,7 +1655,7 @@ impl State {
                 let g = self.add_grant(&mut j, &who, p - cut, height, GrantSource::Claim { claim_id: c });
                 let cl = self.claim_mut(&mut j, c).unwrap();
                 cl.payout = p;
-                cl.grant = Some(g);
+                cl.grant = g;
                 paid += p;
             }
         }
@@ -1355,8 +1686,15 @@ impl State {
         s.closed = true;
         s.results = Some(results);
         self.poc.open_seance = None;
-        self.poc.next_seance_at = height + 1;
     }
+}
+
+/// `types::seance_pairs_digest` of a juror's seat: each assigned pair's claims with their repos
+/// and PR numbers, as `CommitVotes` must bind them.
+pub fn seat_pairs_digest(state: &State, seance_id: u64, juror: &str, pairs: &[[u64; 2]]) -> String {
+    let claim = |id: u64| state.poc.claims.get(&id).map(|c| (id, c.repo.as_str(), c.pr)).unwrap_or((id, "", 0));
+    let pairs: Vec<[(u64, &str, u64); 2]> = pairs.iter().map(|[a, b]| [claim(*a), claim(*b)]).collect();
+    crate::types::seance_pairs_digest(seance_id, juror, &pairs)
 }
 
 #[cfg(test)]
@@ -1382,10 +1720,11 @@ mod tests {
         assert_eq!(out[1].1, 67);
         assert_eq!(out[2].1, 0);
         assert!(split(100, &[]).is_empty());
-        assert_eq!(isqrt(0), 0);
-        assert_eq!(isqrt(99), 9);
-        assert_eq!(isqrt(100), 10);
-        assert_eq!(isqrt(u64::MAX as u128 * 4), 2 * (u32::MAX as u128 + 1) - 1);
+        // A person's claims by rank: a quarter each, 0 once the shift runs out, never a panic.
+        assert_eq!((ranked(1_000, 0), ranked(1_000, 1), ranked(1_000, 2)), (1_000, 250, 62));
+        assert_eq!((ranked(u128::MAX, 63), ranked(u128::MAX, 64), ranked(u128::MAX, usize::MAX)), (u128::MAX >> 126, 0, 0));
+        let w = 100 * PPM as u128;
+        assert!((0..MAX_SEANCE_CLAIMS).map(|r| ranked(w, r)).sum::<u128>() * 3 < 4 * w, "all of them under 4/3 of the best");
     }
 
     #[test]
@@ -1395,13 +1734,50 @@ mod tests {
         assert_eq!(x, y);
         assert_ne!(x, z);
     }
+
+    /// Audit #11: an account's grants are capped. At the cap, what has fully vested is paid out
+    /// to make room; a reward that still doesn't fit goes back to the pool. Nothing is lost.
+    #[test]
+    fn grants_are_capped_and_vested_ones_make_room() {
+        let mut st = State::default();
+        st.params.poc.vesting_blocks = 100;
+        let who = crypto::address_from_bytes(&[7; 32]);
+        // MAX_GRANTS grants of 10 drops: the first 100 fully vested by height 1_000, the rest not.
+        let grants = (0..MAX_GRANTS as u64).map(|id| (id, Grant { id, amount: 10, withdrawn: if id == 0 { 4 } else { 0 }, start: if id < 100 { 0 } else { 1_000 }, end: if id < 100 { 100 } else { 1_100 }, source: GrantSource::Jury { seance_id: 0 } })).collect();
+        st.poc.grants.insert(who.clone(), grants);
+        st.poc.next_grant_id = MAX_GRANTS as u64;
+        st.supply = MAX_GRANTS as u64 * 10;
+        st.accounts.insert(who.clone(), crate::chain::Account { balance: 4, ..Default::default() });
+        st.check_invariants().unwrap();
+        // A reward released from an escrow (as a Séance's budget is), granted at height 1_000.
+        let reward = |st: &mut State, j: &mut Journal| {
+            st.supply += 50;
+            st.add_grant(j, &who, 50, 1_000, GrantSource::Claim { claim_id: 1 })
+        };
+        let mut j = Journal::default();
+        let id = reward(&mut st, &mut j).expect("room was made");
+        assert_eq!(st.poc.grants[&who].len(), MAX_GRANTS - 100 + 1);
+        assert_eq!(st.poc.grants[&who][&id].amount, 50);
+        assert_eq!(st.account(&who).balance, 4 + 100 * 10 - 4, "the vested grants were paid out");
+        st.check_invariants().unwrap();
+        // Fill it again with still-vesting grants: the next reward goes back to the pool.
+        let ids: Vec<u64> = (0..99).map(|_| reward(&mut st, &mut j).unwrap()).collect();
+        assert_eq!((st.poc.grants[&who].len(), ids.len()), (MAX_GRANTS, 99));
+        let pool = st.pool();
+        assert_eq!(reward(&mut st, &mut j), None);
+        assert_eq!((st.poc.grants[&who].len(), st.account(&pool).balance), (MAX_GRANTS, 50));
+        st.check_invariants().unwrap();
+        // And all of it rolls back.
+        st.rollback(j);
+        assert_eq!((st.poc.grants[&who].len(), st.account(&who).balance), (MAX_GRANTS, 4));
+    }
 }
 
 /// Whole-chain scenarios: Souls and vouches, claims and attestations, a full Séance.
 #[cfg(test)]
 mod scenarios {
     use super::*;
-    use crate::chain::{now_ms, Chain, SummonOpts};
+    use crate::chain::{now_ms, BlockInfo, Chain, Outcome, SummonOpts};
     use crate::crypto::Keys;
     use std::path::PathBuf;
 
@@ -1421,7 +1797,10 @@ mod scenarios {
 
     fn setup(tag: &str) -> T {
         let home = std::env::temp_dir().join(format!("blockula-poc-{tag}-{}-{}", now_ms(), std::process::id()));
-        Chain::summon(&home, &SummonOpts { contribution: Some(times()), ..SummonOpts::new("poc", 1) }).unwrap();
+        // The contribution pool holds only what these tests put in: issuance's pool share (P-ECON's
+        // to test) is off, so Séance budgets are exact.
+        let params = [("issuance_pool_bps".to_string(), 0)].into_iter().collect();
+        Chain::summon(&home, &SummonOpts { contribution: Some(times()), epoch_blocks: 10, params, ..SummonOpts::new("poc", 1) }).unwrap();
         let seed: [u8; 32] = hex::decode(std::fs::read_to_string(home.join("validator.key")).unwrap().trim()).unwrap().try_into().unwrap();
         let mut c = Chain::open(&home).unwrap();
         for i in 1..=12u8 {
@@ -1432,10 +1811,13 @@ mod scenarios {
     }
 
     impl T {
-        fn tx_as(&mut self, key: &Keys, from: &str, action: Action) -> Result<String> {
-            let mut tx = Tx { chain_id: "poc".into(), nonce: self.c.next_nonce(from), from: from.into(), fee: 0, action, memo: String::new(), public_key: hex::encode(key.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+        fn signed_as(&self, key: &Keys, from: &str, action: Action) -> Tx {
+            let mut tx = Tx { chain_id: "poc".into(), genesis_hash: self.c.genesis_hash.clone(), nonce: self.c.next_nonce(from), from: from.into(), fee: 0, tip: 0, valid_until: self.c.height() + 100, action, memo: String::new(), public_key: hex::encode(key.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
             tx.fee = min_fee(tx.size());
-            let id = self.c.submit(tx.sign(key))?;
+            tx.sign(key)
+        }
+        fn tx_as(&mut self, key: &Keys, from: &str, action: Action) -> Result<String> {
+            let id = self.c.submit(self.signed_as(key, from, action))?;
             self.c.produce_block()?;
             match self.c.failure(&id) {
                 Some((r, _)) => bail!(r.clone()),
@@ -1482,11 +1864,21 @@ mod scenarios {
         fn attest_all(&mut self, ids: &[u64]) {
             let me = self.admin.address();
             for id in ids {
-                let mut tx = Tx { chain_id: "poc".into(), nonce: self.c.next_nonce(&me), from: me.clone(), fee: 0, action: Action::AttestClaim { claim_id: *id, ok: true, merge_sha: "cd".repeat(20), note: String::new() }, memo: String::new(), public_key: hex::encode(self.admin.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
+                let mut tx = Tx { chain_id: "poc".into(), genesis_hash: self.c.genesis_hash.clone(), nonce: self.c.next_nonce(&me), from: me.clone(), fee: 0, tip: 0, valid_until: self.c.height() + 100, action: Action::AttestClaim { claim_id: *id, ok: true, merge_sha: "cd".repeat(20), note: String::new() }, memo: String::new(), public_key: hex::encode(self.admin.public_key()), signature: "00".repeat(crypto::SIGNATURE_LEN) };
                 tx.fee = min_fee(tx.size());
                 self.c.submit(tx.sign(&self.admin)).unwrap();
             }
             self.c.produce_block().unwrap();
+        }
+        /// Runs empty blocks until a Séance opens (at most a few cadences).
+        fn wait_for_seance(&mut self) -> u64 {
+            for _ in 0..200 {
+                if let Some(id) = self.c.state.poc.open_seance {
+                    return id;
+                }
+                self.blocks(1);
+            }
+            panic!("no Séance opened by block {}", self.h());
         }
         fn reopen_same_root(self) {
             let root = self.c.state.root();
@@ -1498,16 +1890,7 @@ mod scenarios {
 
     /// Every drop is somewhere: balances plus everything held in escrow equals the supply.
     fn conserved(s: &State) {
-        let mut total: u128 = s.accounts.values().map(|a| a.balance as u128).sum();
-        total += s.hunts.values().filter(|h| h.status == crate::chain::HuntStatus::Open).map(|h| h.amount as u128).sum::<u128>();
-        total += s.validators.values().map(|v| v.bond as u128).sum::<u128>();
-        let p = &s.poc;
-        total += p.vouches.values().map(|v| v.bond as u128).sum::<u128>();
-        total += p.jurors.values().map(|r| r.bond as u128).sum::<u128>();
-        total += p.claims.values().map(|c| c.bond as u128).sum::<u128>();
-        total += p.grants.values().flat_map(|g| g.values()).map(|g| (g.amount - g.withdrawn) as u128).sum::<u128>();
-        total += p.seances.values().filter(|x| !x.closed).map(|x| x.budget as u128).sum::<u128>();
-        assert_eq!(total, s.supply as u128, "FANG conserved");
+        s.check_invariants().expect("FANG conserved");
     }
 
     #[test]
@@ -1518,7 +1901,7 @@ mod scenarios {
         assert!(t.tx(&alice, Action::GrantSoul { to: bob.address(), amount: SOUL, reason: "x".into() }).unwrap_err().to_string().contains("only validator admins"));
         assert!(t.tx(&alice, Action::SetRepo { repo: "a/b".into(), weight: 1 }).unwrap_err().to_string().contains("only validator admins"));
         assert!(t.admin(Action::GrantSoul { to: bob.address(), amount: MAX_SOUL_GRANT + 1, reason: "x".into() }).is_err());
-        assert!(!t.c.state.poc.is_active(), "nothing has happened yet, so old roots are unchanged");
+        assert!(!t.c.state.poc.is_active(), "nothing has happened yet, so the end-of-block step stays off");
         t.grant(&alice, 20);
         assert_eq!(t.soul(&alice), 20 * SOUL);
         t.grant(&bob, 3);
@@ -1546,10 +1929,10 @@ mod scenarios {
         t.tx(&alice, Action::Unvouch { account: dave.address() }).unwrap();
         assert!(t.bal(&alice) > before + VOUCH_BOND - DROPS_PER_FANG / 100);
         // Flagging carol as a sybil costs alice her bond and Soul, and blocks carol.
-        let pool0 = t.c.state.account(&pool_address()).balance;
+        let pool0 = t.c.state.account(&t.c.state.pool()).balance;
         assert!(t.tx(&bob, Action::FlagSybil { account: carol.address(), reason: "x".into() }).is_err());
         t.admin(Action::FlagSybil { account: carol.address(), reason: "same person as dave".into() }).unwrap();
-        assert_eq!(t.c.state.account(&pool_address()).balance, pool0 + VOUCH_BOND, "bond slashed into the pool");
+        assert_eq!(t.c.state.account(&t.c.state.pool()).balance, pool0 + VOUCH_BOND, "bond slashed into the pool");
         assert_eq!(t.soul(&alice), 0, "voucher loses 50 Soul (saturating)");
         assert!(t.c.state.poc.vouches.get(&carol.address()).is_none());
         assert!(t.admin(Action::GrantSoul { to: carol.address(), amount: SOUL, reason: "x".into() }).unwrap_err().to_string().contains("sybil"));
@@ -1583,11 +1966,11 @@ mod scenarios {
         t.attest(c1, true).unwrap();
         assert_eq!(t.c.state.poc.claims[&c1].status, ClaimStatus::Verified);
         assert!(t.attest(c1, true).is_err(), "already settled");
-        let pool0 = t.c.state.account(&pool_address()).balance;
+        let pool0 = t.c.state.account(&t.c.state.pool()).balance;
         t.attest(c2, false).unwrap();
         assert_eq!(t.c.state.poc.claims[&c2].status, ClaimStatus::Rejected);
         assert!(t.c.state.poc.claims[&c2].reason.as_deref().unwrap().contains("closed without merging"));
-        assert_eq!(t.c.state.account(&pool_address()).balance, pool0 + 2 * CLAIM_BOND, "rejected bond goes to the pool");
+        assert_eq!(t.c.state.account(&t.c.state.pool()).balance, pool0 + 2 * CLAIM_BOND, "rejected bond goes to the pool");
         let c3 = t.claim(&alice, 2).unwrap();
         assert!(c3 > c2, "a rejected PR can be claimed again");
         // Admin rejection of a verified claim (e.g. reverted) blocks re-claims.
@@ -1603,7 +1986,8 @@ mod scenarios {
         t.grant(&bob, 1);
         let h = t.h();
         for key in [&agent, &stranger] {
-            t.tx(&bob, Action::AddKey { key_id: key_id(&key.public_key()), label: "agent".into(), role: KeyRole::Session { limit: 5 * DROPS_PER_FANG, period_blocks: 1000, expires_at: h + 1000 } }).unwrap();
+            let add = crate::types::add_key(key, &t.c.genesis.chain_id, &t.c.genesis_hash, &bob.address(), "agent", KeyRole::Session { limit: 5 * DROPS_PER_FANG, period_blocks: 1000, expires_at: h + 1000 });
+            t.tx(&bob, add).unwrap();
         }
         t.tx(&bob, Action::RegisterFamiliar { key_id: key_id(&agent.public_key()), label: "claude".into() }).unwrap();
         let bob_addr = bob.address();
@@ -1651,18 +2035,13 @@ mod scenarios {
         t.attest_all(&[big, tiny, ok]);
         assert!(t.c.state.poc.claims.values().all(|c| c.status != ClaimStatus::Pending));
         conserved(&t.c.state);
-        for _ in 0..10 {
-            if t.c.state.poc.open_seance.is_some() {
-                break;
-            }
-            t.blocks(1);
-        }
-        let sid = t.c.state.poc.open_seance.expect("a Séance opens once there are claims and jurors");
+        let sid = t.wait_for_seance();
+        assert_eq!(t.h(), t.c.state.next_seance_height(t.h()), "Séances open on the cadence");
         let s = t.c.state.poc.seances[&sid].clone();
         assert_eq!(s.claims, vec![big, tiny, ok]);
         assert_eq!(s.jurors.len(), 5);
-        assert_eq!(s.budget, 20 * DROPS_PER_FANG * 3 / FULL_BUDGET_CLAIMS, "a quarter of the pool, scaled for 3 claims");
-        assert!(s.jurors.values().all(|seat| seat.pairs.len() == 3), "3 claims → every pair");
+        assert_eq!(s.budget, 20 * DROPS_PER_FANG * 2 / FULL_BUDGET_PEOPLE, "a quarter of the pool, scaled for 2 people");
+        assert!(s.jurors.values().all(|seat| seat.pairs.len() == 2), "every pair of two people's claims (solid's two are never compared)");
         assert!(t.tx(&jurors[0], Action::LeaveJury {}).unwrap_err().to_string().contains("after it closes"));
         conserved(&t.c.state);
         // Honest jurors: big > ok > tiny, and they flag tiny as spam (so does the all-ties juror).
@@ -1681,14 +2060,31 @@ mod scenarios {
             let salt = format!("salt-{i}");
             let commitment = seance_commitment(sid, &jk.address(), &votes, &spam, &salt);
             assert!(t.tx(jk, Action::RevealVotes { seance_id: sid, votes: votes.clone(), spam: spam.clone(), salt: salt.clone() }).unwrap_err().to_string().contains("open after"));
-            t.tx(jk, Action::CommitVotes { seance_id: sid, commitment }).unwrap();
+            let pairs_digest = seat_pairs_digest(&t.c.state, sid, &jk.address(), &seat.pairs);
+            if i == 0 {
+                // gap-7-6: a node that showed the juror the pairs flipped (so 'a' would credit the
+                // other claim), or a claim with another PR, gets the commitment refused.
+                let flipped: Vec<[u64; 2]> = seat.pairs.iter().map(|[a, b]| [*b, *a]).collect();
+                let shown = seat_pairs_digest(&t.c.state, sid, &jk.address(), &flipped);
+                assert!(t.tx(jk, Action::CommitVotes { seance_id: sid, commitment: commitment.clone(), pairs_digest: shown }).unwrap_err().to_string().contains("aren't your seat's"));
+                let [x, y] = seat.pairs[0];
+                let other_pr = |id: u64| { let c = &t.c.state.poc.claims[&id]; (id, c.repo.clone(), c.pr + 1) };
+                let (cx, cy) = (other_pr(x), (y, t.c.state.poc.claims[&y].repo.clone(), t.c.state.poc.claims[&y].pr));
+                let mut refs: Vec<[(u64, &str, u64); 2]> = vec![[(cx.0, cx.1.as_str(), cx.2), (cy.0, cy.1.as_str(), cy.2)]];
+                let rest: Vec<[(u64, String, u64); 2]> = seat.pairs[1..].iter().map(|[a, b]| [a, b].map(|id| (*id, t.c.state.poc.claims[id].repo.clone(), t.c.state.poc.claims[id].pr))).collect();
+                refs.extend(rest.iter().map(|[a, b]| [(a.0, a.1.as_str(), a.2), (b.0, b.1.as_str(), b.2)]));
+                let swapped_pr = crate::types::seance_pairs_digest(sid, &jk.address(), &refs);
+                assert!(t.tx(jk, Action::CommitVotes { seance_id: sid, commitment: commitment.clone(), pairs_digest: swapped_pr }).unwrap_err().to_string().contains("aren't your seat's"));
+            }
+            t.tx(jk, Action::CommitVotes { seance_id: sid, commitment, pairs_digest }).unwrap();
             sealed.push((i, votes, spam, salt));
         }
-        assert!(t.tx(&solid, Action::CommitVotes { seance_id: sid, commitment: "00".repeat(32) }).unwrap_err().to_string().contains("not on the jury"));
+        assert!(t.tx(&solid, Action::CommitVotes { seance_id: sid, commitment: "00".repeat(32), pairs_digest: "00".repeat(32) }).unwrap_err().to_string().contains("not on the jury"));
         while t.h() <= s.commit_until {
             t.blocks(1);
         }
-        assert!(t.tx(&jurors[2], Action::CommitVotes { seance_id: sid, commitment: "00".repeat(32) }).unwrap_err().to_string().contains("closed at block"));
+        let late = seat_pairs_digest(&t.c.state, sid, &jurors[2].address(), &s.jurors[&jurors[2].address()].pairs);
+        assert!(t.tx(&jurors[2], Action::CommitVotes { seance_id: sid, commitment: "00".repeat(32), pairs_digest: late }).unwrap_err().to_string().contains("closed at block"));
         for (i, votes, spam, salt) in &sealed {
             let jk = &jurors[*i];
             assert!(t.tx(jk, Action::RevealVotes { seance_id: sid, votes: votes.clone(), spam: spam.clone(), salt: "wrong".into() }).unwrap_err().to_string().contains("doesn't match"));
@@ -1734,9 +2130,9 @@ mod scenarios {
         assert!(t.bal(&solid) > b0);
         conserved(&t.c.state);
         // Clawback returns what hasn't vested to the pool.
-        let pool0 = t.c.state.account(&pool_address()).balance;
+        let pool0 = t.c.state.account(&t.c.state.pool()).balance;
         t.admin(Action::Clawback { account: solid.address(), reason: "PR reverted".into() }).unwrap();
-        assert!(t.c.state.account(&pool_address()).balance > pool0);
+        assert!(t.c.state.account(&t.c.state.pool()).balance > pool0);
         assert_eq!(t.c.state.grant_totals(&solid.address(), t.h() + 100).2, 0);
         conserved(&t.c.state);
         // The voucher got a cut of mid's reward; rejecting mid's claim (say it was reverted) claws
@@ -1768,12 +2164,15 @@ mod scenarios {
             t.grant(j, 10);
         }
         t.grant(&vet, 25);
-        // Vouches are for newcomers only, and the vouchee can decline (bond back to the voucher).
+        // Vouches are for newcomers only, and the vouchee can decline. The voucher still answers
+        // for it until the lock is over (audit xcut-economic-opus-2): the bond stays held, the
+        // slot taken (25 Soul allows 2).
         assert!(t.tx(&vet, Action::Vouch { account: j1.address() }).unwrap_err().to_string().contains("isn't a newcomer"));
         t.tx(&vet, Action::Vouch { account: newbie.address() }).unwrap();
         let v0 = t.bal(&vet);
         t.tx(&newbie, Action::Unvouch { account: newbie.address() }).unwrap();
-        assert_eq!(t.bal(&vet), v0 + VOUCH_BOND);
+        assert_eq!(t.bal(&vet), v0);
+        assert_eq!(t.c.state.vouches_held_by(&vet.address()), 1);
         t.tx(&vet, Action::Vouch { account: newbie.address() }).unwrap();
         // A handle's work is credited to the first account it's verified for.
         t.link(&newbie, "newbie");
@@ -1782,8 +2181,9 @@ mod scenarios {
         assert_eq!(t.c.state.poc.handles["newbie"], newbie.address());
         t.tx(&newbie, Action::UnlinkGithub { handle: "newbie".into() }).unwrap();
         t.grant(&hopper, 1);
-        t.link(&hopper, "Newbie");
-        assert!(t.claim(&hopper, 2).unwrap_err().to_string().contains("credited to"));
+        // Nobody else can even link it (audit xcut-economic-4: validators have seen its gist).
+        assert!(t.tx(&hopper, Action::LinkGithub { handle: "Newbie".into(), gist_id: "abc123".into() }).unwrap_err().to_string().contains("credited to"));
+        t.link(&newbie, "newbie");
         // Too few reveals: nothing is decided, claims carry over, the budget goes back.
         t.grant(&other, 1);
         t.link(&other, "other");
@@ -1793,12 +2193,13 @@ mod scenarios {
         t.tx(&vet, Action::FundPool { amount: 50 * DROPS_PER_FANG }).unwrap();
         let c2 = t.claim(&other, 3).unwrap();
         t.attest(c2, true).unwrap();
-        let sid = t.c.state.poc.open_seance.expect("2 claims + 3 jurors open a Séance");
+        let sid = t.wait_for_seance();
         let s = t.c.state.poc.seances[&sid].clone();
         let mut sealed = vec![];
         for jk in [&j1, &j2] {
             let votes: String = s.jurors[&jk.address()].pairs.iter().map(|_| 'a').collect();
-            t.tx(jk, Action::CommitVotes { seance_id: sid, commitment: seance_commitment(sid, &jk.address(), &votes, &[], "x") }).unwrap();
+            let pairs_digest = seat_pairs_digest(&t.c.state, sid, &jk.address(), &s.jurors[&jk.address()].pairs);
+            t.tx(jk, Action::CommitVotes { seance_id: sid, commitment: seance_commitment(sid, &jk.address(), &votes, &[], "x"), pairs_digest }).unwrap();
             sealed.push((jk.clone_keys(), votes));
         }
         while t.h() <= s.commit_until {
@@ -1836,8 +2237,603 @@ mod scenarios {
         t.reopen_same_root();
     }
 
+    /// CRY-3: Séances open on a fixed cadence, seeded from the beacon, over jurors and claims
+    /// that were eligible before its value could be known. Whatever the opening block's proposer
+    /// does (reorder, censor or add txs, pick its block hash) the draw is the same, and a juror
+    /// leaving frees only its own seat.
+    #[test]
+    fn seance_draw_is_fixed_before_the_opening_block() {
+        let mut t = setup("draw");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        let jurors: Vec<Keys> = (1..=9).map(k).collect();
+        for j in &jurors {
+            t.grant(j, 10);
+            t.tx(j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        let late = k(12);
+        t.grant(&late, 10);
+        let mut claims = vec![];
+        for (who, handle) in [(k(10), "ten"), (k(11), "eleven")] {
+            t.grant(&who, 1);
+            t.link(&who, handle);
+            claims.push(t.claim(&who, claims.len() as u64 + 1).unwrap());
+        }
+        t.attest_all(&claims);
+        // Openings are the last blocks of every 3rd epoch (30-block Séances, 10-block epochs); the
+        // first that may draw on these claims has its cutoff past their verification.
+        let st = &t.c.state;
+        assert_eq!(st.seance_every_epochs(), 3);
+        let mut at = st.next_seance_height(t.h() + 1);
+        while st.seance_cutoff(st.params.epoch_of(at)) <= t.h() {
+            at = st.next_seance_height(at + 1);
+        }
+        while t.h() < at - 1 {
+            t.blocks(1);
+        }
+        assert!(t.c.state.poc.open_seance.is_none() && t.c.state.poc.next_seance_at == at);
+        // Alternative opening blocks, each on a copy of the state (dropped before the restart check).
+        let pre = t.c.state.clone();
+        let epoch = pre.params.epoch_of(at);
+        let open = |txs: &[Tx], proposer: &str, hash: &str| -> Seance {
+            let mut st = pre.clone();
+            for tx in txs {
+                assert_eq!(st.apply(tx, "poc", proposer, at).unwrap(), Outcome::Applied);
+            }
+            let tx_bytes = txs.iter().map(Tx::size).sum();
+            st.end_block(&BlockInfo { height: at, hash, proposer, view: at, parent_view: at - 1, skipped: &[], tx_bytes });
+            st.check_invariants().unwrap();
+            let id = st.poc.open_seance.expect("a Séance opens on the cadence");
+            assert_eq!(st.poc.seances[&id].seed, hex::encode(crate::beacon::seance_seed(&st, epoch, id).unwrap()), "seeded from the beacon");
+            st.poc.seances[&id].clone()
+        };
+        let json = |s: &Seance| serde_json::to_value(s).unwrap();
+        fn draw(s: &Seance) -> serde_json::Value {
+            serde_json::to_value((&s.seed, &s.claims, &s.jurors)).unwrap()
+        }
+        let join = t.signed_as(&late, &late.address(), Action::JoinJury { bond: JUROR_BOND });
+        let fund = t.signed_as(&jurors[0], &jurors[0].address(), Action::FundPool { amount: 5 * DROPS_PER_FANG });
+        let pay = t.signed_as(&jurors[1], &jurors[1].address(), Action::Transfer { to: jurors[2].address(), amount: DROPS_PER_FANG });
+        let me = t.c.me().unwrap();
+        let a = open(&[join.clone(), fund.clone(), pay.clone()], &me, "a");
+        let b = open(&[pay, fund, join], &jurors[3].address(), "b");
+        let c = open(&[], &me, "c");
+        assert_eq!(a.opened_at, at);
+        assert_eq!((a.claims.clone(), a.jurors.len()), (claims.clone(), JURY_SIZE));
+        assert!(!a.jurors.contains_key(&late.address()), "joined after the cutoff");
+        assert_eq!(json(&a), json(&b), "reordering the opening block, another proposer, another hash: the same Séance");
+        assert_eq!(draw(&a), draw(&c), "censoring the opening block's txs changes nothing either");
+        // Sortition: an unseated juror leaving changes nothing; a seated one frees only its seat.
+        let unseated = jurors.iter().find(|j| !a.jurors.contains_key(&j.address())).unwrap();
+        assert_eq!(draw(&open(&[t.signed_as(unseated, &unseated.address(), Action::LeaveJury {})], &me, "d")), draw(&a));
+        let seated = jurors.iter().find(|j| a.jurors.contains_key(&j.address())).unwrap();
+        let e = open(&[t.signed_as(seated, &seated.address(), Action::LeaveJury {})], &me, "e");
+        assert!(!e.jurors.contains_key(&seated.address()) && e.jurors.len() == JURY_SIZE);
+        for (juror, seat) in a.jurors.iter().filter(|(j, _)| **j != seated.address()) {
+            assert_eq!(e.jurors[juror].pairs, seat.pairs, "the others keep their seats and pairs");
+        }
+        drop(pre);
+        // The real chain opens the same Séance at that height.
+        t.blocks(1);
+        let id = t.c.state.poc.open_seance.unwrap();
+        assert_eq!(draw(&t.c.state.poc.seances[&id]), draw(&c));
+        t.reopen_same_root();
+    }
+
+    /// Audit F53 (the audit's PoC): a juror's vouchee sees from the public seed that its voucher
+    /// would sit, and drops the vouch so the voucher can judge its claim. The vouch goes, but the
+    /// conflict counts as of the Séance's cutoff (`DroppedVouch`), so the same Séance opens without
+    /// it, and the voucher's place in the pool doesn't move (audit review-fix-poc-2).
+    #[test]
+    fn dropping_a_vouch_once_the_draw_is_known_seats_nobody_new() {
+        let mut t = setup("vouchdraw");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        let jurors: Vec<Keys> = (1..=4).map(k).collect();
+        for j in &jurors {
+            t.grant(j, 20);
+            t.tx(j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        let (insider, newcomer, other) = (&jurors[0], k(10), k(11));
+        t.tx(insider, Action::Vouch { account: newcomer.address() }).unwrap();
+        t.grant(&other, 1);
+        t.link(&newcomer, "newcomer");
+        t.link(&other, "other");
+        let claims = [t.claim(&newcomer, 1).unwrap(), t.claim(&other, 2).unwrap()];
+        t.attest_all(&claims);
+        t.tx(&k(12), Action::FundPool { amount: 50 * DROPS_PER_FANG }).unwrap();
+        // The first opening whose cutoff is past all that, run to where its seed is public.
+        let at = {
+            let st = &t.c.state;
+            let mut at = st.next_seance_height(t.h() + 1);
+            while st.seance_cutoff(st.params.epoch_of(at)) <= t.h() {
+                at = st.next_seance_height(at + 1);
+            }
+            at
+        };
+        let epoch = t.c.state.params.epoch_of(at);
+        while t.h() < epoch * t.c.state.params.epoch_blocks {
+            t.blocks(1);
+        }
+        assert!(crate::beacon::value(&t.c.state, epoch).is_some() && t.h() < at, "the seed is public before the opening");
+        let draw = |mut st: State, from: u64| -> Seance {
+            for h in from..=at {
+                st.end_block(&BlockInfo { height: h, hash: "x", proposer: "p", view: h, parent_view: h - 1, skipped: &[], tx_bytes: 0 });
+            }
+            let id = st.poc.open_seance.expect("a Séance opens");
+            st.poc.seances[&id].clone()
+        };
+        // As the rules intend: the insider can't judge the newcomer's claim, so with two claims it
+        // has no pair to judge and doesn't sit.
+        let a = draw(t.c.state.clone(), t.h() + 1);
+        assert_eq!((a.claims.len(), a.jurors.len()), (2, 3));
+        assert!(!a.jurors.contains_key(&insider.address()));
+        // Knowing that, the newcomer declines the vouch (it always may). The two stay tied for
+        // this Séance: the same jury sits, and the insider still doesn't judge the claim it
+        // vouched for. Its seniority in the pool is untouched.
+        let joined = t.c.state.poc.jurors[&insider.address()].joined_at;
+        t.tx(&newcomer, Action::Unvouch { account: newcomer.address() }).unwrap();
+        assert!(!t.c.state.poc.vouches.contains_key(&newcomer.address()));
+        assert_eq!(t.c.state.poc.jurors[&insider.address()].joined_at, joined);
+        let jury = |s: &Seance| serde_json::to_value((&s.claims, &s.jurors)).unwrap();
+        assert_eq!(jury(&draw(t.c.state.clone(), t.h() + 1)), jury(&a));
+        t.blocks(at - t.h());
+        let id = t.c.state.poc.open_seance.expect("the real chain opens it");
+        assert_eq!(jury(&t.c.state.poc.seances[&id]), jury(&a));
+        conserved(&t.c.state);
+        t.reopen_same_root();
+    }
+
+    /// Audit review-fix-poc-2: once the seed is public, the vouchee dropping its vouch can't take
+    /// its voucher off the upcoming Séance (or, with the pool at `MIN_JURY`, stop the Séance and
+    /// re-roll the seed): the conflict counts as of the cutoff, so the same jury sits with the
+    /// same pairs, and the voucher still never judges its vouchee's claim.
+    #[test]
+    fn an_unvouch_after_the_seed_changes_no_seat() {
+        let mut t = setup("vouchseat");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        let jurors: Vec<Keys> = (1..=3).map(k).collect();
+        for j in &jurors {
+            t.grant(j, 20);
+            t.tx(j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        let (insider, newcomer) = (&jurors[0], k(10));
+        t.tx(insider, Action::Vouch { account: newcomer.address() }).unwrap();
+        t.link(&newcomer, "newcomer");
+        let mut claims = vec![t.claim(&newcomer, 1).unwrap()];
+        for (i, who) in [(11u8, "o1"), (12, "o2")] {
+            t.grant(&k(i), 1);
+            t.link(&k(i), who);
+            claims.push(t.claim(&k(i), i as u64).unwrap());
+        }
+        t.attest_all(&claims);
+        t.tx(&k(9), Action::FundPool { amount: 50 * DROPS_PER_FANG }).unwrap();
+        let at = {
+            let st = &t.c.state;
+            let mut at = st.next_seance_height(t.h() + 1);
+            while st.seance_cutoff(st.params.epoch_of(at)) <= t.h() {
+                at = st.next_seance_height(at + 1);
+            }
+            at
+        };
+        let epoch = t.c.state.params.epoch_of(at);
+        while t.h() < epoch * t.c.state.params.epoch_blocks {
+            t.blocks(1);
+        }
+        assert!(crate::beacon::value(&t.c.state, epoch).is_some() && t.h() < at, "the seed is public before the opening");
+        let draw = |mut st: State, from: u64| -> Option<Seance> {
+            for h in from..=at {
+                st.end_block(&BlockInfo { height: h, hash: "x", proposer: "p", view: h, parent_view: h - 1, skipped: &[], tx_bytes: 0 });
+            }
+            st.poc.open_seance.map(|id| st.poc.seances[&id].clone())
+        };
+        let a = draw(t.c.state.clone(), t.h() + 1).expect("a Séance opens");
+        assert_eq!(a.jurors.len(), 3);
+        let seat = &a.jurors[&insider.address()];
+        assert!(seat.pairs.iter().all(|p| !p.contains(&claims[0])), "the insider never judges its vouchee: {:?}", seat.pairs);
+        t.tx(&newcomer, Action::Unvouch { account: newcomer.address() }).unwrap();
+        assert!(!t.c.state.poc.vouches.contains_key(&newcomer.address()));
+        let jury = |s: &Seance| serde_json::to_value((&s.claims, &s.jurors)).unwrap();
+        assert_eq!(draw(t.c.state.clone(), t.h() + 1).map(|s| jury(&s)), Some(jury(&a)), "the same jury, the same pairs");
+        t.blocks(at - t.h());
+        let id = t.c.state.poc.open_seance.expect("the real chain opens it");
+        assert_eq!(jury(&t.c.state.poc.seances[&id]), jury(&a));
+        conserved(&t.c.state);
+        t.reopen_same_root();
+    }
+
+    /// Audit xcut-economic-opus-2: a sybil dropping its vouch (a newcomer may decline one any
+    /// time) doesn't get its voucher off the hook. Until the vouch's lock would have ended, the
+    /// bond stays held and the slot taken; a sybil flag then costs the voucher the bond and
+    /// `SYBIL_VOUCHER_SOUL`, and claws back its cut of the sybil's rewards. After the lock, with
+    /// no flag, the bond comes back at an epoch boundary.
+    #[test]
+    fn a_dropped_vouch_still_answers_for_its_sybil() {
+        let mut t = setup("sybilvouch");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        let (op, s1, s2, s3) = (k(5), k(6), k(7), k(8));
+        t.grant(&op, 25);
+        t.tx(&op, Action::Vouch { account: s1.address() }).unwrap();
+        t.tx(&op, Action::Vouch { account: s2.address() }).unwrap();
+        t.link(&s1, "s1");
+        let c = t.claim(&s1, 1).unwrap();
+        t.attest(c, true).unwrap();
+        let before = t.bal(&op);
+        t.tx(&s1, Action::Unvouch { account: s1.address() }).unwrap();
+        assert_eq!(t.bal(&op), before, "the bond stays held");
+        assert!(t.tx(&op, Action::Vouch { account: s3.address() }).unwrap_err().to_string().contains("allows 2"), "and its slot taken");
+        conserved(&t.c.state);
+        let (pool0, soul0) = (t.c.state.account(&t.c.state.pool()).balance, t.soul(&op));
+        t.admin(Action::FlagSybil { account: s1.address(), reason: "a sock puppet".into() }).unwrap();
+        assert_eq!(t.c.state.account(&t.c.state.pool()).balance, pool0 + VOUCH_BOND + CLAIM_BOND, "the voucher's bond and the sybil's claim bond go to the pool");
+        assert_eq!(t.soul(&op), soul0.saturating_sub(SYBIL_VOUCHER_SOUL));
+        assert_eq!(t.c.state.poc.claims[&c].status, ClaimStatus::Rejected);
+        conserved(&t.c.state);
+        // s2 declines too; nobody flags it. The bond comes back once the lock would have ended.
+        t.tx(&s2, Action::Unvouch { account: s2.address() }).unwrap();
+        let unlock = t.c.state.poc.dropped_vouches[&vouch_key(&s2.address(), &op.address())].at + t.c.state.params.poc.vouch_lock_blocks;
+        let held = t.bal(&op);
+        while t.h() < unlock {
+            t.blocks(1);
+        }
+        assert_eq!(t.bal(&op), held, "held until the lock is over");
+        t.blocks(t.c.state.params.epoch_blocks);
+        assert_eq!(t.bal(&op), held + VOUCH_BOND, "then handed back at an epoch boundary");
+        assert!(t.c.state.poc.dropped_vouches.is_empty(), "and forgotten once no Séance can need it");
+        conserved(&t.c.state);
+        t.reopen_same_root();
+
+        // The voucher's cut of a sybil's rewards is clawed back with the sybil's own (as
+        // `exec_reject_claim` does for a reverted claim).
+        let mut t = setup("sybilcut");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        for j in [k(1), k(2), k(3)] {
+            t.grant(&j, 10);
+            t.tx(&j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        t.tx(&k(9), Action::FundPool { amount: 80 * DROPS_PER_FANG }).unwrap();
+        let (voucher, sybil, other) = (k(5), k(6), k(7));
+        t.grant(&voucher, 20);
+        t.grant(&other, 1);
+        t.tx(&voucher, Action::Vouch { account: sybil.address() }).unwrap();
+        t.link(&sybil, "sybil");
+        t.link(&other, "other");
+        let ids = [t.claim(&sybil, 1).unwrap(), t.claim(&other, 2).unwrap()];
+        t.attest_all(&ids);
+        let sid = t.wait_for_seance();
+        let mut st = t.c.state.clone();
+        judge(&mut st, sid, |c| if c == ids[0] { 2 } else { 1 });
+        st.close_seance(sid, t.h());
+        let h = t.h() + 1;
+        assert!(st.grant_totals(&voucher.address(), h).2 > 0, "the voucher got a cut");
+        let mut j = Journal::default();
+        st.exec_flag_sybil(&mut j, &sybil.address(), "test", "a sock puppet", h).unwrap();
+        assert_eq!((st.grant_totals(&sybil.address(), h).2, st.grant_totals(&voucher.address(), h).2), (0, 0), "both clawed back");
+        st.check_invariants().unwrap();
+        drop(st);
+        std::fs::remove_dir_all(&t.home).ok();
+    }
+
+    /// Audit F53, the rule: a vouch can always be withdrawn (the newcomer declines any time, the
+    /// voucher after the lock), so no juror can pin its vouch, and its cut, on a newcomer with a
+    /// claim open. Withdrawing moves nobody's place in the jury pool (audit review-fix-poc-2): the
+    /// two stay tied for any Séance whose cutoff came before it, and the voucher's bond and slot
+    /// stay held until the lock is over (audit xcut-economic-opus-2).
+    #[test]
+    fn a_vouch_can_always_go_and_moves_no_seat() {
+        let mut t = setup("vouchgo");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        let (juror, newbie, other) = (k(1), k(6), k(7));
+        t.grant(&juror, 35);
+        t.tx(&juror, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        let joined = |t: &T, who: &Keys| t.c.state.poc.jurors.get(&who.address()).unwrap().joined_at;
+        let first = joined(&t, &juror);
+        t.link(&juror, "juror");
+        let mine = t.claim(&juror, 2).unwrap();
+        t.attest(mine, true).unwrap();
+        let b0 = t.bal(&juror);
+        // A newcomer declines: the bond is held, the slot taken, the juror's place unchanged.
+        t.tx(&juror, Action::Vouch { account: other.address() }).unwrap();
+        t.tx(&other, Action::Unvouch { account: other.address() }).unwrap();
+        assert_eq!(joined(&t, &juror), first);
+        let d = t.c.state.poc.dropped_vouches[&vouch_key(&other.address(), &juror.address())].clone();
+        assert_eq!((d.bond, d.dropped_at), (VOUCH_BOND, t.h()));
+        // The newcomer, with a claim open (made under the vouch), declines its juror's vouch: the
+        // same. Its claim stays tied to the juror for Séances whose cutoff came before.
+        t.tx(&juror, Action::Vouch { account: newbie.address() }).unwrap();
+        t.link(&newbie, "newbie");
+        let c = t.claim(&newbie, 1).unwrap();
+        t.attest(c, true).unwrap();
+        t.tx(&newbie, Action::Unvouch { account: newbie.address() }).unwrap();
+        let dropped = t.h();
+        assert_eq!(joined(&t, &juror), first);
+        assert!(t.c.state.conflicted(&juror.address(), &newbie.address(), dropped));
+        assert!(!t.c.state.conflicted(&juror.address(), &newbie.address(), dropped + 1));
+        // Three slots (35 Soul, decaying): two held, so one more vouch, and no fourth.
+        t.tx(&juror, Action::Vouch { account: newbie.address() }).unwrap();
+        assert!(t.tx(&juror, Action::Vouch { account: k(8).address() }).unwrap_err().to_string().contains("allows 3"));
+        let spent = b0 - t.bal(&juror);
+        assert!((3 * VOUCH_BOND..3 * VOUCH_BOND + DROPS_PER_FANG / 10).contains(&spent), "three bonds held, plus fees: {spent}");
+        // The voucher withdraws past the lock, the claim still open: its bond comes straight back,
+        // and the earlier held ones at an epoch boundary once their locks are over.
+        assert!(t.tx(&juror, Action::Unvouch { account: newbie.address() }).unwrap_err().to_string().contains("locked until"));
+        t.blocks(100);
+        let b1 = t.bal(&juror);
+        t.tx(&juror, Action::Unvouch { account: newbie.address() }).unwrap();
+        assert!(t.bal(&juror) + DROPS_PER_FANG / 100 > b1 + VOUCH_BOND);
+        assert_eq!(joined(&t, &juror), first);
+        assert!(!t.c.state.poc.vouches.contains_key(&newbie.address()));
+        t.blocks(t.c.state.params.epoch_blocks);
+        assert_eq!(t.c.state.vouches_held_by(&juror.address()), 0, "the held bonds came back");
+        assert!(t.bal(&juror) + DROPS_PER_FANG / 10 > b0, "all three");
+        conserved(&t.c.state);
+        // The other way round: the voucher has the claim open and the vouchee sits in the pool.
+        t.tx(&juror, Action::Vouch { account: newbie.address() }).unwrap();
+        t.admin(Action::RejectClaim { claim_id: c, reason: "test".into() }).unwrap();
+        t.grant(&newbie, 10);
+        t.tx(&newbie, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        let (j_before, n_before) = (joined(&t, &juror), joined(&t, &newbie));
+        t.tx(&newbie, Action::Unvouch { account: newbie.address() }).unwrap();
+        assert_eq!((joined(&t, &juror), joined(&t, &newbie)), (j_before, n_before));
+        assert!(t.c.state.conflicted(&newbie.address(), &juror.address(), t.h()));
+        t.admin(Action::RejectClaim { claim_id: mine, reason: "test".into() }).unwrap();
+        conserved(&t.c.state);
+        t.reopen_same_root();
+    }
+
+    /// Audit F23: a spam verdict needs `SPAM_MIN_FLAGS` (3) flags and a majority of the jurors who
+    /// saw the claim, so two colluding seats can't slash a claim only they (or few others) saw;
+    /// and a flag the jury didn't uphold counts against the flagger's agreement.
+    #[test]
+    fn spam_needs_three_flags_and_overruled_flags_cost_agreement() {
+        let mut t = setup("spamq");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        let jurors: Vec<Keys> = (1..=5).map(k).collect();
+        for j in &jurors {
+            t.grant(j, 10);
+            t.tx(j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        t.tx(&k(9), Action::FundPool { amount: 50 * DROPS_PER_FANG }).unwrap();
+        let mut claims = vec![];
+        for (i, who) in [(10u8, "ten"), (11, "eleven"), (12, "twelve")] {
+            t.grant(&k(i), 1);
+            t.link(&k(i), who);
+            claims.push(t.claim(&k(i), i as u64).unwrap());
+        }
+        t.attest_all(&claims);
+        let sid = t.wait_for_seance();
+        let (x, a, b) = (claims[0], claims[1], claims[2]);
+        let base = t.c.state.clone();
+        let h = t.h();
+        // Every juror reveals an honest ballot (a > b > x) and the `flaggers` flag `x`; with
+        // `only_two_see_x`, jurors 2–4 compare only `a` and `b`.
+        let close = |flaggers: &[usize], only_two_see_x: bool| -> State {
+            let mut st = base.clone();
+            let s = st.poc.seances.get_mut(&sid).unwrap();
+            for (i, jk) in jurors.iter().enumerate() {
+                let seat = s.jurors.get_mut(&jk.address()).unwrap();
+                if only_two_see_x && i >= 2 {
+                    seat.pairs = vec![[a, b]];
+                }
+                let rank = |c: u64| if c == a { 3 } else if c == b { 2 } else { 1 };
+                seat.votes = Some(seat.pairs.iter().map(|[p, q]| if rank(*p) > rank(*q) { 'a' } else { 'b' }).collect());
+                seat.spam = if flaggers.contains(&i) { vec![x] } else { vec![] };
+            }
+            st.close_seance(sid, h);
+            st.check_invariants().unwrap();
+            st
+        };
+        let agreement = |st: &State, i: usize| st.poc.seances[&sid].jurors[&jurors[i].address()].agreement_ppm.unwrap();
+        // Two of the five who saw it flag it: not spam, and both flags were overruled.
+        let st = close(&[0, 1], false);
+        assert_eq!(st.poc.claims[&x].status, ClaimStatus::Scored);
+        assert!(agreement(&st, 0) < agreement(&st, 2), "an overruled flag costs agreement: {} vs {}", agreement(&st, 0), agreement(&st, 2));
+        assert_eq!(agreement(&st, 2), PPM, "honest ballot, no flags");
+        // Only two jurors saw `x`, and both flagged it: a majority of its viewers, but too few to
+        // decide. It's scored (on ambiguity, never slashed), and the flags aren't graded.
+        let st = close(&[0, 1], true);
+        assert_eq!(st.poc.seances[&sid].jurors[&jurors[3].address()].pairs, vec![[a, b]]);
+        assert_eq!(st.poc.claims[&x].status, ClaimStatus::Scored);
+        assert_eq!(st.poc.claims[&x].bond, 0, "bond refunded");
+        assert_eq!((agreement(&st, 0), agreement(&st, 1)), (PPM, PPM));
+        // Three of five: spam (bond to the pool, Soul lost); upheld flags cost nothing.
+        let st = close(&[0, 1, 2], false);
+        assert_eq!(st.poc.claims[&x].status, ClaimStatus::Spam);
+        assert_eq!(st.poc.seances[&sid].results.as_ref().unwrap().spam, 1);
+        assert_eq!(agreement(&st, 0), PPM);
+        std::fs::remove_dir_all(&t.home).ok();
+    }
+
     fn claims_payout(t: &T, c: u64) -> u64 {
         let cl = &t.c.state.poc.claims[&c];
         t.c.state.poc.grants[&cl.claimant][&cl.grant.unwrap()].amount
+    }
+
+    /// Fills every seat of Séance `sid` with an honest ballot: the claim `rank` puts higher wins
+    /// its pair, equal ranks tie.
+    fn judge(st: &mut State, sid: u64, rank: impl Fn(u64) -> u32) {
+        let s = st.poc.seances.get_mut(&sid).unwrap();
+        for seat in s.jurors.values_mut() {
+            seat.votes = Some(seat.pairs.iter().map(|[a, b]| match rank(*a).cmp(&rank(*b)) { std::cmp::Ordering::Greater => 'a', std::cmp::Ordering::Less => 'b', std::cmp::Ordering::Equal => '=' }).collect());
+        }
+    }
+
+    /// What an account was paid in a closed Séance (its claims' payouts) and the Soul they earned.
+    fn paid(st: &State, who: &Keys) -> (u64, u64) {
+        st.poc.claims.values().filter(|c| c.claimant == who.address()).fold((0, 0), |(p, s), c| (p + c.payout, s + c.soul_awarded))
+    }
+
+    /// Audit xcut-economic-opus-1: volume doesn't pay. One account's 8 small PRs, each of which
+    /// the jury judges worse than one solid PR, earn less than it (here nothing): one person's
+    /// claims are never compared with each other (they'd tie, which floats weak claims over the
+    /// threshold), and the budget grows with the people in a Séance, not their claim count. (With
+    /// weak peers in the field, see `eight_weak_prs_never_beat_one_solid_one_among_weak_peers`.)
+    #[test]
+    fn eight_weak_prs_that_lose_every_comparison_earn_nothing() {
+        let mut t = setup("volume");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        for j in [k(1), k(2), k(3)] {
+            t.grant(&j, 10);
+            t.tx(&j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        t.tx(&k(9), Action::FundPool { amount: 80 * DROPS_PER_FANG }).unwrap();
+        // The volume farmer has the Soul for 8 open claims; the solid contributor has one claim.
+        let (farmer, solid) = (k(5), k(6));
+        t.grant(&farmer, 60);
+        t.grant(&solid, 1);
+        t.link(&farmer, "volume");
+        t.link(&solid, "solid");
+        let small: Vec<u64> = (1..=8).map(|pr| t.claim(&farmer, pr).unwrap()).collect();
+        let big = t.claim(&solid, 100).unwrap();
+        t.attest_all(&[small.as_slice(), &[big]].concat());
+        let sid = t.wait_for_seance();
+        let s = t.c.state.poc.seances[&sid].clone();
+        let pool = t.c.state.account(&t.c.state.pool()).balance + s.budget;
+        assert_eq!(s.budget, bps(pool, SEANCE_POOL_BPS) * 2 / FULL_BUDGET_PEOPLE, "two people: 2/16 of a quarter, however many claims");
+        for seat in s.jurors.values() {
+            assert!(seat.pairs.iter().all(|[a, b]| (*a == big) != (*b == big)), "the farmer's claims are only ever compared with someone else's: {:?}", seat.pairs);
+        }
+        let mut st = t.c.state.clone();
+        judge(&mut st, sid, |c| if c == big { 2 } else { 1 });
+        st.close_seance(sid, t.h());
+        st.check_invariants().unwrap();
+        let ((farmer_paid, farmer_soul), (solid_paid, solid_soul)) = (paid(&st, &farmer), paid(&st, &solid));
+        assert!(solid_paid > 0 && farmer_paid < solid_paid, "8 weak PRs earned {farmer_paid}, the solid one {solid_paid}");
+        assert!(farmer_soul < solid_soul, "Soul: {farmer_soul} vs {solid_soul}");
+        assert!(small.iter().all(|c| st.poc.claims[c].score_ppm == Some(0)), "each lost its only comparisons");
+        // With other people in the Séance too (6 medium PRs, judged between the two), the farmer
+        // still earns less than the solid PR and less than any medium one.
+        let mut t = setup("volume2");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        for j in [k(1), k(2), k(3), k(4)] {
+            t.grant(&j, 10);
+            t.tx(&j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        t.tx(&k(4), Action::FundPool { amount: 80 * DROPS_PER_FANG }).unwrap();
+        t.grant(&farmer, 60);
+        t.grant(&solid, 1);
+        t.link(&farmer, "volume");
+        t.link(&solid, "solid");
+        let small: Vec<u64> = (1..=8).map(|pr| t.claim(&farmer, pr).unwrap()).collect();
+        let big = t.claim(&solid, 100).unwrap();
+        let mut medium = vec![];
+        for i in 7..=12u8 {
+            t.grant(&k(i), 1);
+            t.link(&k(i), &format!("medium{i}"));
+            medium.push(t.claim(&k(i), 200 + i as u64).unwrap());
+        }
+        t.attest_all(&[small.as_slice(), &[big], &medium].concat());
+        let sid = t.wait_for_seance();
+        let mut st = t.c.state.clone();
+        judge(&mut st, sid, |c| if c == big { 3 } else if medium.contains(&c) { 2 } else { 1 });
+        st.close_seance(sid, t.h());
+        st.check_invariants().unwrap();
+        let farmer_paid = paid(&st, &farmer).0;
+        let best_medium = (7..=12u8).map(|i| paid(&st, &k(i)).0).min().unwrap();
+        assert!(farmer_paid < paid(&st, &solid).0 && farmer_paid < best_medium, "farmer {farmer_paid}, solid {}, least medium {best_medium}", paid(&st, &solid).0);
+        std::fs::remove_dir_all(&t.home).ok();
+    }
+
+    /// A Séance of one volume farmer's `small` weak PRs, one solid PR by someone else, and `peers`
+    /// other people's PRs as weak as the farmer's. Honest jurors put the solid PR above every
+    /// other and call every other pair a tie, so each weak claim loses to the solid one and ties
+    /// the rest: with peers in the field the farmer's claims score up to 50%, above the threshold.
+    /// Returns (farmer's payout, Soul), (solid's payout, Soul) and the farmer's scores.
+    fn volume_field(tag: &str, peers: u8, small: u64, farmer_soul: u64, solid_soul: u64) -> ((u64, u64), (u64, u64), Vec<u64>) {
+        let mut t = setup(tag);
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        for j in [k(1), k(2), k(3)] {
+            t.grant(&j, 10);
+            t.tx(&j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        t.tx(&k(9), Action::FundPool { amount: 80 * DROPS_PER_FANG }).unwrap();
+        let (farmer, solid) = (k(5), k(6));
+        // Bonds grow with open claims: 16 of them take 136 FANG.
+        t.c.faucet(&farmer.address(), 500 * DROPS_PER_FANG).unwrap();
+        t.c.produce_block().unwrap();
+        let mut left = farmer_soul;
+        while left > 0 {
+            t.grant(&farmer, left.min(100));
+            left -= left.min(100);
+        }
+        t.grant(&solid, solid_soul);
+        t.link(&farmer, "volume");
+        t.link(&solid, "solid");
+        let weak: Vec<u64> = (1..=small).map(|pr| t.claim(&farmer, pr).unwrap()).collect();
+        let big = t.claim(&solid, 1_000).unwrap();
+        let mut others = vec![];
+        for i in 0..peers {
+            let who = k(20 + i);
+            t.c.faucet(&who.address(), 100 * DROPS_PER_FANG).unwrap();
+            t.c.produce_block().unwrap();
+            t.grant(&who, 1);
+            t.link(&who, &format!("peer{i}"));
+            others.push(t.claim(&who, 2_000 + i as u64).unwrap());
+        }
+        t.attest_all(&[weak.as_slice(), &[big], &others].concat());
+        let sid = t.wait_for_seance();
+        let mut st = t.c.state.clone();
+        judge(&mut st, sid, |c| if c == big { 2 } else { 1 });
+        st.close_seance(sid, t.h());
+        st.check_invariants().unwrap();
+        let scores = weak.iter().map(|c| st.poc.claims[c].score_ppm.unwrap_or(0)).collect();
+        let out = (paid(&st, &farmer), paid(&st, &solid), scores);
+        std::fs::remove_dir_all(&t.home).ok();
+        out
+    }
+
+    /// Audit xcut-economic-opus-1, round 3 (the R1 reviewer's bypass): with other people's weak
+    /// PRs in the field, the farmer's weak claims tie theirs and score 25–50%, over the threshold.
+    /// Under a square root of their sum, 8 of them earned 1.82× the solid PR with one weak peer
+    /// and 2.16× with three (and 2–3× the Soul). Now a person's claims count best first, each a
+    /// quarter of the one above, so 8 (or 16) weak PRs never beat one solid PR, in FANG or in
+    /// Soul, even when the farmer has the full Soul boost and the solid contributor almost none.
+    #[test]
+    fn eight_weak_prs_never_beat_one_solid_one_among_weak_peers() {
+        for (tag, peers, small, farmer_soul, solid_soul) in [("weak1", 1, 8, 60, 1), ("weak3", 3, 8, 60, 1), ("weak3-even", 3, 8, 60, 60), ("weak7-boost", 7, 16, 170, 1)] {
+            let ((fp, fs), (sp, ss), scores) = volume_field(tag, peers, small, farmer_soul, solid_soul);
+            let best = scores.iter().copied().max().unwrap();
+            assert!((MIN_SCORE_PPM..=PPM / 2).contains(&best), "{tag}: the weak claims are accepted, and none beats the field: {scores:?}");
+            assert!(sp > 0 && fp < sp, "{tag}: {small} weak PRs earned {fp}, the solid one {sp} (scores {scores:?})");
+            assert!(fs < ss, "{tag}: Soul {fs} vs {ss}");
+            // Their Soul together is under 4/3 of what the best one alone earns.
+            assert!(3 * fs as u128 <= 4 * (CLAIM_SOUL as u128 * best as u128 / PPM as u128), "{tag}: Soul {fs}, best claim {best}");
+        }
+    }
+
+    /// Audit xcut-economic-opus-3: a person is the sponsor account, so one account that relinks a
+    /// second GitHub handle between claims has all of them ranked together (best first, each next
+    /// a quarter), and earns what one handle with the same claims would.
+    #[test]
+    fn relinking_a_second_handle_is_still_one_person() {
+        let mut t = setup("relink");
+        t.admin(Action::SetRepo { repo: "jackdishman/blockula".into(), weight: 10 }).unwrap();
+        for j in [k(1), k(2), k(3)] {
+            t.grant(&j, 10);
+            t.tx(&j, Action::JoinJury { bond: JUROR_BOND }).unwrap();
+        }
+        t.tx(&k(9), Action::FundPool { amount: 80 * DROPS_PER_FANG }).unwrap();
+        let (a, b) = (k(5), k(6));
+        t.grant(&a, 15);
+        t.grant(&b, 15);
+        t.link(&a, "a-one");
+        let mut mine = vec![t.claim(&a, 1).unwrap(), t.claim(&a, 2).unwrap()];
+        t.attest_all(&mine);
+        t.tx(&a, Action::UnlinkGithub { handle: "a-one".into() }).unwrap();
+        t.link(&a, "a-two");
+        mine.extend([t.claim(&a, 3).unwrap(), t.claim(&a, 4).unwrap()]);
+        t.link(&b, "b");
+        let theirs: Vec<u64> = (5..=8).map(|pr| t.claim(&b, pr).unwrap()).collect();
+        t.attest_all(&[&mine[2..], theirs.as_slice()].concat());
+        assert_eq!((t.c.state.poc.handles["a-one"].clone(), t.c.state.poc.handles["a-two"].clone()), (a.address(), a.address()));
+        let sid = t.wait_for_seance();
+        assert_eq!(t.c.state.poc.seances[&sid].claims.len(), 8);
+        // Every comparison a tie: every claim scores 50%.
+        let mut st = t.c.state.clone();
+        judge(&mut st, sid, |_| 0);
+        st.close_seance(sid, t.h());
+        st.check_invariants().unwrap();
+        let (pa, pb) = (paid(&st, &a).0, paid(&st, &b).0);
+        // (Their Soul boosts differ by a hair: the two grants decay from blocks a few apart.)
+        assert!(pa > 0 && pa.abs_diff(pb) <= pb / 10_000, "two handles {pa}, one handle {pb}");
+        std::fs::remove_dir_all(&t.home).ok();
     }
 }

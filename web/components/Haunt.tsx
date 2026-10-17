@@ -17,20 +17,6 @@ export function Haunt() {
   return <canvas ref={ref} className="haunt" aria-hidden />;
 }
 
-/** Display size of each prop, CSS px. */
-const SIZE: Record<PropKind, [number, number]> = {
-  key: [340, 136],
-  moon: [200, 190],
-  pumpkin: [240, 214],
-  candle: [170, 214],
-  bat: [340, 150],
-  coin: [180, 166],
-  coffin: [340, 180],
-  grave: [220, 236],
-  cauldron: [230, 224],
-  cat: [200, 236],
-};
-
 /**
  * A 3D ASCII prop for a page's hero spot. It turns slowly, leans toward the cursor and is lit
  * from it. `busy` spins it (the key while you unlock, the coin when money arrives), `text` is
@@ -53,8 +39,8 @@ export function Apparition({ kind, busy = false, text, burst }: { kind: PropKind
     live.current = { busy, text };
     handle.current?.redraw();
   }, [busy, text]);
-  const [w, h] = SIZE[kind];
-  return <canvas ref={ref} className={`apparition apparition-${kind}`} style={{ width: w, aspectRatio: `${w} / ${h}` }} aria-hidden />;
+  // Each kind's display size is in globals.css (.apparition-<kind>): the CSP refuses inline style attributes.
+  return <canvas ref={ref} className={`apparition apparition-${kind}`} aria-hidden />;
 }
 
 /** Footer switch for the animations, remembered in this browser. The OS setting wins. */

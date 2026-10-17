@@ -12,6 +12,7 @@
 |---|---|
 | Signatures | **ML-DSA-65** (NIST FIPS 204) for every account, validator vote and block certificate. No elliptic curves on-chain |
 | Hashing | BLAKE3-256. Grover's algorithm only halves its strength, and 256-bit hashes keep a ~128-bit margin |
+| Network | Validators authenticate each other with ML-DSA-65 and key their connections with hybrid X25519 + ML-KEM-768, so recorded traffic stays private even against a future quantum computer |
 | Consensus | BFT proof-of-stake (Commonware *simplex*). Blocks are final in about a second, with no waiting for confirmations |
 | Wallet | A **passkey** unlocks the wallet. Its PRF output derives the ML-DSA key, so the passkey's own non-quantum-safe signature is never used on-chain |
 | Accounts | Multiple keys per account: **owner** keys (each device, plus recovery) and **session** keys for agents and apps, with a spend limit per period and an expiry, all enforced on-chain |
@@ -27,7 +28,7 @@
   - `blockula summon mychain --validators 4` creates your own network.
   - `blockula join` syncs a full node, with the explorer browsable while it syncs.
   - `blockula validator register` lets you apply to validate.
-- **Proof of Contribution** (Hunts are live; the contribution pool ships in the next testnet release): bounties (**Hunts**) on GitHub issues, and a contribution pool for any merged PR. Validators check claims against GitHub; random commit-reveal juries (**Séances**) score them; rewards are square-rooted per person and vest with clawback; reputation (**Souls**) can't be bought. Agents take part as **Familiars** of a human sponsor.
+- **Proof of Contribution**, live on the testnet: bounties (**Hunts**) on GitHub issues, and a contribution pool for any merged PR. Validators check claims against GitHub; random commit-reveal juries (**Séances**) score them; a person's claims count best first (each next a quarter of the one before) and rewards vest with clawback; reputation (**Souls**) can't be bought. Agents take part as **Familiars** of a human sponsor.
 - **Validators are added on-chain at epoch boundaries.** For Season 0 an admin allowlist approves them, and every approval is visible in the explorer.
 - **Reviewed before launch.** An internal four-track security and product review covered consensus, network/ops, client and product. Its findings were fixed and turned into regression tests. A third-party audit comes before mainnet.
 

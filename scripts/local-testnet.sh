@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Local multi-node smoke test: 4 genesis validators (simplex BFT over authenticated p2p) + 1 full
-# node that joins over HTTP + a 5th validator onboarded with the CLI (init → faucet → register →
-# admin approve → active at the next epoch). Runs the SDK e2e against a validator (with validator
+# node that joins over HTTP + a 5th validator onboarded with the CLI (init → faucet → register with
+# a self-bond → selected by stake at the next epoch boundary, no admin step). Runs the SDK e2e
+# against a validator (with validator
 # 0 as the Season 0 admin, so the contribution pool's admin flow runs too) and against the full
 # node, restarts a validator mid-run, then checks every node agrees on hashes and state roots.
+# The chain has `blockula dev`'s short durations (`summon --dev-durations`), so the e2e's staking
+# runs through unbonding and withdrawal, and a ParamChange proposal passes the bootstrap council
+# (3 of the 4 validators) and executes after its timelock.
 #
 #   scripts/local-testnet.sh            # build release, run, tear down
 #   KEEP=1 scripts/local-testnet.sh     # leave the testnet running afterwards
@@ -27,11 +31,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-[[ -n "${SKIP_BUILD:-}" ]] || cargo build --release --manifest-path node/Cargo.toml
+[[ -n "${SKIP_BUILD:-}" ]] || cargo build --release --locked --manifest-path node/Cargo.toml
 echo "📁 $DIR"
 
 EPOCH=${EPOCH:-20}
-"$BIN" summon testnet --home "$DIR" --validators "$N" --epoch-blocks "$EPOCH" | tee "$DIR/summon.txt"
+"$BIN" summon testnet --home "$DIR" --validators "$N" --epoch-blocks "$EPOCH" --dev-durations | tee "$DIR/summon.txt"
 GHASH=$(grep -o 'genesis hash: [0-9a-f]*' "$DIR/summon.txt" | awk '{print $3}')
 addr() { node -e "console.log(require('$DIR/genesis.json').validators[$1].http_addr)"; }
 status() { curl -sf -m 3 "http://$1/api/status"; }
@@ -62,8 +66,30 @@ FULL="127.0.0.1:$FULL_PORT"
 echo "— SDK e2e against validator 2 (faucet + txs gossiped to whoever leads)"
 BLOCKULA_RPC="http://$V2" BLOCKULA_ADMIN_SEED="$(cat "$DIR/v0/validator.key")" npm test -w @blockula/sdk
 
+echo "— governance: a ParamChange the bootstrap council passes (⅔ of the validators vote aye)"
+proposals() { curl -sf "http://$V0/api/proposals?limit=1"; }
+# (A key the council may change: the validators' own economics, e.g. jail_blocks, are the token
+# holders' alone, `params::COUNCIL_KEYS`.)
+before=$(curl -sf "http://$V0/api/params" | field '.params.multisig_expiry_blocks')
+want=$((before + 7))
+"$BIN" gov propose param multisig_expiry_blocks "$want" --title "local testnet: multisig_expiry_blocks $want" --key "$DIR/v0/validator.key" --rpc "http://$V0"
+PID=$(proposals | field '.proposals[0].id')
+# A vote binds what `gov show` printed (its digest): the CLI refuses a proposal that reads
+# differently by the time it signs (audit gap-7-6).
+DIGEST=$("$BIN" gov show "$PID" --rpc "http://$V0" | sed -n 's/^   digest: \([0-9a-f]\{64\}\).*/\1/p')
+[[ ${#DIGEST} == 64 ]] || { echo "❌ gov show printed no digest for proposal #$PID" >&2; exit 1; }
+for i in 0 1 2; do "$BIN" gov vote "$PID" aye 1 --conviction 0 --digest "$DIGEST" --key "$DIR/v$i/validator.key" --rpc "http://$V0"; done
+status=""
+for _ in $(seq 1 240); do
+  status=$(curl -sf "http://$V0/api/proposal/$PID" | field '.status')
+  [[ "$status" == "executed" || "$status" == "rejected" || "$status" == "failed" ]] && break; sleep 1
+done
+now=$(curl -sf "http://$V0/api/params" | field '.params.multisig_expiry_blocks')
+[[ "$status" == "executed" && "$now" == "$want" ]] || { echo "❌ proposal #$PID: $status, multisig_expiry_blocks $now (wanted $want)" >&2; curl -sf "http://$V0/api/proposal/$PID" >&2; exit 1; }
+echo "✓ proposal #$PID passed by the council and ran: multisig_expiry_blocks $before → $now"
+
 echo "— onboarding a validator with the CLI"
-"$BIN" validator init --home "$DIR/v$N" --genesis "http://$V0" | tee "$DIR/init.txt"
+"$BIN" validator init --home "$DIR/v$N" --genesis "http://$V0" --genesis-hash "$GHASH" | tee "$DIR/init.txt"
 NEWV=$(grep -o 'boo1[0-9a-z]*' "$DIR/init.txt" | head -1)
 curl -sf -X POST -H 'content-type: application/json' -d "{\"to\":\"$NEWV\"}" "http://$V0/api/faucet" >/dev/null
 for _ in $(seq 1 60); do
@@ -73,7 +99,6 @@ done
 "$BIN" validator register --home "$DIR/v$N" --rpc "http://$V2"
 "$BIN" run --home "$DIR/v$N" >>"$DIR/v$N.log" 2>&1 &
 PIDS[$((N + 1))]=$!
-"$BIN" validator approve "$NEWV" --key "$DIR/v0/validator.key" --rpc "http://$V0"
 active=""
 for _ in $(seq 1 $((EPOCH * 3 + 30))); do
   active=$(curl -sf "http://$V0/api/validators" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).active.some(v=>v.validator.address==='$NEWV')))")
@@ -88,7 +113,7 @@ for _ in $(seq 1 60); do
   [[ "$proposed" -gt 0 ]] && break; sleep 1
 done
 [[ "$proposed" -gt 0 ]] || { echo "❌ new validator never proposed a block" >&2; exit 1; }
-echo "✓ validator $NEWV joined at an epoch boundary and is proposing blocks"
+echo "✓ validator $NEWV joined by stake at an epoch boundary and is proposing blocks"
 
 echo "— restarting validator 1"
 kill "${PIDS[1]}"; wait "${PIDS[1]}" 2>/dev/null || true
@@ -137,7 +162,10 @@ BLOCKULA_HOME="$W" "$BIN" contrib fund 1 --rpc "http://$V0"
 echo "— fast join from a certified snapshot"
 wait_height "$V0" 106
 FAST="127.0.0.1:$((FULL_PORT + 1))"
-"$BIN" join --genesis "http://$V0" --genesis-hash "$GHASH" --home "$DIR/fast" --port "$((FULL_PORT + 1))" >"$DIR/fast.log" 2>&1 &
+# Dev durations shrink the weak-subjectivity period (half the evidence window, at most the
+# unbonding period) to a minute of blocks, so trusting only the genesis is "stale" by now: this
+# smoke test accepts that risk explicitly instead of fetching a checkpoint (OPERATIONS.md).
+"$BIN" join --genesis "http://$V0" --genesis-hash "$GHASH" --allow-stale-checkpoint --home "$DIR/fast" --port "$((FULL_PORT + 1))" >"$DIR/fast.log" 2>&1 &
 PIDS[$((N + 2))]=$!
 wait_height "$FAST" "$(status "$V0" | field .height)"
 from=$(status "$FAST" | field .fast_synced_from)
