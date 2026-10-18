@@ -9,34 +9,40 @@
 //                       mainnet until public RPCs are built in)
 //   BLOCKULA_CHAIN_ID / BLOCKULA_GENESIS_HASH   pin the chain the node must be on
 //   BLOCKULA_WITNESSES  other nodes of the same chain (comma-separated URLs): .boo names that get
-//                       signed (send, stake, unstake, use_account) are proven against them. Without
+//                       signed (send, stake, unstake, use_account) are proven against them, and the
+//                       height each tx is signed against must not be ahead of their heads (nor, in
+//                       any case, past what the chain's genesis clock allows). Without
 //                       them a send signs the name itself (the chain resolves it when it runs), and
 //                       where an address is needed (stake, unstake, use_account) a name is the
-//                       node's word: on mainnet the address must be confirmed first.
+//                       node's word: on mainnet (any node on blockula-1, however it was configured)
+//                       the address must be confirmed first.
 //   BLOCKULA_HOME       where the agent wallet lives (default ~/.blockula)
 //   BLOCKULA_MAX_SEND   max FANG one call moves (sent, staked, escrowed, paid for a name, bonded; default 100)
 //   BLOCKULA_MAX_DAILY  max FANG leaving the account per UTC day through this MCP, fees included
 //                       (default BLOCKULA_MAX_SEND + 1 FANG for fees, so one full-size call fits)
 //   BLOCKULA_TIMEOUT_MS how long one request to the node may take (default 15000, at most 2147483647)
 //   BLOCKULA_TX_WAIT_MS how long a tx tool waits for finality before answering "pending" (default 15000)
-//   BLOCKULA_BIN        path to the `blockula` binary (default: ~/.blockula/bin/blockula from install_node, else PATH)
+//   BLOCKULA_BIN        path to the `blockula` binary (default: of ~/.blockula/bin/blockula from `blockula release
+//                       install` and ~/.blockula/mcp-bin/blockula from install_node, the one of this MCP's version,
+//                       the first if both or neither are; else PATH)
 //   BLOCKULA_REQUIRE_VERIFY=1   install_node needs provenance too (and refuses a checksum-only release)
-//   BLOCKULA_RELEASE_KEY_ID     the release signing key id to trust (until it's built in)
+//   BLOCKULA_RELEASE_KEY_ID     the release signing key id to trust (until it's built in; it must
+//                       agree with the built-in one and with ~/.blockula/release-key-id, if pinned)
 // The network never changes while the server runs (WAL-4): see network.ts. Spending caps: see
 // spend.ts (reserved before a tx is sent). Chain text is untrusted: see untrusted.ts. When acting
 // for a user's account via a session key, the chain also enforces that key's limit.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ApiError, Client, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, describeKind, encodeKeyGrant, proposalDigest, formatFang, paramsOf, parseFang, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution } from "@blockula/sdk";
+import { ApiError, Client, HeightAheadError, MAINNET_CHAIN_ID, NAMESPACES, RequestTimeoutError, TxFailedError, TxPendingError, Wallet, bareName, checkTimeoutMs, decodeAccount, describeKind, encodeKeyGrant, isAddress, proposalDigest, formatFang, paramsOf, parseFang, proposalSummary, stakeSummary, txDropped, txId, type Action, type ProposalKind, type ProposalSummary, type Recipient, type Resolution } from "@blockula/sdk";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { z } from "zod";
-import { KnownChains, completePin, effectivePin, mismatch, mismatchError, resolveNetwork, type Network } from "./network.js";
-import { REPO, RELEASE_KEY_ID, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, releaseKeyIdFrom } from "./release.js";
-import { SignedTxs } from "./signed.js";
+import { KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, clockFrom, completePin, effectivePin, mismatch, mismatchError, resolveNetwork, type GenesisClock, type Network } from "./network.js";
+import { PIN_FILE, REPO, RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, pickNodeBinary, readReleasePin, releaseKeyIdFrom, type NodeBinary } from "./release.js";
+import { SignedTxs, onChain, type SignedTx } from "./signed.js";
 import { SpendLedger } from "./spend.js";
 import { SERVER_INSTRUCTIONS, UNTRUSTED_NOTE, chainData, clean } from "./untrusted.js";
 
@@ -62,8 +68,29 @@ const TIMEOUT_MS = msEnv("BLOCKULA_TIMEOUT_MS", 15_000);
 const TX_WAIT_MS = msEnv("BLOCKULA_TX_WAIT_MS", 15_000);
 const KNOWN_CHAINS = new KnownChains(join(HOME, "known-chains.json"));
 const VERSION: string = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
-const INSTALLED_BIN = join(HOME, "bin", "blockula");
-let BIN = process.env.BLOCKULA_BIN ?? (existsSync(INSTALLED_BIN) ? INSTALLED_BIN : "blockula");
+// install_node's binary has a path of its own: it never replaces the one `blockula release install`
+// checked against the operator's pinned key (audit review-r3-integrate-compose-1). Which one runs is
+// decided at each use, by version (nodeBinary).
+const { mcp: INSTALLED_BIN, cli: CLI_BIN } = binPaths(HOME);
+
+/** What a binary's `--version` prints, or undefined if it doesn't run. */
+function versionOf(path: string): string | undefined {
+  try {
+    return execFileSync(path, ["--version"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/** The node binary to run now: BLOCKULA_BIN, else the installed one of this MCP's version (pickNodeBinary). */
+function nodeBinary(): NodeBinary & { matches?: boolean } {
+  if (process.env.BLOCKULA_BIN) return { path: process.env.BLOCKULA_BIN };
+  return pickNodeBinary([CLI_BIN, INSTALLED_BIN].filter((p) => existsSync(p)).map((path) => ({ path, version: versionOf(path) })), VERSION);
+}
+
+/** Says which binary ran, and when it isn't this MCP's version. */
+const ranWith = (b: NodeBinary & { matches?: boolean }) =>
+  `Ran ${b.path}${b.version ? ` (${b.version})` : ""}${b.matches === false && b.path !== "blockula" ? `, not this MCP's version (${VERSION}): install_node v${VERSION} (or \`blockula release install v${VERSION}\`) gets one that is.` : "."}`;
 
 /** Testnet economics, said wherever Hunts and the contribution pool come up. */
 const NO_VALUE = "Testnet FANG, Hunts and Soul have no monetary value and come with no promise of any mainnet allocation.";
@@ -84,6 +111,8 @@ try {
 }
 const RPC = NET?.rpc ?? "";
 let pinned: Client | null = null;
+/** The chain `pinned` is held to (tx_status reads a signed tx's record only on the chain it was signed for). */
+let pinnedChain: { chainId?: string; genesisHash?: string; prefix?: string } = {};
 
 function network(): Network {
   if (!NET) throw new Error(`The Blockula MCP isn't configured correctly: ${NET_ERROR?.message}`);
@@ -105,9 +134,32 @@ async function chain(): Promise<Client> {
   const full = completePin(pin, status);
   KNOWN_CHAINS.save(net, full);
   const pins = { chainId: full.chainId, genesisHash: full.genesisHash, prefix: full.prefix, timeoutMs: TIMEOUT_MS };
-  // Witnesses are held to the same chain; with them, names are proven (Client.resolution).
-  pinned = new Client(net.rpc, { ...pins, witnesses: net.witnesses.map((w) => new Client(w, pins)) });
+  // Witnesses are held to the same chain; with them, names are proven (Client.resolution) and a
+  // height ahead of their heads is refused. The chain's genesis clock bounds the height too.
+  const genesisClock = await clockOf(net, full);
+  pinned = new Client(net.rpc, { ...pins, genesisClock, witnesses: net.witnesses.map((w) => new Client(w, pins)) });
+  pinnedChain = { chainId: full.chainId, genesisHash: full.genesisHash, prefix: full.prefix };
   return pinned;
+}
+
+/**
+ * The pinned chain's genesis clock, which bounds the height each tx is signed against
+ * (`Client.checkSigningHeight`: a node reporting a height the chain can't have reached by this
+ * machine's clock gets nothing signed, since it could hold the tx and release it later; audit
+ * review-r3-clients-2). Built in with a known genesis; else the one remembered for this chain id
+ * and genesis hash; else the node's `/api/genesis`, taken on first use like the genesis hash and
+ * remembered with it (but for local dev chains, for this session only). A node that serves none
+ * leaves the height its word, as without the clock.
+ */
+async function clockOf(net: Network, full: { chainId?: string; genesisHash?: string }): Promise<GenesisClock | undefined> {
+  const { chainId, genesisHash } = full;
+  if (chainId === undefined || genesisHash === undefined) return undefined;
+  if (KNOWN_GENESIS[chainId] === genesisHash && KNOWN_CLOCKS[chainId]) return KNOWN_CLOCKS[chainId];
+  const remembered = KNOWN_CHAINS.clock(net, chainId, genesisHash);
+  if (remembered) return remembered;
+  const clock = clockFrom(await new Client(net.rpc, { timeoutMs: TIMEOUT_MS }).genesis().catch(() => undefined), chainId);
+  if (clock) KNOWN_CHAINS.saveClock(net, chainId, genesisHash, clock);
+  return clock;
 }
 
 async function reachable(url: string) {
@@ -137,6 +189,17 @@ const LEDGER = new SpendLedger(SPEND_FILE, MAX_DAILY, MAX_DAILY_TEXT);
 /** The txs this MCP signed (their valid_until, for tx_status): see signed.ts. */
 const SIGNED = new SignedTxs(join(HOME, "agent-txs.json"));
 
+/**
+ * Whether this is real money: the configured network is mainnet, or the chain the client is
+ * pinned to is (audit gap-7-1, R1 bypass): BLOCKULA_RPC alone pointing at a node on blockula-1 is
+ * a "custom" network, and gets mainnet's rules all the same. The client is pinned to the chain id
+ * of its first status, and refuses any later status that reports another, so this is the chain
+ * every signature it makes is for.
+ */
+async function realMoney(client: Client): Promise<boolean> {
+  return network().mainnet || (await client.status()).chain_id === MAINNET_CHAIN_ID;
+}
+
 /** What one tool call spends. */
 interface Spend {
   /** FANG this call moves out of the account (sent, staked, escrowed, paid for a name, bonded). */
@@ -147,6 +210,11 @@ interface Spend {
   perCall?: bigint;
   /** Names the amount in a refusal. */
   what?: string;
+  /**
+   * How names in fields that need an address were resolved: the SDK refuses an unproven one on
+   * mainnet against the very status the tx is signed for (a second check behind `resolved`).
+   */
+  resolutions?: Resolution[];
 }
 
 /** A tx that was submitted (or may have been) but isn't known to be final: never "failed", never to be re-sent blindly. */
@@ -174,7 +242,7 @@ const isInFlight = (r: unknown): r is InFlight => typeof r === "object" && r !==
 async function submitCapped(w: Wallet, action: Action, spend: Spend, memo = ""): Promise<any> {
   const perCall = spend.perCall ?? spend.amount;
   if (perCall > MAX_SEND) throw new Error(`${spend.what ?? "amount"} (${formatFang(perCall)}) exceeds this agent's per-call limit (BLOCKULA_MAX_SEND=${process.env.BLOCKULA_MAX_SEND ?? "100"} FANG)`);
-  const tx = await w.build(action, memo);
+  const tx = await w.build(action, memo, { resolutions: spend.resolutions ?? [] });
   const id = txId(tx);
   const maxFee = BigInt(tx.fee);
   const slot = { account: tx.from, nonce: tx.nonce };
@@ -182,7 +250,7 @@ async function submitCapped(w: Wallet, action: Action, spend: Spend, memo = ""):
   const counted = formatFang(LEDGER.held(slot));
   // Before it can reach any node: tx_status reads its valid_until from here (review-fix-clients-2).
   try {
-    SIGNED.add(id, { valid_until: tx.valid_until, account: tx.from, nonce: tx.nonce });
+    SIGNED.add(id, { valid_until: tx.valid_until, account: tx.from, nonce: tx.nonce, chain_id: tx.chain_id, genesis_hash: tx.genesis_hash });
   } catch {
     /* informational only: tx_status then says valid_until is unknown */
   }
@@ -269,7 +337,7 @@ async function namePrices(client: Client, name: string): Promise<{ price: bigint
  */
 async function resolved(client: Client, input: string, role: string): Promise<{ res: Resolution; confirm?: undefined } | { res?: undefined; confirm: Record<string, unknown> }> {
   const res = await client.resolution(input);
-  if (!res.proven && network().mainnet) {
+  if (!res.proven && (await realMoney(client))) {
     return {
       confirm: {
         status: "not_sent",
@@ -326,7 +394,13 @@ function tool<S extends z.ZodRawShape>(name: string, description: string, shape:
     } catch (e) {
       // Node errors are relayed, so they're cleaned like any chain text.
       const msg = clean(String((e as Error)?.message ?? e), 1000);
-      const hint = /fetch failed|ECONNREFUSED/.test(msg) ? ` (no node at ${RPC}${NET?.key === "local" ? " — call start_dev_node" : ""})` : e instanceof RequestTimeoutError ? ` (the node at ${RPC} isn't answering)` : "";
+      const hint = /fetch failed|ECONNREFUSED/.test(msg)
+        ? ` (no node at ${RPC}${NET?.key === "local" ? " — call start_dev_node" : ""})`
+        : e instanceof RequestTimeoutError
+          ? ` (the node at ${RPC} isn't answering)`
+          : e instanceof HeightAheadError
+            ? ` (the chain's genesis clock is built in, or remembered in ${KNOWN_CHAINS.file} from the first /api/genesis read for this chain)`
+            : "";
       return { ...text(`Error: ${msg}${hint}`), isError: true };
     }
   }) as never);
@@ -334,13 +408,14 @@ function tool<S extends z.ZodRawShape>(name: string, description: string, shape:
 
 tool("status", "Blockula network status: which network and node you're connected to (and the chain it's pinned to), chain id, height, supply, fees burned, and the crypto in use. The network, its pins and how to change them are this MCP's own facts; `node_reports` is what the node says.", {}, async () => {
   const net = network();
-  const s = await (await chain()).status();
+  const client = await chain();
+  const s = await client.status();
   // The node's report is nested and picked field by field: it can't override (or add to) what
   // this MCP states about the network (audit F73).
   const pick = ["chain_id", "height", "finalized_height", "syncing", "epoch", "active_validators", "supply_display", "burned_display", "version", "protocol_version", "head_age_ms", "crypto"];
   return {
     network: net.label,
-    real_money: net.mainnet,
+    real_money: net.mainnet || s.chain_id === MAINNET_CHAIN_ID,
     rpc: net.rpc,
     pinned: chainData({ chain_id: s.chain_id, genesis_hash: s.genesis_hash, address_prefix: s.address_prefix }),
     how_to_change: "The network is fixed while this MCP runs. The user changes it in the MCP's configuration (--network mainnet|testnet|local|custom, or BLOCKULA_RPC).",
@@ -350,25 +425,220 @@ tool("status", "Blockula network status: which network and node you're connected
   };
 });
 
+/** What a node's head says about a tx this MCP signed but the node can't show (it doesn't know it, or only that it dropped it). */
+interface SlotFate {
+  /** The node's height, and the first block it holds (`history_from`), if it said. */
+  head?: number;
+  historyFrom?: number;
+  /** How far ahead a valid_until may be (`max_tx_validity_blocks`): it ran no earlier than valid_until minus this. */
+  maxValidity?: number;
+  /** The account's executed nonce count (`nonce`, never `next_nonce`, which counts the node's mempool too). */
+  accountNonce?: number;
+  /** With BLOCKULA_WITNESSES: accountNonce is proven (the account record's Merkle proof, its state root confirmed by them) as of block `height`. */
+  proven?: { height: number; witnesses: number };
+  /** Why the witnesses didn't confirm the account's nonce (then it's left unknown). */
+  proofError?: string;
+  /** Another tx this MCP signed with the same (account, nonce) that the node shows in a block. */
+  sibling?: { id: string; status: string; block?: number };
+  /**
+   * The tx itself, read again once its nonce showed used (audit review-r4-wallet-1): `ran`, the
+   * node now shows it in a block (it executed between the first read and the nonce read); `absent`,
+   * still in no block (404, or only its drop); unset, the read failed or caught the node mid-update.
+   */
+  recheck?: { ran: Record<string, unknown> } | "absent";
+}
+
+const safeInt = (v: unknown) => (Number.isSafeInteger(v) && (v as number) >= 0 ? (v as number) : undefined);
+
+/**
+ * Reads the head and the account's nonce for a tx this MCP signed (audit review-r3-wallet-1): at
+ * most one tx per (account, nonce) executes, so an executed nonce past the tx's means it (or a tx
+ * that took its nonce) ran, and it can never run again; a nonce still unused at a block past
+ * valid_until means it can never run at all. The status is read first, so a nonce read after a
+ * head past valid_until can't miss this tx running. With BLOCKULA_WITNESSES the nonce is proven
+ * (as of the proof's block), not this node's word.
+ */
+async function slotFate(client: Client, id: string, mine: SignedTx): Promise<SlotFate> {
+  const fate: SlotFate = {};
+  try {
+    const st = await client.status();
+    [fate.head, fate.historyFrom, fate.maxValidity] = [safeInt(st.height), safeInt(st.history_from), safeInt(st.max_tx_validity_blocks)];
+  } catch {
+    /* unknown: answered conservatively below */
+  }
+  if (client.witnesses.length) {
+    try {
+      if (!isAddress(mine.account)) throw new Error(`${mine.account} isn't an address`);
+      const r = await client.provenRecord(NAMESPACES.ACCOUNTS, mine.account, { witnesses: client.witnesses });
+      // No record: provably no account, so nothing from it ever ran.
+      fate.accountNonce = r.value === null ? 0 : decodeAccount(r.value).nonce;
+      fate.proven = { height: r.height, witnesses: client.witnesses.length };
+      fate.head = Math.max(fate.head ?? 0, r.head);
+    } catch (e) {
+      fate.proofError = clean(String((e as Error)?.message ?? e), 200);
+    }
+  } else {
+    try {
+      fate.accountNonce = safeInt((await client.account(mine.account)).nonce);
+    } catch {
+      /* unknown */
+    }
+  }
+  if (fate.accountNonce !== undefined && fate.accountNonce > mine.nonce) {
+    // The first read (that didn't find it in a block) predates the nonce read: the block it ran in
+    // may have executed in between. Only a read after the nonce read can say it's in none of the
+    // blocks this node holds.
+    try {
+      const t = await client.tx(id);
+      if (t.status === "finalized" || (t.status === "failed" && !txDropped(t))) {
+        fate.recheck = { ran: t };
+        return fate;
+      }
+      if (t.status === "failed") fate.recheck = "absent";
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) fate.recheck = "absent";
+    }
+    for (const other of SIGNED.sameSlot(mine, id).slice(-3)) {
+      const t = await client.tx(other).catch(() => null);
+      if (t && (t.status === "finalized" || (t.status === "failed" && !txDropped(t)))) {
+        fate.sibling = { id: other, status: String(t.status), ...(safeInt(t.height) !== undefined ? { block: safeInt(t.height) } : {}) };
+        break;
+      }
+    }
+  }
+  return fate;
+}
+
+/**
+ * tx_status's answer for a tx this MCP signed that the node doesn't show in a block: `how` says
+ * whether the node doesn't know it at all (`unknown`: pruned, never held, or never reached it) or
+ * remembers dropping it unrun (`dropped`). Says it's in flight only while the head is at or below
+ * its valid_until and its nonce is unused; never "isn't confirmed" for a nonce that executed.
+ */
+function afterTheFact(how: "unknown" | "dropped", tx_id: string, mine: SignedTx, fate: SlotFate): Record<string, unknown> {
+  const vu = mine.valid_until;
+  const facts = {
+    tx_id,
+    account: mine.account,
+    nonce: mine.nonce,
+    valid_until: vu,
+    ...(fate.head !== undefined ? { node_height: fate.head } : {}),
+    ...(fate.accountNonce !== undefined ? { account_nonce: fate.accountNonce } : {}),
+    ...(fate.proven ? { account_nonce_proven_at: fate.proven.height, proven_by_witnesses: fate.proven.witnesses } : {}),
+    ...(fate.proofError ? { proof_error: fate.proofError } : {}),
+    ...(fate.historyFrom !== undefined ? { history_from: fate.historyFrom } : {}),
+  };
+  const seen = how === "dropped" ? "This node dropped it from its mempool without running it" : `${RPC} doesn't know this tx`;
+  const proof = fate.proven ? ` (proven at block ${fate.proven.height}: its state root confirmed by ${fate.proven.witnesses} other node${fate.proven.witnesses === 1 ? "" : "s"})` : "";
+  // The block the nonce was read at: the proof's, else (unproven) the node's head, read just before.
+  const nonceAt = fate.proven ? fate.proven.height : fate.head;
+  if (fate.accountNonce !== undefined && fate.accountNonce > mine.nonce) {
+    // Its nonce was used: by this tx (through another node, or in a block this node no longer
+    // holds) or by another one. Either way it's final: it can never execute again.
+    let which: string;
+    // With witnesses only the nonce is proven: which tx used it (a sibling's status, a 404 and
+    // history_from) is still this node's word (audit review-r4-wallet-4).
+    const nodeWord = fate.proven ? " Only the nonce is proven: which tx used it is this node's word." : "";
+    if (fate.sibling) {
+      which = `This MCP signed another tx with the same nonce, ${fate.sibling.id}, which this node shows ${fate.sibling.status === "finalized" ? "finalized" : "failed (its fee was charged)"}${fate.sibling.block !== undefined ? ` in block ${fate.sibling.block}` : ""}: that one used the nonce, so this one never ran and nothing was charged for it. Check that tx (tx_status ${fate.sibling.id}), not this one.${nodeWord}`;
+    } else {
+      const earliest = fate.maxValidity !== undefined ? Math.max(1, vu - fate.maxValidity) : 1;
+      const holdsAll = fate.historyFrom !== undefined && fate.historyFrom <= earliest;
+      // "In none of them" needs a read after the nonce read that still didn't find it in a block.
+      const lacks = !holdsAll || fate.recheck !== "absent";
+      which = lacks
+        ? `It may have been this one${how === "dropped" ? ", included by another node after this one dropped it" : holdsAll ? ": asked again after its nonce was read, this node gave no clear answer" : `: this node ${fate.historyFrom !== undefined ? `only holds blocks from #${fate.historyFrom} on` : "may not hold the block it ran in"}, so it may have pruned or never held it`}. Look it up on an archive node (or in ${mine.account}'s history) to see whether this one ran and whether it succeeded.`
+        : `This node says it holds every block it could have run in (from #${fate.historyFrom}) and ${how === "dropped" ? "shows it in none of them" : "has no record of it"}, so most likely another tx used that nonce and this one never ran; confirm on another node (or in ${mine.account}'s history).${nodeWord}`;
+    }
+    return {
+      status: "nonce_used",
+      ...facts,
+      next: `${seen}, but ${mine.account}'s nonce ${mine.nonce} has been used (the account has run ${fate.accountNonce} txs${proof}), so this tx can never execute again: it already ran, or another tx with the same nonce took its place. ${which} Do NOT send it again until you know whether it was this one: if it was, the payment already went through. Tell the user exactly that, not that it isn't confirmed.`,
+    };
+  }
+  if (nonceAt !== undefined && nonceAt > vu && fate.accountNonce !== undefined) {
+    return {
+      status: "expired",
+      ...facts,
+      next: fate.proven
+        ? `${seen}, and at block ${nonceAt}, past its valid_until (${vu}), ${mine.account}'s nonce ${mine.nonce} was still unused${proof}: it never ran, can never execute, and nothing was charged for it. It stays counted toward today's limit.`
+        : `${seen}, and says the chain is at block ${nonceAt}, past its valid_until (${vu}), with ${mine.account}'s nonce ${mine.nonce} still unused: if that's right, it can never execute and nothing was charged. It stays counted toward today's limit; check the height and the account's nonce with another node (or configure BLOCKULA_WITNESSES) before signing it again.`,
+    };
+  }
+  if (fate.head !== undefined && fate.head <= vu && (fate.accountNonce !== undefined || (how === "dropped" && !fate.proofError))) {
+    const inFlight = how === "dropped" ? "This node dropped it from its mempool without running it, so nothing was charged, but another node" : `${RPC} doesn't know this tx, but this MCP signed it, and a node that holds it`;
+    return {
+      status: how,
+      ...(how === "dropped" ? { dropped: true } : {}),
+      ...facts,
+      next: `${inFlight} may still include it until block ${vu} (the chain is at block ${fate.head}). It still counts toward the daily limit. Do NOT send it again before then: check tx_status again, and tell the user it isn't confirmed yet.`,
+    };
+  }
+  // The node (or the witnesses) didn't say enough: the height, or the account's nonce once past valid_until.
+  const missing =
+    fate.head === undefined
+      ? "the chain's height"
+      : fate.proofError
+        ? `a proven nonce for ${mine.account} (${fate.proofError})`
+        : fate.accountNonce !== undefined
+          ? `${mine.account}'s nonce as of a block past its valid_until (the proof is from block ${nonceAt}, the chain at block ${fate.head})`
+          : `whether ${mine.account}'s nonce ${mine.nonce} was used`;
+  return {
+    status: how,
+    ...(how === "dropped" ? { dropped: true } : {}),
+    ...facts,
+    next: `${seen}, and this MCP couldn't read ${missing}, so it may still be in flight (until block ${vu}) or have run already. Do NOT send it again: check tx_status again (or ask another node), and tell the user it isn't known yet whether it went through.`,
+  };
+}
+
+/** A tx the node shows in a block: finalized, or failed (it ran, so its fee was charged). Final either way. */
+function inBlock(tx: any, link: string): Record<string, unknown> {
+  const status = String(tx.status);
+  const summary = clean(String(tx.summary ?? ""));
+  const error = tx.error ? { error: clean(String(tx.error)) } : {};
+  if (status === "finalized") return { status, summary, ...error, block: tx.height, fee: tx.fee_display, explorer: link };
+  return { status, summary, ...error, block: tx.height, fee: tx.fee_display, next: `It ran${typeof tx.height === "number" ? ` in block ${tx.height}` : ""} and failed, so its fee was charged and nothing else happened. That's final.`, explorer: link };
+}
+
 /**
  * A tx's status as the node reports it, read the way submitCapped reads it (audit
  * review-fix-clients-2): "finalized" and "failed" (it ran in a block; its fee was charged) are
  * final; "dropped" (this node dropped it from its mempool unrun: nothing charged) and "pending"
  * aren't, since another node may still include it until its valid_until. For a tx this MCP
- * signed, valid_until is what it signed (signed.ts), not the node's word.
+ * signed, valid_until, account and nonce are what it signed (signed.ts), not the node's word, and
+ * one the node can't show is read against the head and the account's nonce (afterTheFact).
  */
-tool("tx_status", "Check a transaction by id: finalized (with its block), failed in a block (its fee was charged), pending, or dropped from this node's mempool without running (nothing charged, but another node may still include it until valid_until, so it must not be sent again before then), with its plain-English summary.", { tx_id: z.string().regex(/^[0-9a-f]{64}$/) }, async ({ tx_id }) => {
+tool("tx_status", "Check a transaction by id: finalized (with its block), failed in a block (its fee was charged), pending, or dropped from this node's mempool without running (nothing charged, but another node may still include it until valid_until, so it must not be sent again before then), with its plain-English summary. For a tx this MCP signed that the node can't show: nonce_used (its nonce ran: it can never execute again, and may already have gone through), expired (past valid_until, nonce unused: it never ran), unknown/dropped (still in flight), or other_chain (signed for another network: ask that one).", { tx_id: z.string().regex(/^[0-9a-f]{64}$/) }, async ({ tx_id }) => {
   const client = await chain();
-  const mine = SIGNED.get(tx_id);
+  // A record from another network (BLOCKULA_HOME is shared by all of them) says nothing about this
+  // one: its account's nonce and this chain's head are another chain's (audit review-r4-wallet-3).
+  const record = SIGNED.get(tx_id);
+  const mine = record && onChain(record, pinnedChain) && isAddress(record.account, pinnedChain.prefix) ? record : undefined;
   const link = explorer(`tx/${tx_id}`);
   const until = (v: number | undefined) => (v === undefined ? "its valid_until (unknown here: this MCP didn't sign it)" : `block ${v}`);
   let tx: any;
   try {
     tx = await client.tx(tx_id);
   } catch (e) {
-    // This node doesn't know it. One this MCP signed may still be in another node's mempool.
+    // This node doesn't know it: pruned or never held (it ran long ago), or never reached it.
     if (e instanceof ApiError && e.status === 404 && mine) {
-      return { status: "unknown", tx_id, valid_until: mine.valid_until, next: `${RPC} doesn't know this tx, but this MCP signed it, and a node that holds it may still include it until block ${mine.valid_until}. It still counts toward the daily limit. Do NOT send it again before then: check tx_status again, and tell the user it isn't confirmed yet.`, explorer: link };
+      const fate = await slotFate(client, tx_id, mine);
+      // It ran in a block that executed after the first read: answered as what it is.
+      if (fate.recheck && fate.recheck !== "absent") return inBlock(fate.recheck.ran, link);
+      return { ...afterTheFact("unknown", tx_id, mine, fate), explorer: link };
+    }
+    if (e instanceof ApiError && e.status === 404 && record) {
+      const signedFor = record.chain_id !== undefined ? `chain ${record.chain_id} (genesis ${record.genesis_hash})` : "a chain it didn't record (it was signed before this MCP kept that)";
+      return {
+        status: "other_chain",
+        tx_id,
+        account: record.account,
+        nonce: record.nonce,
+        valid_until: record.valid_until,
+        ...(record.chain_id !== undefined ? { signed_for_chain_id: record.chain_id, signed_for_genesis_hash: record.genesis_hash } : {}),
+        next: `This MCP signed it for ${signedFor}, not the network it's on now (${pinnedChain.chainId ?? "unknown"} at ${RPC}), which can't say whether it ran. Do NOT send it again, and don't tell the user it failed or never ran: ask a node of the network it was signed for (run the MCP on that network and call tx_status again).`,
+        explorer: link,
+      };
     }
     throw e;
   }
@@ -377,18 +647,23 @@ tool("tx_status", "Check a transaction by id: finalized (with its block), failed
   const error = tx.error ? { error: clean(String(tx.error)) } : {};
   const nodeUntil = Number.isSafeInteger(tx.valid_until) ? (tx.valid_until as number) : undefined;
   const validUntil = mine?.valid_until ?? nodeUntil;
-  if (status === "finalized") return { status, summary, ...error, block: tx.height, fee: tx.fee_display, explorer: link };
-  if (status === "failed" && !txDropped(tx)) {
-    return { status, summary, ...error, block: tx.height, fee: tx.fee_display, next: `It ran${typeof tx.height === "number" ? ` in block ${tx.height}` : ""} and failed, so its fee was charged and nothing else happened. That's final.`, explorer: link };
-  }
+  if (status === "finalized" || (status === "failed" && !txDropped(tx))) return inBlock(tx, link);
   if (status === "failed") {
     // Dropped unrun: the height in the answer is where this node dropped it, not a block it ran in.
-    const head = await client.status().then((st) => (Number.isSafeInteger(st.height) ? (st.height as number) : undefined)).catch(() => undefined);
+    const at = typeof tx.height === "number" ? { dropped_at_height: tx.height } : {};
+    if (mine) {
+      const fate = await slotFate(client, tx_id, mine);
+      // Another node included it after this one dropped it, and this node has run that block since.
+      if (fate.recheck && fate.recheck !== "absent") return inBlock(fate.recheck.ran, link);
+      const r = afterTheFact("dropped", tx_id, mine, fate);
+      return { ...r, ...(r.status === "dropped" ? { dropped: true } : {}), summary, ...error, ...at, explorer: link };
+    }
+    const head = await client.status().then((st) => safeInt(st.height)).catch(() => undefined);
     const past = validUntil !== undefined && head !== undefined && head > validUntil;
     const next = past
       ? `This node dropped it without running it, and says the chain is at block ${head}, past its valid_until (${validUntil}): if that height is right, it can never execute and nothing was charged. It stays counted toward today's limit; check the height with another node before signing it again.`
       : `This node dropped it from its mempool without running it, so nothing was charged, but another node may still include it until ${until(validUntil)}. It still counts toward the daily limit. Do NOT send it again before then: check tx_status again, and tell the user it isn't confirmed yet.`;
-    return { status: "dropped", dropped: true, summary, ...error, ...(typeof tx.height === "number" ? { dropped_at_height: tx.height } : {}), valid_until: validUntil ?? "unknown", ...(head !== undefined ? { node_height: head } : {}), next, explorer: link };
+    return { status: "dropped", dropped: true, summary, ...error, ...at, valid_until: validUntil ?? "unknown", ...(head !== undefined ? { node_height: head } : {}), next, explorer: link };
   }
   return {
     status: clean(status),
@@ -413,7 +688,8 @@ tool("start_dev_node", "Start a local Blockula dev chain (faucet + built-in expl
   mkdirSync(HOME, { recursive: true });
   const log = openSync(join(HOME, "dev-node.log"), "a");
   let missing = false;
-  const child = spawn(BIN, ["dev", "--port", port, ...(reset ? ["--reset"] : [])], { detached: true, stdio: ["ignore", log, log] });
+  const bin = nodeBinary();
+  const child = spawn(bin.path, ["dev", "--port", port, ...(reset ? ["--reset"] : [])], { detached: true, stdio: ["ignore", log, log] });
   child.on("error", (e: NodeJS.ErrnoException) => {
     missing = e.code === "ENOENT";
   });
@@ -423,23 +699,25 @@ tool("start_dev_node", "Start a local Blockula dev chain (faucet + built-in expl
     if (await reachable(target)) {
       // A reset dev chain has a new genesis: re-pin on the next call.
       if (net.key === "local") pinned = null;
-      return `🧛 Dev chain is up. Explorer: ${target} · logs: ${join(HOME, "dev-node.log")}. ${using}`;
+      return `🧛 Dev chain is up. Explorer: ${target} · logs: ${join(HOME, "dev-node.log")}. ${ranWith(bin)} ${using}`;
     }
   }
   if (missing) {
-    throw new Error(`The \`${BIN}\` node binary isn't installed, so a local chain can't start. Call install_node to download the prebuilt node (checksum-verified, plus provenance or signature checks where available), then start_dev_node again.`);
+    throw new Error(`The \`${bin.path}\` node binary isn't installed, so a local chain can't start. Call install_node to download the prebuilt node (checksum-verified, plus provenance or signature checks where available), then start_dev_node again.`);
   }
   throw new Error(`node didn't start. See ${join(HOME, "dev-node.log")}`);
 });
 
 tool(
   "install_node",
-  "Download the prebuilt `blockula` node + CLI for this machine from the official GitHub release and install it to ~/.blockula/bin, after the same checks as scripts/install.sh: the release must be the version asked for (`latest` is resolved to its tag first), SHA-256 against the release checksums, build provenance from that tag with a logged-in GitHub CLI, and the offline ML-DSA-65 release signature. Once the release key id is known, a release without a valid signature is refused. It says which checks passed; with BLOCKULA_REQUIRE_VERIFY=1 it also requires provenance and refuses a release it can only checksum. Needed for start_dev_node and summon_chain; nothing else needs it.",
+  "Download the prebuilt `blockula` node + CLI for this machine from the official GitHub release and install it to ~/.blockula/mcp-bin (never over the binary `blockula release install` keeps in ~/.blockula/bin), after the same checks as scripts/install.sh: the release must be the version asked for (`latest` is resolved to its tag first), SHA-256 against the release checksums, build provenance from that tag with a logged-in GitHub CLI, and the offline ML-DSA-65 release signature. Once the release key id is known (pinned in ~/.blockula/release-key-id by `blockula release install`, built in, or BLOCKULA_RELEASE_KEY_ID, which must all agree), a release without a valid signature is refused. It says which checks passed; with BLOCKULA_REQUIRE_VERIFY=1 it also requires provenance and refuses a release it can only checksum. Needed for start_dev_node and summon_chain; nothing else needs it.",
   { version: z.string().regex(/^(latest|v\d+\.\d+\.\d+)$/).default("latest") },
   async ({ version }) => {
     const target = releaseTarget();
     if (!target) throw new Error(`No prebuilt node for ${process.platform}/${process.arch}. Build from source: https://github.com/${REPO}`);
-    const releaseKeyId = releaseKeyIdFrom(process.env.BLOCKULA_RELEASE_KEY_ID, RELEASE_KEY_ID);
+    // The operator's pin (written by `blockula release install`) binds this MCP too.
+    const pinFile = join(HOME, PIN_FILE);
+    const releaseKeyId = releaseKeyIdFrom(process.env.BLOCKULA_RELEASE_KEY_ID, RELEASE_KEY_ID, readReleasePin(pinFile), pinFile);
     // Every check is bound to one tag: GitHub redirects /releases/latest to /releases/tag/<tag>.
     const tag = version === "latest" ? latestTagFrom((await fetch(`https://github.com/${REPO}/releases/latest`, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(60_000) })).url) : version;
     const base = `https://github.com/${REPO}/releases/download/${tag}`;
@@ -472,12 +750,20 @@ tool(
         // checkBinaryVersion reports it as unrunnable.
       }
       checkBinaryVersion(printed, tag);
-      mkdirSync(join(HOME, "bin"), { recursive: true });
-      copyFileSync(extracted, INSTALLED_BIN);
-      chmodSync(INSTALLED_BIN, 0o755);
-      BIN = INSTALLED_BIN;
+      // Atomically: a temporary file beside it, then a rename.
+      mkdirSync(dirname(INSTALLED_BIN), { recursive: true });
+      const staged = `${INSTALLED_BIN}.new-${process.pid}`;
+      try {
+        copyFileSync(extracted, staged);
+        chmodSync(staged, 0o755);
+        renameSync(staged, INSTALLED_BIN);
+      } finally {
+        rmSync(staged, { force: true });
+      }
       const installed = execFileSync(INSTALLED_BIN, ["--version"], { encoding: "utf8" }).trim();
-      return { installed, path: INSTALLED_BIN, sha256: rel.sha256, verified: rel.verified.length ? rel.verified : ["checksum only"], ...(rel.warning ? { warning: rel.warning } : {}), next: "start_dev_node runs a local chain; summon_chain creates your own network" };
+      const runs = nodeBinary();
+      const which = runs.path === INSTALLED_BIN ? "they run this one" : `they run ${runs.path}${runs.version ? ` (${runs.version})` : ""}, ${process.env.BLOCKULA_BIN ? "BLOCKULA_BIN" : "the binary of this MCP's version or `blockula release install`'s"}, not this one`;
+      return { installed, path: INSTALLED_BIN, sha256: rel.sha256, verified: rel.verified.length ? rel.verified : ["checksum only"], ...(rel.warning ? { warning: rel.warning } : {}), next: `start_dev_node runs a local chain; summon_chain creates your own network (${which})` };
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
@@ -485,8 +771,9 @@ tool(
 );
 
 tool("summon_chain", "Create a brand-new Blockula chain (fresh genesis + validator key) that you can run as your own network.", { chain_id: z.string().regex(/^[a-z0-9-]{3,40}$/), faucet: z.boolean().default(true) }, async ({ chain_id, faucet }) => {
-  const out = execFileSync(BIN, ["summon", chain_id, ...(faucet ? [] : ["--no-faucet"])], { encoding: "utf8" });
-  return out.trim();
+  const bin = nodeBinary();
+  const out = execFileSync(bin.path, ["summon", chain_id, ...(faucet ? [] : ["--no-faucet"])], { encoding: "utf8" });
+  return `${out.trim()}\n${ranWith(bin)}`;
 });
 
 tool("create_wallet", "Create this agent's post-quantum (ML-DSA-65) wallet, stored locally. Returns the existing one if it already exists.", {}, async () => {
@@ -535,7 +822,8 @@ tool("use_account", "Act for a user's account (name or address) that has authori
         address: addr,
         ...(res.name === null ? {} : { name_resolution: res.proven ? clean(res.how, 300) : `UNPROVEN: ${clean(res.how, 300)}` }),
         key_id: w.keyId,
-        grant_code: encodeKeyGrant(await w.keyGrant(addr)),
+        // The resolution itself, so the SDK refuses it too if it's unproven on mainnet.
+        grant_code: encodeKeyGrant(await w.keyGrant(res)),
         next: `Nothing was signed on-chain. Give the user the grant_code (this agent key's consent to joining ${addr} only; it holds no secret and can't spend anything). They paste it in the Blockula web wallet → Devices & agents → 'Give an agent a budget' and choose a limit and an expiry. Then call use_account again.`,
       };
     }
@@ -585,7 +873,9 @@ tool("send", "Send FANG to a .boo name or address. Amounts are in FANG, e.g. \"1
   const w = await requireWallet();
   await w.client.addressPrefix();
   // With witnesses a name's proven owner is signed; without, the name itself, which the chain
-  // resolves when the tx runs: a lying node can make it fail, not pay someone else (audit gap-7-1).
+  // resolves when the tx runs: a lying node can't point it at another account now, though one
+  // holding the signed tx could release it later in its validity window (audit gap-7-1,
+  // review-r3-clients-2).
   const rc = await w.client.recipient(to);
   const opening = await openingFee(w.client, rc.address);
   const r = await submitCapped(w, { type: "transfer", to: rc.signed, amount: drops.toString() }, { amount: drops, extra: opening }, memo ?? "");
@@ -635,7 +925,7 @@ tool("stake", "Stake (delegate) FANG from the account this agent acts for in a v
   const w = await requireWallet();
   const { res, confirm } = await resolved(w.client, validator, "validator");
   if (confirm) return confirm;
-  const r = await submitCapped(w, { type: "delegate", validator: res.address, amount: drops.toString() }, { amount: drops });
+  const r = await submitCapped(w, { type: "delegate", validator: res.address, amount: drops.toString() }, { amount: drops, resolutions: [res] });
   return isInFlight(r) ? { ...r, ...resolvedView(res, "validator") } : txResult(r, { ...resolvedView(res, "validator"), next: "my_stake shows the stake and its value" });
 });
 
@@ -659,7 +949,7 @@ tool("unstake", "Start unbonding stake from a validator's pool: an amount in FAN
   const view = drops === null
     ? { ...resolvedView(res, "validator"), unbonding: `all ${d.shares} shares (the node reports they're worth ${formatFang(BigInt(d.value))})` }
     : { ...resolvedView(res, "validator"), unbonding: `${formatFang(drops)} (at least: the chain sells the shares that much buys at the pool's price when the tx runs)` };
-  const r = await submitCapped(w, action, { amount: 0n });
+  const r = await submitCapped(w, action, { amount: 0n, resolutions: [res] });
   return isInFlight(r) ? { ...r, ...view } : txResult(r, view);
 });
 
@@ -771,7 +1061,7 @@ tool("fund_hunt", `Add FANG to an open Hunt's bounty (crowdfunding). Refunded to
   return isInFlight(r) ? r : { summary: clean(String(r.summary ?? "")), fee: r.fee_display, tx_id: r.id, explorer: explorer(`hunt/${hunt_id}`) };
 });
 
-tool("contribution_pool", `Blockula's contribution pool (Proof of Contribution): its balance, which GitHub repos earn from it, the rules, and the Séance (review jury) that's open now. Merged PRs to pool repos can be claimed for a share; payouts are judged by human juries, count a sponsor's claims best first (each next a quarter of the one before), and vest over ~90 days. ${NO_VALUE}`, {}, async () => {
+tool("contribution_pool", `Blockula's contribution pool (Proof of Contribution): its balance, which GitHub repos earn from it, the rules, and the Séance (review jury) that's open now. Merged PRs to pool repos can be claimed for a share; payouts are judged by human juries, rate a sponsor's claims in a Séance together (one pooled win rate; each next a quarter of the one before), and vest over ~90 days. ${NO_VALUE}`, {}, async () => {
   const c = await (await chain()).contributions();
   return {
     pool: chainData(c.pool?.balance_display),

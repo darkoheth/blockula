@@ -7,20 +7,22 @@
 # The genesis is built with the genesis builder (`blockula genesis operator` + `genesis build`,
 # docs/GENESIS_CEREMONY.md) from a spec this script writes once: the DEC-5 allocation with `tboo`
 # addresses, one operator per validator with its own owner account (which holds the self-bond and
-# pays the validator's system fees), no admin keys, and a faucet funded on the validators'
-# consensus-key accounts. Keys are generated once on this laptop under
-# ~/.config/blockula/$CHAIN_ID (mode 700): consensus keys are uploaded only to their validator,
-# seeded onto its volume on first boot, then deleted from Fly; owner, founder and foundation keys
-# never leave this machine. (A public testnet is still one operator's machines; independent
-# operators come with the incentivized testnet, OPS-1.)
+# pays the validator's system fees), no admin keys, a faucet funded on the validators'
+# consensus-key accounts, and the contribution pool open from genesis (its repos, an opening
+# balance out of the endowment, founding jurors' Soul). Keys are generated once on this laptop
+# under ~/.config/blockula/$CHAIN_ID (mode 700): consensus keys are uploaded only to their
+# validator, seeded onto its volume on first boot, then deleted from Fly; owner, founder,
+# foundation and stand-in juror keys never leave this machine. (A public testnet is still one
+# operator's machines; independent operators come with the incentivized testnet, OPS-1.)
 #
 #   deploy/launch.sh                  launch, or upgrade the nodes of, $CHAIN_ID
 #   GENESIS_ONLY=1 deploy/launch.sh   rehearsal: only build keys, operator files, spec and genesis
 #                                     under ~/.config/blockula/$CHAIN_ID-rehearsal (placeholder IPs
-#                                     unless IPS="ip ip …"); no Fly calls
+#                                     unless IPS="ip ip …", or P2P_ADDRS="host:port …"); no Fly calls
 #   RESET=1 deploy/launch.sh          wipe the apps' machines, volumes and secrets (another chain's
 #                                     data) before launching $CHAIN_ID. Refused once $CHAIN_ID has
-#                                     launched: a chain id is never reused, pick a new one
+#                                     launched (its validators were deployed, even if the launch
+#                                     then failed): a chain id is never reused, pick a new one
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -33,44 +35,73 @@ ADDRESS_PREFIX=${ADDRESS_PREFIX:-tboo}
 REGIONS=(${REGIONS:-iad sjc fra ams})   # one validator per region
 RPC_REGION=${RPC_REGION:-iad}
 EPOCH_BLOCKS=${EPOCH_BLOCKS:-3600}      # 1-hour epochs at 1 s blocks (DEC-12)
+DAY=86400                               # blocks a day at 1 s blocks
 FAUCET_FANG=${FAUCET_FANG:-2500000}     # per validator's consensus-key account (drips + fees)
 SELF_BOND=${SELF_BOND:-10000}           # FANG each owner bonds (the default min_self_bond)
+# Unbonding, and the evidence window with it: a week (mainnet: 21 days), so the weak-subjectivity
+# period (half the evidence window) is 3.5 days, not hours, and unbonding is still a week's
+# exercise. Below governance's 14-day floor on the evidence window, which a vote then can't lower
+# further but can raise (params.rs `governance_band`; mainnet's genesis must start inside it).
+UNBONDING_BLOCKS=${UNBONDING_BLOCKS:-$((7 * DAY))}
+# The contribution pool, open from genesis.
+POOL_FANG=${POOL_FANG:-100000}          # its opening balance, out of the endowment
+POOL_REPOS=${POOL_REPOS:-"jackdishman/blockula:10"}   # owner/name:weight …
+JURORS=${JURORS:-3}                     # stand-in founding jurors made on this laptop …
+JUROR_SOUL=${JUROR_SOUL:-25}            # … with this much Soul each (5 sits on a jury, 10 vouches)
+# JURORS_FILE: the founding jurors instead of stand-ins, one per line: `tboo1… <soul> <reason>`.
 VALIDATOR_VM=${VALIDATOR_VM:-shared-cpu-2x}
 VALIDATOR_MEMORY=${VALIDATOR_MEMORY:-2048mb}
 RPC_VM=${RPC_VM:-shared-cpu-1x}
 RPC_MEMORY=${RPC_MEMORY:-1024mb}
 VOLUME_GB=${VOLUME_GB:-10}
+RPC_VOLUME_GB=${RPC_VOLUME_GB:-$VOLUME_GB}
+# Block windows: validators keep the node's default (~2 days) unless VALIDATOR_PRUNE_BLOCKS is
+# set; the public node keeps 14 days (~1.2 GB idle with 4 validators, ~10 GB at a sustained
+# 0.4 tx/s: docs/OPERATIONS.md "Disk sizing"), or everything with RPC_ARCHIVE=1 (size
+# RPC_VOLUME_GB for it).
+VALIDATOR_PRUNE_BLOCKS=${VALIDATOR_PRUNE_BLOCKS:-}
+RPC_PRUNE_BLOCKS=${RPC_PRUNE_BLOCKS:-$((14 * DAY))}
+RPC_ARCHIVE=${RPC_ARCHIVE:-}
 P2P_PORT=30300
 HTTP_PORT=7070
+RPC_PORT=7171
 CONF=$HOME/.config/blockula
-# A rehearsal (GENESIS_ONLY, placeholder IPs) never shares a directory with the real launch.
+# A rehearsal (GENESIS_ONLY, placeholder IPs) never shares a directory with the real launch
+# (REHEARSAL_DIR picks another one for it).
 NET=$CONF/$CHAIN_ID${GENESIS_ONLY:+-rehearsal}
+if [ -n "${GENESIS_ONLY:-}" ] && [ -n "${REHEARSAL_DIR:-}" ]; then NET=$REHEARSAL_DIR; fi
 N=${#REGIONS[@]}
-RPC_URL=https://$RPC_APP.fly.dev
+RPC_URL=${RPC_URL:-https://$RPC_APP.fly.dev}
 APPS=("$RPC_APP"); for i in $(seq 0 $((N - 1))); do APPS+=("$PREFIX-v$i"); done
+source deploy/fly-config.sh
 
 fly_ok() { [ -z "${GENESIS_ONLY:-}" ]; }
+if ! fly_ok && [ -n "${RESET:-}" ]; then echo "❌ RESET=1 with GENESIS_ONLY=1: a rehearsal makes no Fly calls, so it never resets anything" >&2; exit 1; fi
 if fly_ok; then fly auth whoami >/dev/null || { echo "Run: fly auth login" >&2; exit 1; }; fi
 mkdir -p "$CONF" && chmod 700 "$CONF"
-cargo build --release --locked --manifest-path node/Cargo.toml -q
-BIN=node/target/release/blockula
+[ -n "${SKIP_BUILD:-}" ] || cargo build --release --locked --manifest-path node/Cargo.toml -q
+BIN=${BIN:-node/target/release/blockula}
+# Seconds between the liveness checks of a rolling restart (60 of them), for tests.
+PROGRESS_SECS=${PROGRESS_SECS:-5}
 
 if [ "${RESET:-}" = 1 ]; then
-  [ ! -f "$NET/launched" ] || { echo "❌ $CHAIN_ID has launched already: a chain id is never reused. Set CHAIN_ID to a new one (and RESET=1 to clear the apps)." >&2; exit 1; }
+  [ ! -f "$NET/launched" ] || { echo "❌ $CHAIN_ID has launched already (its validators were deployed and may have signed blocks): a chain id is never reused. Rerun without RESET to finish this launch, or set CHAIN_ID to a new one (and RESET=1 to clear the apps)." >&2; exit 1; }
   echo "♻️  RESET: destroying the apps' machines, volumes and secrets before launching $CHAIN_ID"
   for app in "${APPS[@]}"; do
     fly machines list -a "$app" --json 2>/dev/null | jq -r '.[].id' | while read -r m; do fly machine destroy "$m" -a "$app" --force >/dev/null; done
     fly volumes list -a "$app" --json 2>/dev/null | jq -r '.[].id' | while read -r v; do fly volumes destroy "$v" -a "$app" --yes >/dev/null; done
     fly secrets list -a "$app" --json 2>/dev/null | jq -r '.[].name // .[].Name' | while read -r s; do fly secrets unset "$s" -a "$app" --stage >/dev/null; done
   done
+  # Those secrets included any this chain staged on an earlier, failed attempt: stage them again.
+  rm -f "$NET/secrets-staged"
 fi
 
 ensure_app() { fly apps list --org "$ORG" --json | jq -e --arg a "$1" '.[] | select(.Name == $a)' >/dev/null || fly apps create "$1" --org "$ORG" >/dev/null; }
-ensure_volume() { # app region [validator]
+ensure_volume() { # app region size [validator]
   local snapshots=true
-  [ "${3:-}" = validator ] && snapshots=false
+  [ "${4:-}" = validator ] && snapshots=false
   if [ "$(fly volumes list -a "$1" --json | jq length)" -eq 0 ]; then
-    fly volumes create data -a "$1" -r "$2" -s "$VOLUME_GB" --scheduled-snapshots="$snapshots" --yes >/dev/null
+    fly volumes create data -a "$1" -r "$2" -s "$3" --scheduled-snapshots="$snapshots" --yes >/dev/null
   elif [ "$snapshots" = false ]; then
     # Volumes from before this script turned snapshots off: never keep restorable validator state.
     fly volumes list -a "$1" --json | jq -r '.[].id' | while read -r v; do fly volumes update "$v" -a "$1" --scheduled-snapshots=false >/dev/null; done
@@ -83,6 +114,18 @@ dedicated_v4() {
   echo "$ip"
 }
 has_secret() { fly secrets list -a "$1" --json | jq -e --arg s "$2" 'map(.name // .Name) | index($s)' >/dev/null; }
+height() { curl -fsS -m 5 "$RPC_URL/api/status" 2>/dev/null | jq -r '.height // 0' 2>/dev/null || echo 0; }
+# Require the restarted validator itself to have finalized new blocks, not just the public node:
+# three of four can keep finalizing while the fourth stays down. The image has blockula but no
+# curl; its checkpoint command can check a specific finalized height through loopback HTTP.
+progressed() { # app, height before restart
+  local app=$1 target=$(($2 + 6))
+  for _ in $(seq 60); do
+    if [ "$(height)" -ge "$target" ] && fly ssh console -a "$app" -C "blockula checkpoint --peer http://127.0.0.1:$HTTP_PORT --height $target --genesis-hash $GENESIS_HASH" >/dev/null 2>&1; then return 0; fi
+    sleep "$PROGRESS_SECS"
+  done
+  return 1
+}
 # Country of a Fly region, for the operator files' independence fields (DEC-14 display only).
 country_of() {
   case "$1" in
@@ -91,20 +134,26 @@ country_of() {
     sin) echo SG ;; nrt) echo JP ;; syd) echo AU ;; bom) echo IN ;; jnb) echo ZA ;; hkg) echo HK ;; *) echo "" ;;
   esac
 }
+toml_str() { local s=${1//\\/\\\\}; printf '"%s"' "${s//\"/\\\"}"; }
 
-IPS_ARR=()
+P2P=()
 if fly_ok; then
   echo "🪦 Apps, volumes and IPs…"
-  ensure_app "$RPC_APP"; ensure_volume "$RPC_APP" "$RPC_REGION"
+  ensure_app "$RPC_APP"; ensure_volume "$RPC_APP" "$RPC_REGION" "$RPC_VOLUME_GB"
   for i in $(seq 0 $((N - 1))); do
     app=$PREFIX-v$i
-    ensure_app "$app"; ensure_volume "$app" "${REGIONS[$i]}" validator
-    IPS_ARR+=("$(dedicated_v4 "$app")")
-    echo "   $app  ${REGIONS[$i]}  ${IPS_ARR[$i]}"
+    ensure_app "$app"; ensure_volume "$app" "${REGIONS[$i]}" "$VOLUME_GB" validator
+    ip=$(dedicated_v4 "$app")
+    P2P+=("$ip:$P2P_PORT")
+    echo "   $app  ${REGIONS[$i]}  $ip"
   done
+elif [ -n "${P2P_ADDRS:-}" ]; then
+  read -r -a P2P <<< "$P2P_ADDRS"
+  [ "${#P2P[@]}" -eq "$N" ] || { echo "❌ P2P_ADDRS lists ${#P2P[@]} addresses for $N validators" >&2; exit 1; }
 else
   read -r -a IPS_ARR <<< "${IPS:-}"
   for i in $(seq ${#IPS_ARR[@]} $((N - 1))); do IPS_ARR+=("203.0.113.$((i + 1))"); done
+  for i in $(seq 0 $((N - 1))); do P2P+=("${IPS_ARR[$i]}:$P2P_PORT"); done
 fi
 
 if [ ! -f "$NET/genesis.json" ]; then
@@ -118,20 +167,44 @@ if [ ! -f "$NET/genesis.json" ]; then
     CONSENSUS=$(key "$NET/v$i/consensus.json")
     [ -f "$NET/v$i/validator.key" ] || (umask 077; jq -r .seed "$NET/v$i/consensus.json" > "$NET/v$i/validator.key")
     OWNER=$(key "$NET/owner-$i.json")
+    # Each validator publishes the public node as its HTTP endpoint: its sentry, as mainnet
+    # operators publish theirs (`genesis operator --http-addr`); validators' own HTTP stays on
+    # Fly's private network, where the other nodes reach it (PEER_HTTP).
+    # No seat is flagged `--founder-or-foundation`: the four stand in for a mainnet genesis's
+    # independent operators. The founder's and the foundation's stand-in accounts are excluded
+    # from the bootstrap delegation as on mainnet; flagging the seats too would leave the
+    # delegation nobody to back, and DEC-3's cap (fewer such seats than f: none in a set of 4)
+    # would keep a seat that left the set out for good (relaunch problem 2; staking test
+    # `testnet_seats_leave_rejoin_and_get_the_bootstrap_delegation`).
     $BIN genesis operator --chain-id "$CHAIN_ID" --key "$NET/v$i/validator.key" --owner "$OWNER" \
-      --p2p-addr "${IPS_ARR[$i]}:$P2P_PORT" --http-addr "$RPC_URL" --commission-bps 500 --self-bond "$SELF_BOND" \
+      --p2p-addr "${P2P[$i]}" --http-addr "$RPC_URL" --commission-bps 500 --self-bond "$SELF_BOND" \
       --name "Blockula testnet validator $i (${REGIONS[$i]})" --legal-entity "Blockula (testnet)" --entity-jurisdiction US \
       --hosting-provider Fly.io --asn 40509 --datacenter-country "$(country_of "${REGIONS[$i]}")" --datacenter "fly-${REGIONS[$i]}" \
-      --founder-or-foundation --out "$NET/operators/v$i.toml"
+      --out "$NET/operators/v$i.toml"
     ops="$ops  \"operators/v$i.toml\",\n"
     allocs="$allocs[[allocation]]\nbucket = \"operators\"\naddress = \"$OWNER\"\namount = \"1000000\"\nlabel = \"genesis operator: validator $i\"\n\n"
     allocs="$allocs[[allocation]]\nbucket = \"faucet\"\naddress = \"$CONSENSUS\"\namount = \"$FAUCET_FANG\"\nlabel = \"faucet: validator $i\"\n\n"
   done
+  # Founding jurors: Soul in the genesis ledger (docs/TOKENOMICS.md: never the founder's).
+  souls=""
+  if [ -n "${JURORS_FILE:-}" ]; then
+    [ -f "$JURORS_FILE" ] || { echo "❌ JURORS_FILE=$JURORS_FILE isn't a file" >&2; exit 1; }
+    while read -r addr soul reason || [ -n "${addr:-}" ]; do
+      case "$addr" in "" | \#*) continue ;; esac
+      souls="$souls[[soul]]\naccount = \"$addr\"\nsoul = \"$soul\"\nreason = $(toml_str "${reason:-founding juror}")\n\n"
+    done < "$JURORS_FILE"
+  else
+    for i in $(seq 0 $((JURORS - 1))); do
+      souls="$souls[[soul]]\naccount = \"$(key "$NET/juror-$i.json")\"\nsoul = \"$JUROR_SOUL\"\nreason = \"founding juror (testnet stand-in $i)\"\n\n"
+    done
+  fi
+  repos=""
+  for r in $POOL_REPOS; do repos="$repos[[contribution.repo]]\nrepo = \"${r%:*}\"\nweight = ${r##*:}\n\n"; done
   GENESIS_MS=$(($(date +%s) * 1000))
   cat > "$NET/spec.toml" <<SPEC
 # The $CHAIN_ID genesis spec, written by deploy/launch.sh. Rebuild it (byte-identically) with
 #   blockula genesis build --spec spec.toml --out genesis.json
-# Founder, foundation and grant accounts are testnet stand-ins held by the launcher.
+# Founder, foundation, grant and juror accounts are testnet stand-ins held by the launcher.
 chain_id = "$CHAIN_ID"
 address_prefix = "$ADDRESS_PREFIX"
 genesis_time_ms = $GENESIS_MS
@@ -146,15 +219,31 @@ $(printf "%b" "$ops")]
 reserved_names = ["blockula", "boo", "foundation", "treasury", "community", "validator", "admin", "support", "security", "official"]
 features = []
 
-# Mainnet's parameters, except durations short enough to exercise on a testnet: a day of
-# unbonding (and of evidence), day-long votes, an hour's timelock, spends open from genesis.
+# Mainnet's parameters, except durations short enough to exercise on a testnet: a week of
+# unbonding and of evidence (the weak-subjectivity period is half that), day-long votes, an
+# hour's timelock, spends open from genesis.
 [params]
-unbonding_blocks = 86400
-evidence_max_age_epochs = $((86400 / EPOCH_BLOCKS))
-voting_blocks = 86400
+unbonding_blocks = $UNBONDING_BLOCKS
+evidence_max_age_epochs = $((UNBONDING_BLOCKS / EPOCH_BLOCKS))
+voting_blocks = $DAY
 timelock_blocks = 3600
 governance_spend_height = 0
 proposal_deposit = "100000000000"
+$(printf "%b" "${EXTRA_PARAMS:-}")
+
+# Proof of Contribution from genesis: the pool's repos, an opening balance out of the endowment,
+# and days instead of weeks (Séances every 3 days, a 3-day revert window, 30-day vesting).
+[contribution]
+opening_balance = "$POOL_FANG"
+seance_blocks = $((3 * DAY))
+claim_maturity_blocks = $((3 * DAY))
+vesting_blocks = $((30 * DAY))
+vouch_lock_blocks = $((30 * DAY))
+claim_ttl_blocks = $((3 * DAY))
+
+$(printf "%b" "$repos")
+
+$(printf "%b" "$souls")
 
 [[allocation]]
 bucket = "community"
@@ -166,7 +255,7 @@ amount = "250000000"
 
 [[allocation]]
 bucket = "endowment"
-amount = "150000000"
+amount = "$((150000000 - POOL_FANG))"
 
 [[allocation]]
 bucket = "bootstrap"
@@ -193,10 +282,21 @@ label = "security grants (testnet stand-in)"
 SPEC
   # Each operator's allocation (its self-bond comes out of it) and its validator's faucet float.
   printf "%b" "$allocs" >> "$NET/spec.toml"
-  # Warnings are expected: a testnet breaks mainnet's independence policy (DEC-3, DEC-14).
+  # Warnings are expected: a testnet breaks mainnet's independence policy (DEC-3, DEC-14) and
+  # opens the pool early (deploy/README.md lists them).
   $BIN genesis build --spec "$NET/spec.toml" --out "$NET/genesis.json"
   for i in $(seq 0 $((N - 1))); do cp "$NET/genesis.json" "$NET/v$i/genesis.json"; done
-  (umask 077; openssl rand -hex 32 > "$NET/forwarder-secret")
+  [ -f "$NET/forwarder-secret" ] || (umask 077; openssl rand -hex 32 > "$NET/forwarder-secret")
+elif fly_ok && [ ! -f "$NET/launched" ]; then
+  # A genesis an earlier, failed attempt built: its clock started then, and every hour it waits
+  # is a deficit the chain never makes up (blocks are at least a block time apart), counted
+  # against the weak-subjectivity period until a timed checkpoint exists.
+  built=$(jq -r '.created_at_ms' "$NET/genesis.json")
+  hours=$((($(date +%s) * 1000 - built) / 3600000))
+  if [ "$hours" -ge "${GENESIS_MAX_AGE_HOURS:-24}" ]; then
+    echo "❌ $NET/genesis.json was built $hours h ago and never launched. Rebuild it with a fresh clock (the keys stay): rm $NET/genesis.json $NET/spec.toml, then rerun. GENESIS_MAX_AGE_HOURS=$((hours + 1)) launches it as it is." >&2
+    exit 1
+  fi
 fi
 
 # The public node's `join` pins this genesis (CRY-2: joins without a pinned genesis are refused).
@@ -207,7 +307,7 @@ echo "   genesis hash: $GENESIS_HASH"
 # org: `fly wireguard create`). Fly also scrapes every app's /metrics itself ([metrics] below).
 {
   echo "# $CHAIN_ID scrape targets (deploy/monitoring/prometheus/prometheus.yml, job \"blockula\")."
-  echo "- targets: ['$RPC_APP.internal:7171']"
+  echo "- targets: ['$RPC_APP.internal:$RPC_PORT']"
   echo "  labels: { node: '$RPC_APP' }"
   for i in $(seq 0 $((N - 1))); do
     echo "- targets: ['$PREFIX-v$i.internal:$HTTP_PORT']"
@@ -221,7 +321,8 @@ if [ -n "${GENESIS_ONLY:-}" ]; then
 fi
 
 if [ ! -f "$NET/secrets-staged" ]; then
-  # Secrets go through stdin, never argv (visible to other local users via ps).
+  # Secrets go through stdin, never argv (visible to other local users via ps). The machines get
+  # them as environment variables; nothing in their configuration names VALIDATOR_KEY_B64.
   for i in $(seq 0 $((N - 1))); do
     printf 'VALIDATOR_KEY_B64=%s\nBLOCKULA_FORWARDER_SECRET=%s\n' "$(base64 < "$NET/v$i/validator.key" | tr -d '\n')" "$(cat "$NET/forwarder-secret")" \
       | fly secrets import -a "$PREFIX-v$i" --stage >/dev/null
@@ -239,109 +340,52 @@ echo "🔨 Building $IMAGE on Fly's builders…"
 fly deploy . -c "$WORK/build.toml" --dockerfile deploy/Dockerfile --depot="${DEPOT:-false}" \
   --build-arg GIT_SHA="$TAG" --build-only --push --image-label "$TAG" >/dev/null
 
+# From here on validators run and sign: this genesis is live, and RESET is refused for it (a
+# retry after any failure below finishes this launch, or takes a new CHAIN_ID).
+touch "$NET/launched"
+
 SEEDING=()
+DEPLOYS=()
 for i in $(seq 0 $((N - 1))); do
   app=$PREFIX-v$i
-  key_file=""
-  if has_secret "$app" VALIDATOR_KEY_B64; then
-    SEEDING+=("$app")
-    key_file=$'[[files]]\n  guest_path = "/etc/blockula/validator.key"\n  secret_name = "VALIDATOR_KEY_B64"'
-  fi
-  halt=""
-  [ -n "${HALT_HEIGHT:-}" ] && halt="  HALT_HEIGHT = \"$HALT_HEIGHT\""
   # Exit codes 10/11/12 (halt height, upgrade required, slashing protection) make the
   # entrypoint stay down instead of exiting, so neither the restart policy nor the proxy
   # restarts a validator that stopped on purpose; crashes still restart.
-  cat > "$WORK/$app.toml" <<TOML
-app = "$app"
-primary_region = "${REGIONS[$i]}"
-[env]
-  ROLE = "validator"
-  P2P_PRESET = "public-nat"
-  BLOCKULA_LOG = "warn,blockula=info"
-$halt
-[mounts]
-  source = "data"
-  destination = "/data"
-[[files]]
-  guest_path = "/etc/blockula/genesis.json"
-  local_path = "$NET/genesis.json"
-$key_file
-[[services]]
-  internal_port = $P2P_PORT
-  protocol = "tcp"
-  auto_stop_machines = "off"
-  auto_start_machines = false
-  min_machines_running = 1
-  [[services.ports]]
-    port = $P2P_PORT
-[[restart]]
-  policy = "on-failure"
-  retries = 10
-[metrics]
-  port = $HTTP_PORT
-  path = "/metrics"
-[[vm]]
-  size = "$VALIDATOR_VM"
-  memory = "$VALIDATOR_MEMORY"
-TOML
+  validator_toml "$i" > "$WORK/$app.toml"
   echo "🧛 Deploying $app (${REGIONS[$i]})…"
   # --ha=false: exactly one machine per validator. Never scale a validator app.
   fly deploy -c "$WORK/$app.toml" --image "$IMAGE" --ha=false >/dev/null &
+  DEPLOYS+=($!)
 done
-wait
+failed=""
+for i in $(seq 0 $((N - 1))); do wait "${DEPLOYS[$i]}" || failed="$failed $PREFIX-v$i"; done
+[ -z "$failed" ] || { echo "❌ deploying$failed failed (fly logs -a <app>); rerun deploy/launch.sh, without RESET" >&2; exit 1; }
+# Which validators still hold their key in Fly, asked once the deploys applied the staged
+# secrets (a staged secret may not be listed before).
+for i in $(seq 0 $((N - 1))); do
+  if has_secret "$PREFIX-v$i" VALIDATOR_KEY_B64; then SEEDING+=("$PREFIX-v$i"); fi
+done
 
-PEERS=""
-for i in $(seq 0 $((N - 1))); do PEERS="$PEERS http://$PREFIX-v$i.internal:$HTTP_PORT"; done
-cat > "$WORK/$RPC_APP.toml" <<TOML
-app = "$RPC_APP"
-primary_region = "$RPC_REGION"
-[env]
-  ROLE = "rpc"
-  GENESIS_HASH = "$GENESIS_HASH"
-  CLIENT_IP_HEADER = "fly-client-ip"
-  PEER_HTTP = "${PEERS# }"
-  BLOCKULA_LOG = "warn,blockula=info"
-[mounts]
-  source = "data"
-  destination = "/data"
-[[files]]
-  guest_path = "/etc/blockula/genesis.json"
-  local_path = "$NET/genesis.json"
-[http_service]
-  internal_port = 7171
-  force_https = true
-  auto_stop_machines = "off"
-  min_machines_running = 1
-  [[http_service.checks]]
-    method = "GET"
-    path = "/api/health"
-    interval = "15s"
-    timeout = "5s"
-    grace_period = "60s"
-[metrics]
-  port = 7171
-  path = "/metrics"
-[[vm]]
-  size = "$RPC_VM"
-  memory = "$RPC_MEMORY"
-TOML
+rpc_toml > "$WORK/$RPC_APP.toml"
 echo "🌐 Deploying public node ${RPC_APP}…"
 fly deploy -c "$WORK/$RPC_APP.toml" --image "$IMAGE" --ha=false >/dev/null
 
 # Keys are on their volumes now: delete them from Fly so no other machine can ever load them.
+# Not staged: each validator restarts without the variable, one at a time, the next once the
+# restarted validator has finalized new blocks; otherwise it stops before the next restart.
 for app in ${SEEDING[@]+"${SEEDING[@]}"}; do
   if fly ssh console -a "$app" -C "test -f /data/home/.seeded" >/dev/null 2>&1; then
-    fly secrets unset VALIDATOR_KEY_B64 -a "$app" --stage >/dev/null && echo "🔒 $app: key seeded on its volume; removed from Fly secrets"
+    before=$(height)
+    fly secrets unset VALIDATOR_KEY_B64 -a "$app" >/dev/null && echo "🔒 $app: key seeded on its volume; removed from Fly secrets"
+    progressed "$app" "$before" || { echo "❌ $app did not confirm new finalized blocks after its restart (from #$before): stopping before the next validator. Check fly logs -a $app, then rerun deploy/launch.sh (without RESET) to remove the remaining keys." >&2; exit 1; }
   else
     echo "⚠️  $app: couldn't confirm the key was seeded; VALIDATOR_KEY_B64 left in place" >&2
   fi
 done
-touch "$NET/launched"
 
 # Informational only: a failure here (e.g. a stale local DNS cache) must not skip anything above.
 for _ in $(seq 60); do curl -fsS "$RPC_URL/api/health" >/dev/null 2>&1 && break; sleep 5; done
 curl -fsS "$RPC_URL/api/status" | jq '{chain_id, genesis_hash, height, syncing, active_validators, version}' || echo "⚠️  couldn't reach $RPC_URL from here yet (DNS can take a few minutes)"
 
 echo "✓ $CHAIN_ID live: $RPC_URL  (explorer at /, API at /api/status)"
-echo "  genesis hash: $GENESIS_HASH  (pin it in the MCP and wallet: deploy/README.md \"Relaunch\")"
+echo "  genesis hash: $GENESIS_HASH  (pin it: scripts/pin-network.sh $CHAIN_ID $GENESIS_HASH --genesis $NET/genesis.json, deploy/README.md \"Relaunch\")"

@@ -159,11 +159,14 @@ impl ClientIpPolicy {
             entries.len().checked_sub(hops.max(1)).and_then(|i| entries[i].trim().parse::<IpAddr>().ok())
         };
         let policy = self;
+        // A node bound to `::` sees IPv4 peers as IPv4-mapped IPv6 (`::ffff:127.0.0.1`): the
+        // same caller, so local callers stay local and trusted forwarders stay trusted.
+        let ip = peer.ip().to_canonical();
         let by_secret = match (&policy.forwarder_secret, h.get("x-blockula-forwarder-key")) {
             (Some(secret), Some(given)) => ct_eq(secret.as_bytes(), given.as_bytes()),
             _ => false,
         };
-        if by_secret || policy.trusted_forwarders.contains(&peer.ip()) {
+        if by_secret || policy.trusted_forwarders.contains(&ip) {
             if let Some(ip) = header_ip("x-blockula-client-ip", 1) {
                 return Some(ip);
             }
@@ -171,9 +174,9 @@ impl ClientIpPolicy {
         if let Some(name) = policy.header.as_deref() {
             // Configured but missing or unreadable: limited as the proxy itself, never as a
             // local caller (which isn't limited at all).
-            return Some(header_ip(name, policy.hops).unwrap_or(peer.ip()));
+            return Some(header_ip(name, policy.hops).unwrap_or(ip));
         }
-        if peer.ip().is_loopback() { None } else { Some(peer.ip()) }
+        if ip.is_loopback() { None } else { Some(ip) }
     }
 }
 
@@ -515,14 +518,58 @@ fn label(v: &ReadView, addr: &str) -> Value {
 }
 
 fn tx_json(v: &ReadView, tx: &Tx, height: Option<u64>) -> Value {
-    tx_json_with(v, tx, height, None)
+    tx_json_with(v, tx, height.map(|height| Ran { height, idx: None, meta: None }), None)
 }
 
-fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>) -> Value {
+/// Where a sealed tx ran: its block's height and, when the caller has them, its index in the
+/// block and the block's index row (for who its action named, see `named_at_execution`).
+#[derive(Clone, Copy)]
+struct Ran<'a> {
+    height: u64,
+    idx: Option<usize>,
+    meta: Option<&'a BlockMeta>,
+}
+
+/// The account a sealed tx's action named, as the chain resolved it when its block ran: the tx's
+/// index rows (`BlockMeta::history`) hold the accounts it joined: the sender and the ones it
+/// named, resolved just before it ran (`State::named_by`). A name signed as a name (audit gap-7-1)
+/// pays whoever owned it then, so resolving it against today's state, or against the state after
+/// its whole block, would credit a later owner, or nobody once it lapsed (audit
+/// main13-protocol-3, review-main13-1). No other row: it named its own sender, or (only a failed
+/// tx) a name that didn't resolve, so a failed one's is unknown (`None`).
+fn named_at_execution(meta: &BlockMeta, idx: usize, sender: &str, failed: bool) -> Option<String> {
+    let mut rows = meta.history.iter().filter(|(i, a)| *i as usize == idx && a != sender).map(|(_, a)| a);
+    match (rows.next(), rows.next()) {
+        (Some(a), None) => Some(a.clone()),
+        (None, _) if !failed => Some(sender.to_string()),
+        _ => None,
+    }
+}
+
+fn tx_json_with(v: &ReadView, tx: &Tx, ran: Option<Ran>, error: Option<&str>) -> Value {
     let st = &v.state;
+    let height = ran.map(|r| r.height);
     let sender = tx.sender().unwrap_or_default();
+    // An address names itself. For a sealed tx, a name is who the block's index rows say it paid
+    // when it ran, and unknown without them (never who owns it now); a pending one's resolves now.
+    let named = |named: &String| -> Option<String> {
+        if crypto::is_address(named) {
+            return Some(named.clone());
+        }
+        match ran {
+            Some(r) => named_at_execution(r.meta?, r.idx?, &sender, error.is_some()),
+            None => st.resolve(named).ok(),
+        }
+    };
+    // The name the action was signed with, for the kinds whose `to` it names.
+    let signed_name = |n: &String| (!crypto::is_address(n)).then(|| format!("{}{NAME_SUFFIX}", normalize_name(n).unwrap_or_else(|_| n.clone())));
+    let to_name = match &tx.action {
+        Action::Transfer { to, .. } | Action::AwardHunt { to, .. } | Action::GrantSoul { to, .. } | Action::TransferName { to, .. } | Action::Unshield { to, .. } => signed_name(to),
+        Action::Vouch { account } | Action::Unvouch { account } | Action::FlagSybil { account, .. } | Action::Clawback { account, .. } => signed_name(account),
+        _ => None,
+    };
     let (kind, to, amount) = match &tx.action {
-        Action::Transfer { to, amount } => ("transfer", st.resolve(to).ok(), Some(*amount)),
+        Action::Transfer { to, amount } => ("transfer", named(to), Some(*amount)),
         Action::RegisterName { .. } => ("register_name", None, None),
         Action::AddKey { .. } => ("add_key", None, None),
         Action::RemoveKey { .. } => ("remove_key", None, None),
@@ -534,14 +581,14 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
         Action::UnlinkGithub { .. } => ("unlink_github", None, None),
         Action::CreateHunt { amount, .. } => ("create_hunt", None, Some(*amount)),
         Action::FundHunt { amount, .. } => ("fund_hunt", None, Some(*amount)),
-        Action::AwardHunt { to, .. } => ("award_hunt", st.resolve(to).ok(), None),
+        Action::AwardHunt { to, .. } => ("award_hunt", named(to), None),
         Action::CancelHunt { .. } => ("cancel_hunt", None, None),
         Action::RegisterFamiliar { .. } => ("register_familiar", None, None),
         Action::SetRepo { .. } => ("set_repo", None, None),
-        Action::GrantSoul { to, .. } => ("grant_soul", st.resolve(to).ok(), None),
-        Action::Vouch { account } => ("vouch", st.resolve(account).ok(), Some(crate::poc::VOUCH_BOND)),
-        Action::Unvouch { account } => ("unvouch", st.resolve(account).ok(), None),
-        Action::FlagSybil { account, .. } => ("flag_sybil", st.resolve(account).ok(), None),
+        Action::GrantSoul { to, .. } => ("grant_soul", named(to), None),
+        Action::Vouch { account } => ("vouch", named(account), Some(crate::poc::VOUCH_BOND)),
+        Action::Unvouch { account } => ("unvouch", named(account), None),
+        Action::FlagSybil { account, .. } => ("flag_sybil", named(account), None),
         Action::SubmitClaim { .. } => ("submit_claim", None, None),
         Action::AttestClaim { .. } => ("attest_claim", None, None),
         Action::RejectClaim { .. } => ("reject_claim", None, None),
@@ -551,14 +598,14 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
         Action::RevealVotes { .. } => ("reveal_votes", None, None),
         Action::FundPool { amount } => ("fund_pool", Some(st.pool()), Some(*amount)),
         Action::WithdrawVested {} => ("withdraw_vested", None, None),
-        Action::Clawback { account, .. } => ("clawback", st.resolve(account).ok(), None),
+        Action::Clawback { account, .. } => ("clawback", named(account), None),
         Action::Delegate { validator, amount } => ("delegate", Some(validator.clone()), Some(*amount)),
         Action::Propose { deposit, .. } => ("propose", None, Some(*deposit)),
         Action::Vote { amount, .. } => ("vote", None, Some(*amount)),
-        Action::TransferName { to, .. } => ("transfer_name", st.resolve(to).ok(), None),
+        Action::TransferName { to, .. } => ("transfer_name", named(to), None),
         Action::ClaimDistribution { amount, .. } => ("claim_distribution", None, Some(*amount)),
         Action::Shield { amount, .. } => ("shield", None, Some(*amount)),
-        Action::Unshield { to, amount, .. } => ("unshield", st.resolve(to).ok(), Some(*amount)),
+        Action::Unshield { to, amount, .. } => ("unshield", named(to), Some(*amount)),
         a => (a.kind(), None, None),
     };
     // An unsigned ghost tx pays exactly its fee (it's in its proof's value balance).
@@ -572,7 +619,9 @@ fn tx_json_with(v: &ReadView, tx: &Tx, height: Option<u64>, error: Option<&str>)
         "height": height,
         // Unsigned ghost txs have no sender to show.
         "from": (!tx.is_unsigned()).then(|| label(v, &sender)),
+        // Who the action named: for a sealed tx, the account the chain resolved when it ran.
         "to": to.map(|t| label(v, &t)),
+        "to_name": to_name,
         "amount": amount.map(|a| a.to_string()),
         "amount_display": amount.map(fmt_fang),
         // What the tx is charged (base fee burned + tip); `max_fee` is what it allowed.
@@ -623,6 +672,7 @@ fn header_json(v: &ReadView, height: u64, m: &BlockMeta) -> Value {
 }
 
 fn block_json(v: &ReadView, b: &Block) -> Value {
+    let meta = v.block_meta(b.height);
     json!({
         "height": b.height,
         "hash": b.hash,
@@ -638,7 +688,7 @@ fn block_json(v: &ReadView, b: &Block) -> Value {
         // The base fee its txs paid (flat drops + `rate` milli-drops per byte, econ.rs).
         "base_fee": b.base_fee.map(|s| json!({ "flat": s.flat.to_string(), "rate": s.rate.to_string(), "max_block_bytes": s.max_block_bytes })),
         "summary": block_summary(b.height, b.txs.len()),
-        "txs": b.txs.iter().enumerate().map(|(i, t)| tx_json_with(v, t, Some(b.height), b.failed.get(&i).map(|s| s.as_str()))).collect::<Vec<_>>(),
+        "txs": b.txs.iter().enumerate().map(|(i, t)| tx_json_with(v, t, Some(Ran { height: b.height, idx: Some(i), meta: meta.as_ref() }), b.failed.get(&i).map(|s| s.as_str()))).collect::<Vec<_>>(),
         "signature_bytes": v.cert_len(b.height),
         "failed_count": b.failed.len(),
     })
@@ -754,7 +804,8 @@ async fn tx(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
     let v = n.live.view();
     if let Some((h, i)) = v.tx_location(&id) {
         if let Some((t, err)) = v.finalized_tx(h, i) {
-            return Ok(Json(tx_json_with(&v, &t, Some(h), err.as_deref())));
+            let meta = v.block_meta(h);
+            return Ok(Json(tx_json_with(&v, &t, Some(Ran { height: h, idx: Some(i), meta: meta.as_ref() }), err.as_deref())));
         }
     }
     let mp = n.live.mempool();
@@ -893,8 +944,12 @@ async fn upgrade(State(n): State<Node>) -> ApiResult {
         "supported_protocol_version": crate::consensus::SUPPORTED_PROTOCOL_VERSION,
         "schedule": st.upgrade.schedule.iter().map(|u| json!({ "version": u.version, "activation_height": u.activation_height, "active": u.activation_height <= h + 1 })).collect::<Vec<_>>(),
         // What cancellations withdrew: versions through `highest_version` are never scheduled
-        // again, and upgrade proposals made by `last_cancelled_at` are superseded.
-        "withdrawn": { "highest_version": st.upgrade.withdrawals.highest, "last_cancelled_at": st.upgrade.withdrawals.last_at },
+        // again, and upgrade proposals made by `last_cancelled_at` are superseded; the highest of
+        // those (`superseded_version`) isn't spent, but a release may carry it.
+        // `next_version`: what the next upgrade should ship as (past all of them and what's
+        // scheduled; a new one is at most 16 past `next_version - 1`).
+        "withdrawn": { "highest_version": st.upgrade.withdrawals.highest, "last_cancelled_at": st.upgrade.withdrawals.last_at, "superseded_version": st.upgrade.withdrawals.superseded },
+        "next_version": crate::upgrade::next_version(st),
         "next": next.map(|u| json!({ "version": u.version, "activation_height": u.activation_height, "blocks_left": u.activation_height.saturating_sub(h + 1), "this_binary_supports_it": u.version <= crate::consensus::SUPPORTED_PROTOCOL_VERSION })),
         "halted": n.halt.get().map(|h| json!({ "kind": h.kind(), "reason": h.to_string() })),
         "readiness": {
@@ -1100,14 +1155,45 @@ async fn account(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
     let mp = n.live.mempool();
     // The mempool is capped (`MAX_MEMPOOL`), so this scan is bounded.
     let mut recent: Vec<Value> = mp.newest().filter(|t| t.from == addr || matches!(&t.action, Action::Transfer { to, .. } if st.resolve(to).ok().as_deref() == Some(addr.as_str()))).map(|t| tx_json(&v, t, None)).collect();
-    recent.extend(v.history(&addr, 25).into_iter().filter_map(|(h, i)| v.finalized_tx(h, i).map(|(t, e)| tx_json_with(&v, &t, Some(h), e.as_deref()))));
+    // Each block's index row once, for who its txs paid when they ran.
+    let history = v.history(&addr, 25);
+    let mut metas: BTreeMap<u64, Option<BlockMeta>> = BTreeMap::new();
+    for &(h, _) in &history {
+        metas.entry(h).or_insert_with(|| v.block_meta(h));
+    }
+    recent.extend(history.into_iter().filter_map(|(h, i)| v.finalized_tx(h, i).map(|(t, e)| tx_json_with(&v, &t, Some(Ran { height: h, idx: Some(i), meta: metas.get(&h).and_then(Option::as_ref) }), e.as_deref()))));
     let hunts_created: Vec<u64> = v.ids(ix::HUNT_CREATOR, &addr, false, ACCOUNT_LIST_LIMIT);
     let hunts_won: Vec<Value> = v.ids(ix::HUNT_WINNER, &addr, false, ACCOUNT_LIST_LIMIT).into_iter().filter_map(|id| st.hunts.get(&id)).map(|h| json!({ "id": h.id, "repo": h.repo, "issue": h.issue, "amount_display": fmt_fang(h.amount), "pr": h.pr, "self_awarded": h.self_awarded() })).collect();
     let keys = st.keys_of(&addr);
+    // What it can move out now (econ::free: vesting and vote locks hold the rest, net of stake),
+    // and the locks still holding something, as the next block runs them.
+    let now = crate::econ::now(st);
+    let (transferable, locked) = (crate::econ::transferable(st, &addr, now), acct.locked_at(now));
+    let locks: Vec<Value> = acct
+        .locks
+        .iter()
+        .filter(|l| l.amount.locked_at(now) > 0)
+        .map(|l| {
+            let until = match l.amount {
+                crate::chain::LockAmount::Vesting { end, .. } => end,
+                crate::chain::LockAmount::Until { until, .. } => until,
+            };
+            json!({ "id": l.id, "reason": l.reason, "amount": l.amount.locked_at(now).to_string(), "amount_display": fmt_fang(l.amount.locked_at(now)), "until": until, "vesting": matches!(l.amount, crate::chain::LockAmount::Vesting { .. }) })
+        })
+        .collect();
     Ok(Json(json!({
         "account": label(&v, &addr),
         "balance": acct.balance.to_string(),
         "balance_display": fmt_fang(acct.balance),
+        "transferable": transferable.to_string(),
+        "transferable_display": fmt_fang(transferable),
+        "locked": locked.to_string(),
+        "locked_display": fmt_fang(locked),
+        "locks": locks,
+        // Whether the chain has an account here yet, and what a payment that opens it burns from
+        // its sender (`account_creation_fee`; 0 for an existing or keyless system account).
+        "exists": st.accounts.contains_key(&addr),
+        "creation_fee": st.creation_fee_for(&addr).to_string(),
         "nonce": acct.nonce,
         "next_nonce": acct.nonce + mp.pending_count(&addr) as u64,
         "names": names,
@@ -1310,7 +1396,7 @@ async fn faucet(State(n): State<Node>, ConnectInfo(peer): ConnectInfo<SocketAddr
         rules.push((format!("faucet-ip:{}", ip_key(ip)), 1, FAUCET_IP_WINDOW));
     }
     // Loopback callers (local dev, tests) aren't limited at all.
-    let limited = client.is_some() || !peer.ip().is_loopback();
+    let limited = client.is_some() || !peer.ip().to_canonical().is_loopback();
     // The slot is taken before the drip (atomically: parallel requests can't all pass a check
     // first, F28) and given back if the drip doesn't go out.
     let reserved = if limited { Some(n.limits.allow(&rules).map_err(|w| too_many("the faucet already dripped for you", w))?) } else { None };
@@ -1920,8 +2006,9 @@ async fn contributions(State(n): State<Node>) -> ApiResult {
             "vouch_min_soul": fmt_soul(VOUCH_MIN_SOUL), "juror_min_soul": fmt_soul(JUROR_MIN_SOUL),
             "jury_size": JURY_SIZE, "min_jury": MIN_JURY, "pairs_per_juror": PAIRS_PER_JUROR, "max_claims_per_seance": MAX_SEANCE_CLAIMS,
             "pool_share_per_seance": ppm_display(SEANCE_POOL_BPS * 100), "juror_share": ppm_display(JUROR_SHARE_BPS * 100), "min_score": ppm_display(MIN_SCORE_PPM),
-            // The budget reaches the full share at this many people; within a Séance each of a
-            // person's claims after their best counts 1/`claim_rank_divisor` of the one above it.
+            // The budget reaches the full share at this many people; within a Séance a person's
+            // claims share one win rate pooled over all their comparisons, and each after the
+            // first counts 1/`claim_rank_divisor` of the one above it.
             "full_budget_people": FULL_BUDGET_PEOPLE, "min_people": 2, "claim_rank_divisor": 1u64 << CLAIM_RANK_SHIFT,
         },
     })))
@@ -2156,6 +2243,9 @@ async fn multisig(State(n): State<Node>, Path(id): Path<String>) -> ApiResult {
                 "created_at": p.created_at,
                 "expires_at": p.expires_at,
                 "expired": v.height > p.expires_at,
+                // Why no approval can file it any more (an upgrade proposal a cancellation
+                // superseded), or null.
+                "superseded": crate::governance::superseded_multisig_action(st, p),
             })
         })
         .collect();
@@ -2229,6 +2319,13 @@ mod tests {
         let lan = ClientIpPolicy { trusted_forwarders: vec!["10.0.0.2".parse().unwrap()], ..Default::default() };
         let fake = headers(&[("fly-client-ip", "10.0.0.2"), ("x-blockula-client-ip", "9.9.9.9")]);
         assert_eq!(lan.resolve(peer, &fake), Some(peer.ip()));
+        // A node bound to `::` (dual stack) sees IPv4 peers as IPv4-mapped: 127.0.0.1 is still
+        // a local caller, a trusted forwarder still trusted, and anyone else limited by their
+        // IPv4 address.
+        let mapped = |s: &str| SocketAddr::new(IpAddr::V6(s.parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped()), 5000);
+        assert_eq!(ClientIpPolicy::default().resolve(mapped("127.0.0.1"), &HeaderMap::new()), None);
+        assert_eq!(lan.resolve(mapped("10.0.0.2"), &headers(&[("x-blockula-client-ip", "9.9.9.9")])), Some("9.9.9.9".parse().unwrap()));
+        assert_eq!(ClientIpPolicy::default().resolve(mapped("203.0.113.7"), &HeaderMap::new()), Some(peer.ip()));
     }
 
     /// Audit F40: a full node forwards a signed tx with its client's IP (for the validator's
@@ -2284,6 +2381,69 @@ globalThis.location = { hash: "" };
             assert!(!html.contains("<img") && !html.contains("<b>"), "{route}: {html}");
             assert!(html.contains("offline"), "{route}: {html}");
         }
+    }
+
+    /// The explorer's tx page for one `/api/tx` answer, rendered by the page's own script under
+    /// Node with a stub DOM; `None` where `node` isn't installed (CI has it).
+    pub(super) fn explorer_tx_page(answer: &Value) -> Option<String> {
+        let ok = std::process::Command::new("node").arg("--version").output().is_ok_and(|o| o.status.success());
+        if !ok {
+            eprintln!("skipping: node isn't installed");
+            return None;
+        }
+        let stub = format!(
+            r##"
+const app = {{ innerHTML: "" }};
+globalThis.document = {{ querySelector: (s) => (s === "#app" ? app : {{ addEventListener() {{}}, textContent: "", value: "" }}), querySelectorAll: () => [], head: {{ append() {{}} }}, createElement: () => ({{}}) }};
+globalThis.window = {{ addEventListener() {{}} }};
+globalThis.setInterval = () => 0;
+const ANSWER = {answer};
+globalThis.fetch = async (p) => (String(p).startsWith("/api/tx/") ? {{ ok: true, json: async () => ANSWER }} : {{ ok: false, json: async () => ({{ error: "offline" }}) }});
+globalThis.location = {{ hash: "#/tx/{id}" }};
+"##,
+            id = "ab".repeat(32)
+        );
+        // The page routes once as it loads; this second pass is the one awaited.
+        let probe = r##"
+(async () => {
+  await route();
+  console.log(JSON.stringify(app.innerHTML));
+})();
+"##;
+        let src = format!("{stub}{}{probe}", explorer_script());
+        let out = std::process::Command::new("node").arg("-e").arg(&src).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        Some(serde_json::from_slice(&out.stdout).unwrap())
+    }
+
+    /// review-fix-clients-2: the node's explorer (which the MCP's in-flight answers link to) tells a
+    /// tx dropped unrun (nothing charged; another node may still include it, so it must not be sent
+    /// again yet) from a failure that ran (its fee was charged; final), and calls a drop "failed"
+    /// nowhere. An older node's tx-less failure, which doesn't say, reads as a drop: the answer that
+    /// never invites a re-send.
+    #[test]
+    fn explorer_tells_a_drop_from_a_failure_that_ran() {
+        const DROPPED: &str = "dropped from this node's mempool without running";
+        const NOT_YET: &str = "nothing was charged, but another node may still include it until its valid_until, so don't send it again before then";
+        const RAN: &str = "failed in <a href=\"#/block/12\">block #12</a>: its fee was charged";
+        let id = "ab".repeat(32);
+        let dropped = json!({ "id": id, "status": "failed", "dropped": true, "error": "expired: valid_until 11", "height": 12, "summary": "Transaction dropped without running: expired" });
+        let older = json!({ "id": id, "status": "failed", "error": "expired", "height": 12, "summary": "Transaction failed: expired" });
+        let ran = json!({ "id": id, "status": "failed", "dropped": false, "error": "insufficient balance", "height": 12, "summary": "Transaction failed: insufficient balance" });
+        for (what, answer) in [("dropped", &dropped), ("an older node's tx-less failure", &older)] {
+            let Some(page) = explorer_tx_page(answer) else { return };
+            assert!(page.contains(DROPPED) && page.contains(NOT_YET), "{what}: {page}");
+            assert!(page.contains(r#"<span class="pill pending">dropped</span>"#), "{what}: a non-final pill: {page}");
+            assert!(!page.contains("pill failed") && !page.contains("fee was charged") && !page.contains("didn't go through"), "{what}: {page}");
+        }
+        let Some(page) = explorer_tx_page(&ran) else { return };
+        assert!(page.contains(RAN) && page.contains("final"), "{page}");
+        assert!(page.contains(r#"<span class="pill failed">failed</span>"#), "{page}");
+        assert!(!page.contains(DROPPED) && !page.contains("may still include"), "{page}");
+        // Node text stays text.
+        let hostile = json!({ "id": id, "status": "failed", "dropped": true, "error": "<img src=x onerror=alert(1)>", "height": "<b>12</b>", "summary": "" });
+        let Some(page) = explorer_tx_page(&hostile) else { return };
+        assert!(!page.contains("<img") && !page.contains("<b>"), "{page}");
     }
 
     /// The p2p transport `/api/status` reports is the one linked (audit #1/#3). Compiling
@@ -2566,6 +2726,8 @@ mod http_tests {
         let (s, u, _) = call(&n, "GET", "/api/upgrade", None, "127.0.0.1:1").await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!((u["height"].as_u64(), u["next"]["version"].as_u64(), u["next"]["blocks_left"].as_u64(), u["next"]["this_binary_supports_it"].as_bool()), (Some(2), Some(v2 as u64), Some(1), Some(false)));
+        // Nothing withdrawn or superseded; the next upgrade ships past what's scheduled.
+        assert_eq!((u["withdrawn"]["highest_version"].as_u64(), u["withdrawn"]["superseded_version"].as_u64(), u["next_version"].as_u64()), (Some(0), Some(0), Some(v2 as u64 + 1)));
         // The one validator proposed both blocks, signalling what its binary supports.
         assert_eq!((u["readiness"]["version"].as_u64(), u["readiness"]["ready"].as_u64(), u["readiness"]["active"].as_u64()), (Some(v2 as u64), Some(0), Some(1)));
         assert_eq!(u["readiness"]["validators"][0]["signal"].as_u64(), Some(crate::consensus::SUPPORTED_PROTOCOL_VERSION as u64));
@@ -3044,6 +3206,74 @@ mod http_tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// Audit main13-protocol-3: a payment signed to a name (gap-7-1) is reported as paid to whoever
+    /// owned the name when it ran, with the name it was signed to, even after the name changed hands.
+    #[tokio::test]
+    async fn a_payment_to_a_name_reports_who_it_paid() {
+        let (root, n) = node("paidname");
+        let (alice, bob, payer) = (crate::crypto::Keys::from_seed([21; 32]), crate::crypto::Keys::from_seed([22; 32]), crate::crypto::Keys::from_seed([23; 32]));
+        let (cid, gh) = { let c = n.chain.lock(); (c.genesis.chain_id.clone(), c.genesis_hash.clone()) };
+        let mk = |c: &Chain, from: &crate::crypto::Keys, action: Action| {
+            let mut tx = Tx { chain_id: cid.clone(), genesis_hash: gh.clone(), from: from.address(), nonce: c.next_nonce(&from.address()), fee: 0, tip: 0, valid_until: c.height() + 100, action, memo: String::new(), public_key: hex::encode(from.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
+            tx.fee = min_fee(tx.size());
+            tx.sign(from)
+        };
+        let step = |who: &crate::crypto::Keys, action: Action| {
+            let mut c = n.chain.lock();
+            let tx = mk(&c, who, action);
+            c.submit(tx.clone()).unwrap();
+            c.produce_block().unwrap();
+            tx
+        };
+        {
+            let mut c = n.chain.lock();
+            for k in [&alice, &bob, &payer] {
+                c.faucet(&k.address(), 100 * DROPS_PER_FANG).unwrap();
+            }
+            c.produce_block().unwrap();
+        }
+        step(&alice, Action::RegisterName { name: "crypt".into() });
+        let pay = step(&payer, Action::Transfer { to: "crypt.boo".into(), amount: 5 * DROPS_PER_FANG });
+        // alice offers the name to bob, and bob accepts it.
+        step(&alice, Action::TransferName { name: "crypt".into(), to: bob.address() });
+        step(&bob, Action::TransferName { name: "crypt".into(), to: bob.address() });
+        assert_eq!(n.chain.lock().state.resolve("crypt.boo").unwrap(), bob.address());
+        let (s, v, _) = call(&n, "GET", &format!("/api/tx/{}", pay.id()), None, "127.0.0.1:1").await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!((v["to"]["address"].as_str(), v["to_name"].as_str()), (Some(alice.address().as_str()), Some("crypt.boo")), "paid to the owner when it ran: {v}");
+        let (_, a, _) = call(&n, "GET", &format!("/api/account/{}", alice.address()), None, "127.0.0.1:1").await;
+        let row = a["recent_txs"].as_array().unwrap().iter().find(|t| t["id"] == json!(pay.id())).cloned().expect("in alice's history");
+        assert_eq!(row["to"]["address"].as_str(), Some(alice.address().as_str()), "{row}");
+        let h = v["height"].as_u64().unwrap();
+        let (_, b, _) = call(&n, "GET", &format!("/api/block/{h}"), None, "127.0.0.1:1").await;
+        assert_eq!(b["txs"][0]["to"]["address"].as_str(), Some(alice.address().as_str()), "{b}");
+        // Audit review-main13-1: the name changes hands later in the payment's own block. Who it
+        // named is resolved just before each tx runs, so it's still reported as paid to alice.
+        step(&alice, Action::RegisterName { name: "shop".into() });
+        step(&alice, Action::TransferName { name: "shop".into(), to: bob.address() });
+        let (same, accept) = {
+            let c = n.chain.lock();
+            (mk(&c, &payer, Action::Transfer { to: "shop.boo".into(), amount: 5 * DROPS_PER_FANG }), mk(&c, &bob, Action::TransferName { name: "shop".into(), to: bob.address() }))
+        };
+        let had = n.chain.lock().state.account(&alice.address()).balance;
+        n.chain.lock().produce_block_with(vec![same.clone(), accept]).unwrap();
+        {
+            let c = n.chain.lock();
+            assert_eq!((c.state.account(&alice.address()).balance, c.state.resolve("shop.boo").unwrap()), (had + 5 * DROPS_PER_FANG, bob.address()), "the chain paid alice; bob owns it after the block");
+        }
+        let (_, v, _) = call(&n, "GET", &format!("/api/tx/{}", same.id()), None, "127.0.0.1:1").await;
+        assert_eq!((v["to"]["address"].as_str(), v["to_name"].as_str()), (Some(alice.address().as_str()), Some("shop.boo")), "{v}");
+        let (_, a, _) = call(&n, "GET", &format!("/api/account/{}", alice.address()), None, "127.0.0.1:1").await;
+        assert!(a["recent_txs"].as_array().unwrap().iter().any(|t| t["id"] == json!(same.id())), "in alice's history: {a}");
+        let (_, b, _) = call(&n, "GET", &format!("/api/account/{}", bob.address()), None, "127.0.0.1:1").await;
+        assert!(!b["recent_txs"].as_array().unwrap().iter().any(|t| t["id"] == json!(same.id())), "not in bob's: {b}");
+        // An address-signed payment names no name.
+        let direct = step(&payer, Action::Transfer { to: bob.address(), amount: DROPS_PER_FANG });
+        let (_, d, _) = call(&n, "GET", &format!("/api/tx/{}", direct.id()), None, "127.0.0.1:1").await;
+        assert_eq!((d["to"]["address"].as_str(), d["to_name"].is_null()), (Some(bob.address().as_str()), true), "{d}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[tokio::test]
     async fn failed_txs_report_status_instead_of_404() {
         let (root, n) = node("txfail");
@@ -3088,6 +3318,10 @@ mod http_tests {
         assert_eq!((v["status"].as_str(), v["dropped"].as_bool()), (Some("failed"), Some(true)), "{v}");
         assert!(v["error"].as_str().unwrap().contains("expired"), "{v}");
         assert!(!n.live.mempool().failure_ran(&t3.id()));
+        // The node's own explorer reads this answer as a drop too, not as a final failure.
+        if let Some(page) = super::tests::explorer_tx_page(&v) {
+            assert!(page.contains("dropped from this node's mempool without running") && page.contains("so don't send it again before then") && !page.contains("pill failed"), "{page}");
+        }
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -3191,6 +3425,24 @@ mod http_tests {
         assert_eq!((m["threshold"].as_u64(), m["owners"].as_array().map(Vec::len), m["pending"][0]["valid_approvals"].as_u64()), (Some(2), Some(2), Some(1)));
         assert!(m["pending"][0]["summary"].as_str().unwrap().contains("sent 1 FANG to"), "{m}");
         assert_eq!(get(format!("/api/multisig/{me}")).await.0, StatusCode::NOT_FOUND);
+        // What an account can move: the vote's conviction lock holds its amount, net of stake
+        // (econ::free), and `locks` says why; a wallet's preflight checks payments against it.
+        let (_, a, _) = get(format!("/api/account/{me}")).await;
+        let transferable = {
+            let c = n.chain.lock();
+            crate::econ::transferable(&c.state, &me, crate::econ::now(&c.state))
+        };
+        assert_eq!(a["locked"].as_str(), Some((100_000_000 * FANG).to_string().as_str()), "{a}");
+        assert_eq!(a["transferable"].as_str(), Some(transferable.to_string().as_str()), "{a}");
+        assert!(a["transferable"].as_str().unwrap().parse::<u64>().unwrap() <= a["balance"].as_str().unwrap().parse::<u64>().unwrap(), "{a}");
+        assert_eq!((a["locks"][0]["id"].as_str(), a["locks"][0]["vesting"].as_bool()), (Some("vote:0"), Some(false)), "{a}");
+        assert_eq!((a["exists"].as_bool(), a["creation_fee"].as_str()), (Some(true), Some("0")), "{a}");
+        // An address with no account yet: paying it burns the creation fee from the payer.
+        let fresh = crate::crypto::Keys::from_seed([77; 32]).address();
+        let (_, f, _) = get(format!("/api/account/{fresh}")).await;
+        let fee = n.chain.lock().state.chain_params.account_creation_fee;
+        assert!(fee > 0);
+        assert_eq!((f["exists"].as_bool(), f["creation_fee"].as_str(), f["locked"].as_str(), f["transferable"].as_str()), (Some(false), Some(fee.to_string().as_str()), Some("0"), Some("0")), "{f}");
         std::fs::remove_dir_all(root).ok();
     }
 }

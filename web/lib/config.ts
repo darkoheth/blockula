@@ -18,6 +18,31 @@ export const MAINNET_PREFIX = "boo";
  */
 export const MAINNET_GENESIS_HASH = clean(process.env.NEXT_PUBLIC_MAINNET_GENESIS_HASH)?.toLowerCase();
 
+/** The public testnet (deploy/launch.sh): its own chain id, never reused (DEC-7), and the testnet prefix. */
+export const TESTNET_CHAIN_ID = "blockula-testnet-2";
+export const TESTNET_PREFIX = "tboo";
+export const TESTNET_RPC = "https://blockula-testnet.fly.dev";
+/**
+ * The testnet's genesis hash, once it has launched: the release after the launch pins it here
+ * (scripts/pin-network.sh). Until then, and when it's set, NEXT_PUBLIC_TESTNET_GENESIS_HASH
+ * pins it instead.
+ */
+export const TESTNET_GENESIS_HASH: string | undefined = undefined;
+
+/** A chain's genesis clock: its genesis.json's `created_at_ms` and `block_time_ms`. */
+export interface GenesisClock {
+  createdAtMs: number;
+  blockTimeMs: number;
+}
+
+/**
+ * The testnet's genesis clock, pinned with TESTNET_GENESIS_HASH (scripts/pin-network.sh), for that
+ * genesis only. With it the wallet refuses a node reporting a height the chain can't have reached
+ * from the first payment on, instead of taking the clock from the node on first use
+ * (lib/chain.ts, audit review-r3-clients-2).
+ */
+export const TESTNET_GENESIS_CLOCK: GenesisClock | undefined = undefined;
+
 /** A mainnet deployment (`NEXT_PUBLIC_NETWORK=mainnet`): stricter rules, see next.config.ts. */
 export const IS_MAINNET_BUILD = process.env.NEXT_PUBLIC_NETWORK === "mainnet";
 
@@ -29,6 +54,8 @@ export interface Network {
   chainId?: string;
   /** The genesis hash the node must report, when known. */
   genesisHash?: string;
+  /** That genesis's clock, when built in: it bounds the height a tx is signed against (lib/chain.ts). */
+  genesisClock?: GenesisClock;
   /** The bech32m address prefix ("boo1…"), when known. */
   prefix?: string;
   /** Real money: no browser-only keys, no faucet copy, a plain badge. */
@@ -65,18 +92,21 @@ const mainnet: Network | undefined = mainnetRpc
   ? { key: "mainnet", label: "Mainnet", rpc: mainnetRpc, chainId: MAINNET_CHAIN_ID, genesisHash: MAINNET_GENESIS_HASH, prefix: MAINNET_PREFIX, mainnet: true, witnesses: witnessList(process.env.NEXT_PUBLIC_MAINNET_WITNESSES, mainnetRpc) }
   : undefined;
 
+const testnetGenesis = clean(process.env.NEXT_PUBLIC_TESTNET_GENESIS_HASH)?.toLowerCase() || TESTNET_GENESIS_HASH;
+
 // A mainnet deployment lists the testnet only when it's configured explicitly.
 const testnet: Network | undefined =
   !IS_MAINNET_BUILD || testnetRpc
     ? {
         key: "testnet",
         label: "Testnet",
-        rpc: testnetRpc || "https://blockula-testnet.fly.dev",
-        chainId: clean(process.env.NEXT_PUBLIC_TESTNET_CHAIN_ID) || "blockula-testnet",
-        genesisHash: clean(process.env.NEXT_PUBLIC_TESTNET_GENESIS_HASH)?.toLowerCase(),
-        // Today's public testnet predates DEC-7 and still uses "boo"; protocol v1 testnets use "tboo".
-        prefix: clean(process.env.NEXT_PUBLIC_TESTNET_PREFIX) || "boo",
-        witnesses: witnessList(process.env.NEXT_PUBLIC_TESTNET_WITNESSES, testnetRpc || "https://blockula-testnet.fly.dev"),
+        rpc: testnetRpc || TESTNET_RPC,
+        chainId: clean(process.env.NEXT_PUBLIC_TESTNET_CHAIN_ID) || TESTNET_CHAIN_ID,
+        genesisHash: testnetGenesis,
+        // The built-in clock is that of the built-in genesis: never another one's.
+        genesisClock: testnetGenesis && testnetGenesis === TESTNET_GENESIS_HASH ? TESTNET_GENESIS_CLOCK : undefined,
+        prefix: clean(process.env.NEXT_PUBLIC_TESTNET_PREFIX) || TESTNET_PREFIX,
+        witnesses: witnessList(process.env.NEXT_PUBLIC_TESTNET_WITNESSES, testnetRpc || TESTNET_RPC),
       }
     : undefined;
 

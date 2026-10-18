@@ -8,7 +8,7 @@
 //    remembers the chain across restarts, and notices a node that switches mid-session.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -20,7 +20,7 @@ import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { RELEASE_SIGNATURE_FORMAT, releaseMessage } from "@blockula/sdk";
 import { KNOWN_GENESIS, KnownChains, LOCAL_RPC, TESTNET_RPC, completePin, effectivePin, mismatch, networkArg, resolveNetwork } from "../src/network.js";
-import { checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
+import { RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, pickNodeBinary, readReleasePin, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
 
 const G1 = "11".repeat(32);
 const G2 = "22".repeat(32);
@@ -94,10 +94,18 @@ assert.deepEqual(effectivePin(custom, known.get(custom)), { chainId: "a", genesi
 assert.deepEqual(effectivePin(pinned, { chainId: "other", genesisHash: G2 }), { chainId: "x", genesisHash: G1, prefix: undefined }, "configuration beats memory");
 // The testnet relaunched under a new chain id: what was remembered for the old one (its genesis)
 // isn't held against the new one, which is pinned on first use.
+// Its genesis is built in once a release pins it (scripts/pin-network.sh); until then it's pinned
+// on first use. Either way these hold.
 const testnet = resolveNetwork({});
-assert.deepEqual([testnet.pin.chainId, testnet.pin.prefix, testnet.pin.genesisHash], ["blockula-testnet-2", "tboo", undefined], "its genesis exists only once it launches");
-assert.deepEqual(effectivePin(testnet, { chainId: "blockula-testnet", genesisHash: G2, prefix: "boo" }), { chainId: "blockula-testnet-2", genesisHash: undefined, prefix: "tboo" });
-assert.deepEqual(effectivePin(testnet, { chainId: "blockula-testnet-2", genesisHash: G1, prefix: "tboo" }), { chainId: "blockula-testnet-2", genesisHash: G1, prefix: "tboo" });
+const builtIn: string | undefined = KNOWN_GENESIS["blockula-testnet-2"];
+assert.deepEqual([testnet.pin.chainId, testnet.pin.prefix, testnet.pin.genesisHash], ["blockula-testnet-2", "tboo", builtIn], "its genesis is built in only once a release pins it");
+assert.deepEqual(effectivePin(testnet, { chainId: "blockula-testnet", genesisHash: G2, prefix: "boo" }), { chainId: "blockula-testnet-2", genesisHash: builtIn, prefix: "tboo" });
+assert.deepEqual(effectivePin(testnet, { chainId: "blockula-testnet-2", genesisHash: G1, prefix: "tboo" }), { chainId: "blockula-testnet-2", genesisHash: builtIn ?? G1, prefix: "tboo" });
+if (builtIn) {
+  assert.match(builtIn, /^[0-9a-f]{64}$/);
+  assert.match(mismatch(testnet.pin, status("blockula-testnet-2", G1 === builtIn ? G2 : G1, "tboo")) ?? "", /genesis/, "a node on another instance of the testnet is refused");
+  assert.equal(mismatch(testnet.pin, status("blockula-testnet-2", builtIn, "tboo")), null);
+}
 const local = resolveNetwork({}, ["--network", "local"]);
 known.save(local, { chainId: "blockula-dev", genesisHash: G1 });
 assert.equal(known.get(local), undefined, "dev chains are re-pinned each session (a reset makes a new genesis)");
@@ -177,7 +185,50 @@ assert.equal(releaseKeyIdFrom(undefined, keyId), keyId);
 assert.equal(releaseKeyIdFrom(keyId, keyId), keyId);
 assert.throws(() => releaseKeyIdFrom("cd".repeat(32), keyId), /isn't BLOCKULA_RELEASE_KEY_ID/);
 assert.throws(() => releaseKeyIdFrom("abc", ""), /64 hex characters/);
-console.log(`✓ install_node: version binding, checksum, provenance and signature checks (${releaseRefusals.length} bad releases refused)`);
+// Audit review-r3-integrate-compose-1: the operator's pin (`blockula release install` writes
+// $BLOCKULA_HOME/release-key-id) binds install_node too, with release_cli.rs read_pin's rules.
+const pinDir = mkdtempSync(join(tmpdir(), "blockula-mcp-pin-"));
+const pinFile = join(pinDir, "release-key-id");
+assert.equal(readReleasePin(pinFile), null, "no pin");
+writeFileSync(pinFile, ` ${keyId.toUpperCase()}\n`);
+chmodSync(pinFile, 0o644);
+assert.equal(readReleasePin(pinFile), keyId);
+chmodSync(pinFile, 0o664);
+assert.throws(() => readReleasePin(pinFile), /writable by others/);
+chmodSync(pinFile, 0o644);
+writeFileSync(pinFile, "not a key id\n");
+assert.throws(() => readReleasePin(pinFile), /isn't a release key id pin/);
+// Every key id that's set must agree: the pin, BLOCKULA_RELEASE_KEY_ID and the built-in one.
+const otherId = "cd".repeat(32);
+assert.equal(releaseKeyIdFrom(undefined, "", keyId, pinFile), keyId);
+assert.equal(releaseKeyIdFrom(keyId, keyId, keyId, pinFile), keyId);
+assert.throws(() => releaseKeyIdFrom(otherId, "", keyId, pinFile), /pinned in .* is [0-9a-f]{64}, not BLOCKULA_RELEASE_KEY_ID/);
+assert.throws(() => releaseKeyIdFrom(undefined, otherId, keyId, pinFile), /built with release key [0-9a-f]{64}, but .* pins [0-9a-f]{64}/);
+// The finding's case: nothing built into this MCP, the operator pinned K, and GitHub serves a
+// release with provenance and no signature. Before, provenance alone installed it; now the pin
+// requires the signature.
+await assert.rejects(fetchVerifiedRelease(base, asset, opts(releaseKeyIdFrom(undefined, "", keyId, pinFile), false), deps({ ...files, "checksums.txt.sig": null }, "ok")), /no checksums.txt.sig/);
+await assert.rejects(fetchVerifiedRelease(base, asset, opts(releaseKeyIdFrom(undefined, "", keyId, pinFile), false), deps({ ...files, "checksums.txt.sig": sig(sums, other) }, "ok")), /signature check FAILED/);
+rmSync(pinDir, { recursive: true, force: true });
+// install_node's binary has a path of its own, never the one `blockula release install` writes.
+assert.notEqual(binPaths("/h").mcp, binPaths("/h").cli);
+assert.equal(binPaths("/h").cli, join("/h", "bin", "blockula"));
+// review-r4-supply-3: install_node's binary doesn't shadow a newer one `release install` put in
+// ~/.blockula/bin. The one of this MCP's version runs, `release install`'s first; else the first
+// that runs, flagged as another version.
+const cli = { path: "/h/bin/blockula", version: "blockula 0.6.0" };
+const mcpBin = { path: "/h/mcp-bin/blockula", version: "blockula 0.5.0" };
+assert.deepEqual(pickNodeBinary([cli, mcpBin], "0.6.0"), { ...cli, matches: true });
+assert.deepEqual(pickNodeBinary([cli, mcpBin], "0.5.0"), { ...mcpBin, matches: true });
+assert.deepEqual(pickNodeBinary([cli, { ...mcpBin, version: "blockula 0.6.0" }], "0.6.0"), { ...cli, matches: true }, "both match: the pinned-key-checked one");
+assert.deepEqual(pickNodeBinary([cli, mcpBin], "0.7.0"), { ...cli, matches: false });
+assert.deepEqual(pickNodeBinary([{ path: cli.path }, mcpBin], "0.7.0"), { ...mcpBin, matches: false }, "one that doesn't run comes last");
+assert.deepEqual(pickNodeBinary([], "0.6.0"), { path: "blockula", matches: false });
+// The built-in key id is the same in all three copies (release_cli.rs checks it too).
+const releaseKeyIn = (file: string, re: RegExp) => re.exec(readFileSync(new URL(file, import.meta.url), "utf8"))?.[1];
+assert.equal(releaseKeyIn("../../node/src/release_cli.rs", /^pub const BUILTIN_KEY_ID: &str = "([0-9a-f]*)";$/m), RELEASE_KEY_ID, "release_cli.rs BUILTIN_KEY_ID");
+assert.equal(releaseKeyIn("../../scripts/install.sh", /^BUILTIN_KEY_ID="([0-9a-f]*)"$/m), RELEASE_KEY_ID, "install.sh BUILTIN_KEY_ID");
+console.log(`✓ install_node: version binding, checksum, provenance and signature checks (${releaseRefusals.length} bad releases refused), the pinned key, its own install path`);
 
 // ---- 4. the server, over stdio, against a fake node ----
 

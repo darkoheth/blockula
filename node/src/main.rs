@@ -187,8 +187,9 @@ enum Cmd {
         /// Required unless this release knows the chain id
         #[arg(long)]
         genesis_hash: Option<String>,
-        /// Trusted checkpoint HEIGHT:HASH[:SET_HASH] (repeatable): snapshots and blocks that
-        /// contradict it are refused. Get one from sources you trust (`blockula checkpoint`)
+        /// Trusted checkpoint HEIGHT:HASH[:SET_HASH[:TIMESTAMP_MS]] (repeatable): snapshots and
+        /// blocks that contradict it are refused, and its age counts from its block's time. Get
+        /// one from sources you trust (`blockula checkpoint`)
         #[arg(long = "checkpoint", value_parser = checkpoints::Checkpoint::parse)]
         checkpoints: Vec<checkpoints::Checkpoint>,
         /// Sync even when the newest trusted checkpoint is older than the weak-subjectivity
@@ -198,8 +199,8 @@ enum Cmd {
         #[command(flatten)]
         net: Net,
     },
-    /// Print a checkpoint (HEIGHT:HASH:SET_HASH) that several nodes agree on, for `join
-    /// --checkpoint` and node/checkpoints/*.json; or, with --genesis, a genesis file's hash
+    /// Print a checkpoint (HEIGHT:HASH:SET_HASH:TIMESTAMP_MS) that several nodes agree on, for
+    /// `join --checkpoint` and node/checkpoints/*.json; or, with --genesis, a genesis file's hash
     Checkpoint {
         /// A node's HTTP URL (repeat it: ask nodes run by independent operators)
         #[arg(long = "peer", required_unless_present = "genesis")]
@@ -213,6 +214,9 @@ enum Cmd {
         /// Print the JSON entry for node/checkpoints/<chain id>.json
         #[arg(long)]
         json: bool,
+        /// Refuse unless the peers serve this genesis (hex): for a node whose genesis you hold
+        #[arg(long, conflicts_with = "genesis")]
+        genesis_hash: Option<String>,
     },
     /// A simple command-line wallet (key in ~/.blockula/wallet.json, mode 600)
     Wallet {
@@ -364,13 +368,18 @@ fn main() -> Result<()> {
             node::join(&genesis, &home, &pins, !net.full)?;
             node::run_full_node(home, net_opts(net, Some(port), None, false))
         }
-        Cmd::Checkpoint { peers, height, genesis, json } => {
+        Cmd::Checkpoint { peers, height, genesis, json, genesis_hash } => {
             if let Some(path) = genesis {
-                println!("{}", checkpoints::genesis_hash(&chain::Genesis::load(&path)?));
+                let g = chain::Genesis::load(&path)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&checkpoints::genesis_checkpoint(&g))?);
+                } else {
+                    println!("{}", checkpoints::genesis_hash(&g));
+                }
                 return Ok(());
             }
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            let (g, cp) = rt.block_on(checkpoints::fetch(&peers, height))?;
+            let (g, cp) = rt.block_on(checkpoints::fetch(&peers, height, genesis_hash.as_deref()))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&cp)?);
             } else {
