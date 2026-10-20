@@ -1,6 +1,12 @@
 # Programs: implementation plan
 
-Status: plan, 2026-10-19, against main at `2bbecde` (after v0.5.2). It turns the design in
+> **2026-10-20 — reoriented to a fast experiment track.** The goal is now to get programs
+> *running* on a throwaway v2 chain quickly, not shipped to mainnet. **Section 1A** is the current
+> plan. Sections 5–12 are the full production path (an 8-week soak, a format freeze, an audit gate,
+> the testnet-2 migration, mainnet); they're kept as reference and **deferred** — pursued only if
+> the experiment earns it. The C-/P-item details in those sections are reused by 1A.
+
+Status: plan, 2026-10-19 (reoriented 2026-10-20), against main at `2bbecde` (after v0.5.2). It turns the design in
 [PROGRAMS.md](PROGRAMS.md) (revision 3, 2026-10-19) into milestones and pull requests. The design
 says what to build. This plan says:
 - in what order to build it;
@@ -14,7 +20,85 @@ as v0.5.2's (`397061c`).
 
 ---
 
+## 1A. The fast experiment track (current goal, 2026-10-20)
+
+Blockula is an experiment, and the goal is reset: **get programs demonstrably running on a
+Blockula chain quickly.** Not mainnet. The full production path below (sections 6–9: M5–M6, the
+tooling lanes T3–T8, the testnet-2 upgrade, the audit-as-gate and mainnet) is **deferred**, kept as
+reference, and pursued only if the experiment earns it.
+
+**What "done" looks like.** On a `blockula dev` or `summon`ed chain — born at v2 with `programs`
+on — you can upload a program, create an instance, call it, have it hold and move FANG, and compose
+two programs in one atomic batch, all from the CLI, exercising the hand-written guests the spike
+already has (counter, token, escrow, router). That is milestones **M1–M3 on a dev chain**, and
+nothing more.
+
+**Why this is fast.** The 8–9-month calendar below is almost all mainnet gates: an 8-week public
+soak, a format freeze, a full audit close, the live testnet-2 migration, the training wheels. A
+dev/summoned chain is born at v2 and thrown away on breakage, so none of those apply. The engine
+spike (S1, `spike/programs-vm`) already runs the guests on soroban-wasmi; the work is wiring it into
+the node deterministically.
+
+**The item set** (reuses the C-/P-items in sections 5–6):
+
+| Keep — the irreducible core | Why |
+|---|---|
+| **D1 = soroban-wasmi, decided now** | Take the default (no crashes, audited lineage) and move; S4 keeps running as background diligence, not a gate. |
+| **C1, C2** | VM core, host ABI, exec, overlay — productionize the spike into the node. |
+| **C3, C4, C5** | Interface, tx tags 62–70, state/namespaces. Not frozen; they can still change. |
+| **C6 (sane, not floor-perfect)** | Fuel and fees good enough not to halt a dev chain. The calibrated schedule is deferred. |
+| **C7, C8, C9** | Upload/create, calls + commit + conservation, receipts. |
+| **C10** | Reads and the minimal `blockula program` CLI; `blockula dev` at v2. |
+| **P3** | The executor thread (the VM needs the 64 MiB stack). |
+| Version-gating (P7, done) | Keeps the door open to the production path later. |
+
+That is M1–M3. M2's value cap and M3's no-reentrancy / depth-8 / read-only-frame rules stay — they
+are correctness, not ceremony, and cheap.
+
+| Deferred for the experiment | What it was for |
+|---|---|
+| **M5** (C17 scoped keys, C18 pause / exit-only / freeze / cap) | Agent budgets and mainnet safety rails. |
+| **M6** (C19 worst-case gate, C20 soak, C21 mixed-binary) | Production hardening. |
+| **P2** (v1 replay gate), **P4** (replay cache), **P5** (lock), **P6** (`/api/simulate`) | v1-preservation and consensus perf; not needed on a dev-only chain under light load. |
+| **Phase 2 T3–T8** (full SDK / MCP / web / explorer / docs) | Keep only C10's CLI. Add `program-sdk` (T1/T2) only if hand-writing programs gets painful — the spike's guests already exist. |
+| **Phase 3** (O1–O8, the testnet-2 upgrade) | Skipped: use dev / summoned chains, not testnet-2. |
+| **Phase 4**, the audit *as a gate* | Keep the cheap per-PR Fable pass; drop the milestone and full audits as blockers. |
+| **Phase 5**, mainnet, the 8-week soak, the format freeze | Not a target. |
+
+**The boundary that keeps this safe.** The experiment binary runs v2 **only** on chains born at v2
+(`supported_version()` returns 2 for them, 1 for everything else — N2, section 4 rule 2). A public
+network's genesis can't schedule v2, so **nothing here reaches testnet-2 or mainnet by accident.**
+Do not ship the experiment binary as a testnet-2 release — that is the production path, and it needs
+P2, the gates and the audit first.
+
+**What you are consciously accepting:**
+- No audit, soak or hardening: a bug could halt or corrupt a dev chain, or be exploitable.
+  Acceptable because the chain is throwaway and holds no value — resummon on breakage.
+- A "good enough" fuel schedule: the first floor run (`docs/programs/phase0.md` §4.3) shows
+  schedule v1 is 2–10× off on cache-missing loads and instantiation, so an adversarial block can be
+  slow. Fine on a dev chain; the real schedule is production-path work.
+- No training wheels: no pause / exit / cap. Fine for a throwaway chain; add a dev kill-switch if
+  wanted.
+- Deferring P2: the version-gating isn't CI-proven against v1 history yet, so this binary stays
+  dev-only until the production path proves it.
+
+**Rough size.** ~M1–M3 scope: about 10 consensus PRs (C1–C10) plus P3 and a light CLI — a fraction
+of the full ~50-PR, 18–22-engineer-month plan. With soroban picked now, the spike reused, and the
+per-milestone audits and format-freeze ceremony dropped, this is weeks-to-a-small-number-of-months
+of focused work, depending on how much of section 4's per-PR rigor you keep. Determinism,
+conservation and the `catch_unwind` / executor-thread safety are **not** optional even on a dev
+chain — those stay.
+
+**Next step:** C1 (productionize the spike's VM into `node/vm`, wired behind the v2 gate), then C2;
+P3 can go in parallel. The spike is bundled at
+`~/conductor/archived-contexts/blockula/programs-s1/` and lives on local `spike/programs-vm`.
+
+---
+
 ## 1. Summary
+
+> Sections 1 and 5–12 describe the **full production path to mainnet**, deferred under the 1A
+> reorientation. They're the reference the experiment track draws its PR details from.
 
 - **Shape.** Seven stages:
   1. Decide six things now (section 3).
@@ -114,7 +198,9 @@ each correction):
 ### Settled by phase 0
 
 - **D1, the engine pin:** wasmi 2.0.x, soroban-wasmi 29.x or wasmi 0.38.0, chosen from the
-  measurements in S5's memo.
+  measurements in S5's memo. **For the experiment track (1A), D1 is decided now: soroban-wasmi
+  29.x** — S5's memo leans it, S1 found no crashes in it (it found three in wasmi 2.0), and its
+  line is audited. S4's fuzzing continues as diligence, not a gate.
 - **D3 changes the default.** The design picked wasmi 2.0 on the condition that it got a scoped
   external review, with soroban-wasmi as the fallback otherwise. With no external review,
   **soroban-wasmi 29.x is now the default.** It's the engine a production chain runs today, and
@@ -258,6 +344,9 @@ version becomes unadmittable. The authority renounces, and an empty program clos
 | **C15** | **Upgrades and authority:** `UpgradeProgram`; `ProgramAdmin`; `in_force` and `fold`; `PROGRAM_DUE` and folding in `end_block`; the `Additive` check |
 | **C16** | **Removal:** `CloseProgram`, which leaves a tombstone that nothing anywhere can credit; `RemoveCode`, once its refs are 0 and its 1-day delay has passed |
 
+> **Deferred for the experiment (1A).** M5 and M6 are production hardening, not needed to run
+> programs on a dev chain.
+
 ### M5: agents and training wheels
 
 **Demo:**
@@ -289,6 +378,9 @@ Tag that commit. After it, a format changes only with a new protocol version.
 
 ---
 
+> **Deferred for the experiment (1A), except C10's minimal CLI.** T1/T2 (`program-sdk` and
+> templates) only if hand-writing guests gets painful.
+
 ## 7. Phase 2: tooling (January to June 2027, parallel lanes)
 
 | Lane | What | Can start after |
@@ -310,6 +402,9 @@ Tag that commit. After it, a format changes only with a new protocol version.
 
 ---
 
+> **Deferred for the experiment (1A).** The experiment runs on dev / summoned chains, never
+> testnet-2.
+
 ## 8. Phase 3: the testnet-2 upgrade (about June to August 2027)
 
 | Step | What | Who |
@@ -329,6 +424,9 @@ Tag that commit. After it, a format changes only with a new protocol version.
 - no open high finding.
 
 ---
+
+> **Deferred for the experiment (1A).** Keep the cheap per-PR Fable review; the milestone and
+> full audits, the 8-week soak and mainnet are the production path.
 
 ## 9. Phases 4 and 5
 
@@ -382,6 +480,9 @@ blind spots. It runs at three levels.
 
 ## 10. Schedule
 
+> **The production-path calendar (deferred, 1A).** The experiment track has no 8-week soak,
+> freeze or audit gate, so it isn't bound by these dates.
+
 | When | What |
 |---|---|
 | 2026-10-19 | Decisions made (section 3). P0's archive running |
@@ -415,11 +516,19 @@ PRs and one approver.
 
 ---
 
-## 12. First steps
+## 12. First steps (the experiment track, 1A)
 
-1. ~~Decide N1–N4, D2 and D3~~ (done, section 3).
-2. ~~P0: archive testnet-2's history~~ (done).
-3. P1: land PROGRAMS.md revision 3 and this plan in `docs/`, together with
-   `scripts/archive-chain.mjs`. Revision 3 records D2 and D3 and updates LAUNCH-PLAN.md's
-   "separate VM/host-interface audit" to match.
-4. Start S1 (soroban-wasmi and wasmi 2.0 side by side) and P7 in parallel.
+Done: P0, P1 (#45), P7 (#46); S1 (the spike: soroban-wasmi + wasmi 2.0 + 0.38), S3's first floor
+run (phase0.md §4.3), S4's fuzz targets; **D1 decided: soroban-wasmi 29.x**.
+
+1. **C1** — productionize the spike's VM into `node/vm` wired behind the v2 gate: engine
+   configuration, upload validation, the versioned fuel schedule, the per-block engine. Pin
+   soroban-wasmi 29.x.
+2. **C2** — host ABI v1 and execution (frames, meter, overlay) on `MemHost`, then over `&State`.
+3. **P3** — the executor thread (in parallel; the VM needs the 64 MiB stack).
+4. **C3–C10** — interface and tx formats (not frozen), state/namespaces, a sane fuel schedule,
+   upload/create, calls + commit, receipts, and the minimal `blockula program` CLI — ending in the
+   **M1 demo on `blockula dev`**, then M2 (programs hold FANG) and M3 (programs compose).
+
+Target: the four hand-written guests running on a `blockula dev` / `summon`ed v2 chain, from the
+CLI. Stop there — the production path (sections 5–9) is deferred (1A).
