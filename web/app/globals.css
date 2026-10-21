@@ -234,7 +234,7 @@ input.mono { font-family: var(--mono); font-size: 16px; }
 .steps li::marker { font-family: var(--display); color: var(--blood); }
 .code { font-family: var(--mono); font-weight: 700; font-size: 28px; letter-spacing: 3px; color: var(--blood); }
 .code.inline { font-size: inherit; letter-spacing: 1px; }
-.snippet { background: var(--paper-hi); border: 1px solid var(--ink); padding: 14px; font-size: 14px; white-space: pre-wrap; margin: 0; font-family: var(--mono); }
+.snippet { background: var(--paper-hi); border: 1px solid var(--ink); padding: 14px; font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; font-family: var(--mono); }
 .kv { display: grid; grid-template-columns: 130px 1fr; gap: 10px 14px; margin: 0; }
 .kv dt { font: 400 16px/1.7 var(--caps); letter-spacing: 0.06em; color: var(--dim); }
 .kv dd { margin: 0; word-break: break-word; }
