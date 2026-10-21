@@ -63,7 +63,8 @@ function Program() {
                     <span className="title">{a.title}</span>
                     <span className="sig">{a.kind}</span>
                   </summary>
-                  <ActionForm spec={a} initial={open === actionId(a) ? initial : {}} />
+                  {/* Reset fields and previews for a new prefill, not reordered/unrelated URL params. */}
+                  <ActionForm key={JSON.stringify(a.params.map(({ key }) => open === actionId(a) ? initial[key] : null))} spec={a} initial={open === actionId(a) ? initial : {}} />
                 </details>
               ))}
               {p.elsewhere && <p className="card-note">{p.elsewhere}</p>}
