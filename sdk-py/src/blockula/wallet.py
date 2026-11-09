@@ -1,4 +1,4 @@
-"""Seeded ML-DSA-65 wallets for local/testnet development; no seed persistence."""
+"""Seeded ML-DSA-65 wallets for development; no seed persistence."""
 from copy import deepcopy
 import secrets
 import threading

@@ -27,16 +27,16 @@ Reads: `status()`, `account(address_or_name)`, `name(name)`, `tx(id)`,
 `Wallet.from_seed(bytes_or_hex, client)` derives the same key/address as the
 TS SDK. The SDK never saves seeds or reads an existing wallet file.
 
-Amounts are **decimal strings in FANG**, or **integer drops** (1 FANG =
-1,000,000,000 drops). Floats and bools are refused. `send()` resolves an active
+Amounts are **decimal strings** in the chain's coin (FANG unless the chain
+names its own ticker), or **integer drops** (1 coin = 1,000,000,000 drops). Floats and bools are refused. `send()` resolves an active
 name and signs its owner's address, never a guessed or unchecked raw string.
 The resolved address is one RPC's word, not an independently verified proof.
 
 The client pins the first observed chain id, genesis hash and address prefix
 for its lifetime. Supply `chain_id=`, `genesis_hash=` and `prefix=` to pin them
-before the first request. Reads support mainnet, but this minimal wallet
-deliberately refuses **online mainnet signing** until it has the witness/clock
-checks of the TS SDK. Only `transfer` and `register_name` can be encoded/signed;
+before the first request. It has no witness or state-proof checks yet (the TS
+SDK's `witnesses`), so names and heights are the one node's word: point it at a
+node you run or trust. Only `transfer` and `register_name` can be encoded/signed;
 other action types raise `ValueError`. This is not a full TS SDK port.
 
 Signing uses hedged ML-DSA by default. `sign(tx, deterministic=True)` is for
@@ -60,7 +60,7 @@ applications using the same nonce must coordinate their outstanding txs.
 python -m pip install ./sdk-py
 python -m unittest discover -s sdk-py/tests -v
 BLOCKULA_RPC=http://127.0.0.1:7070 python sdk-py/tests/e2e.py
-# Or launch and stop a disposable dev node automatically:
+# Or start and stop a throwaway dev node automatically:
 BIN=node/target/release/blockula bash sdk-py/tests/local-e2e.sh
 ```
 
