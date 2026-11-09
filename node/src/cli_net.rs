@@ -3,8 +3,9 @@
 //! `known-chains.json`:
 //!
 //! * `--network mainnet|testnet|local|custom` (or `BLOCKULA_NETWORK`) says which network you mean.
-//!   Without it, it's read from `--rpc`: the public testnet's URL is `testnet`, this machine is
-//!   `local`, anything else `custom`. `mainnet` and `testnet` pin their chain id and prefix.
+//!   Without it, it's read from `--rpc`: this machine is `local`, anything else `custom`. `mainnet`
+//!   and `testnet` pin their chain id and prefix. Neither has a public node built in (the public
+//!   testnet was retired in November 2026): `--rpc` names one.
 //! * `--chain-id` and `--genesis-hash` (or `BLOCKULA_CHAIN_ID`, `BLOCKULA_GENESIS_HASH`) pin them
 //!   for any node. A chain id this release knows (`node/checkpoints/`) must come with its genesis.
 //! * What isn't pinned is pinned by the first status the node reports (trust on first use) and,
@@ -35,9 +36,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// The public testnet's node (as in the MCP).
-pub const TESTNET_RPC: &str = "https://blockula-testnet.fly.dev";
-/// The public testnet's chain id (deploy/launch.sh; never reused, DEC-7).
+/// The testnet's chain id (deploy/launch.sh; never reused, DEC-7). Its public node was retired in
+/// November 2026, so no URL is built in: `--network testnet` pins the chain of the node `--rpc` names.
 pub const TESTNET_CHAIN_ID: &str = "blockula-testnet-2";
 /// Where pins are remembered, in the blockula directory (shared with the MCP).
 pub const KNOWN_CHAINS_FILE: &str = "known-chains.json";
@@ -121,7 +121,9 @@ fn is_local(u: &reqwest::Url) -> bool {
 fn is_private(u: &reqwest::Url) -> bool {
     let h = host(u);
     let second = |p: &str| h.strip_prefix(p).and_then(|r| r.split('.').next()).and_then(|o| o.parse::<u8>().ok());
-    is_local(u) || h.starts_with("10.") || h.starts_with("192.168.") || second("172.").is_some_and(|o| (16..=31).contains(&o)) || [".internal", ".local", ".lan"].iter().any(|s| h.ends_with(s))
+    // 100.64.0.0/10 and `.ts.net` are Tailscale's: WireGuard-encrypted, tailnet members only.
+    let tailscale = second("100.").is_some_and(|o| (64..=127).contains(&o));
+    is_local(u) || h.starts_with("10.") || h.starts_with("192.168.") || second("172.").is_some_and(|o| (16..=31).contains(&o)) || tailscale || [".internal", ".local", ".lan", ".ts.net"].iter().any(|s| h.ends_with(s))
 }
 
 /// A node URL: http(s) without credentials, plain http only on this machine or a private
@@ -150,7 +152,6 @@ pub fn resolve(rpc: &str, args: &ChainPin) -> Result<Network> {
             "custom" => NetKey::Custom,
             _ => bail!("unknown network {n:?} (mainnet, testnet, local or custom)"),
         },
-        None if rpc == TESTNET_RPC => NetKey::Testnet,
         None if is_local(&url) => NetKey::Local,
         None => NetKey::Custom,
     };
@@ -187,7 +188,7 @@ pub fn mismatch(pin: &Pin, status: &Value) -> Option<String> {
     match pin.chain_id.as_deref() {
         Some(want) if want != chain_id => return Some(format!("the node is on chain `{chain_id}`, not `{want}`")),
         None if chain_id == MAINNET_CHAIN_ID => {
-            return Some(format!("the node is on mainnet (`{MAINNET_CHAIN_ID}`, real FANG), and this command wasn't told to use mainnet. Pass --network mainnet if that's what you mean"));
+            return Some(format!("the node is on mainnet (`{MAINNET_CHAIN_ID}`), and this command wasn't told to use mainnet. Pass --network mainnet if that's what you mean"));
         }
         _ => {}
     }
@@ -308,6 +309,7 @@ impl Remote {
             };
             bail!("Refusing {} ({} network): {why}. Nothing was signed or sent.{fix}", net.rpc, net.key.name());
         }
+        crate::types::set_display_unit(status["token"].as_str().unwrap_or_default());
         let full = complete_pin(&pin, &status);
         let (Some(chain_id), Some(genesis_hash)) = (full.chain_id.clone(), full.genesis_hash.clone()) else {
             bail!("{} didn't report its chain id and genesis hash; nothing was signed", net.rpc);
@@ -444,6 +446,39 @@ pub fn account_ref(who: &str) -> Result<String> {
     Ok(name)
 }
 
+// -------------------------------------------------------------------------------------- words
+
+/// What `wallet new` prints with every new key.
+pub const UNRECOVERABLE_KEY: &str = "Nobody, Blockula included, can recover this key.";
+
+/// `blocks` of `block_time_ms` each, in words: "21 days", "36 hours", "5 minutes" (rounded down,
+/// at least one of the unit).
+pub fn span_words(blocks: u64, block_time_ms: u64) -> String {
+    let secs = blocks.saturating_mul(block_time_ms) / 1000;
+    let (n, unit) = if secs >= 2 * 86_400 {
+        (secs / 86_400, "day")
+    } else if secs >= 2 * 3_600 {
+        (secs / 3_600, "hour")
+    } else {
+        ((secs / 60).max(1), "minute")
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+#[cfg(test)]
+mod words {
+    use super::span_words;
+
+    #[test]
+    fn spans_read_in_whole_units() {
+        assert_eq!(span_words(21 * 86_400, 1000), "21 days");
+        assert_eq!(span_words(36 * 3600, 1000), "36 hours");
+        assert_eq!(span_words(300, 1000), "5 minutes");
+        assert_eq!(span_words(1, 1000), "1 minute");
+        assert_eq!(span_words(86_400 / 2, 2000), "24 hours");
+    }
+}
+
 #[cfg(test)]
 mod account_refs {
     #[test]
@@ -474,10 +509,22 @@ mod tests {
     }
 
     #[test]
+    fn plain_http_reaches_private_networks_and_tailscale_only() {
+        for ok in ["http://localhost:7070", "http://192.168.1.20:7070", "http://10.0.0.5:7070", "http://172.20.0.2:7070", "http://100.64.0.7:7070", "http://100.127.255.254:7070", "http://jacks-mac.tail1234.ts.net:7070", "http://box.lan:7070"] {
+            assert!(check_rpc_url(ok).is_ok(), "{ok}");
+        }
+        for no in ["http://100.63.0.1:7070", "http://100.128.0.1:7070", "http://8.8.8.8:7070", "http://rpc.example:7070", "http://ts.net.example:7070"] {
+            assert!(check_rpc_url(no).is_err(), "{no}");
+        }
+    }
+
+    #[test]
     fn the_network_comes_from_the_flags_or_the_url_and_contradictions_are_errors() {
         let none = ChainPin::default();
-        let net = resolve("https://blockula-testnet.fly.dev/", &none).unwrap();
-        assert_eq!((net.key, net.rpc.as_str(), net.pin.chain_id.as_deref(), net.pin.prefix.as_deref()), (NetKey::Testnet, TESTNET_RPC, Some(TESTNET_CHAIN_ID), Some("tboo")));
+        // The retired public testnet's URL is no longer read as the testnet: --network says so.
+        assert_eq!(resolve("https://blockula-testnet.fly.dev/", &none).unwrap().key, NetKey::Custom);
+        let net = resolve("https://rpc.example/", &pin(Some("testnet"), None, None)).unwrap();
+        assert_eq!((net.key, net.rpc.as_str(), net.pin.chain_id.as_deref(), net.pin.prefix.as_deref()), (NetKey::Testnet, "https://rpc.example", Some(TESTNET_CHAIN_ID), Some("tboo")));
         let local = resolve("http://localhost:7070", &none).unwrap();
         assert_eq!((local.key, local.remember, local.pin.clone()), (NetKey::Local, false, Pin::default()));
         assert_eq!(resolve("https://rpc.example", &none).unwrap().key, NetKey::Custom);
@@ -506,7 +553,7 @@ mod tests {
             let why = mismatch(&effective_pin(&net, None), &mainnet).expect("refused");
             assert!(why.contains("--network mainnet"), "{why}");
         }
-        assert!(mismatch(&resolve(TESTNET_RPC, &ChainPin::default()).unwrap().pin, &mainnet).unwrap().contains("not `blockula-testnet-2`"));
+        assert!(mismatch(&resolve("https://rpc.example", &pin(Some("testnet"), None, None)).unwrap().pin, &mainnet).unwrap().contains("not `blockula-testnet-2`"));
         // Asked for: fine (its genesis pinned on first use until a release builds it in).
         let asked = resolve("https://rpc.example", &pin(Some("mainnet"), None, None)).unwrap();
         assert_eq!(mismatch(&asked.pin, &mainnet), None);
@@ -526,7 +573,7 @@ mod tests {
         // First use fills what wasn't pinned; remembered pins fill a network's gaps, but never
         // override it, and a relaunched network's old chain is ignored.
         // (The testnet's genesis is built in once a release pins it, scripts/pin-network.sh.)
-        let net = resolve(TESTNET_RPC, &ChainPin::default()).unwrap();
+        let net = resolve("http://127.0.0.1:7171", &pin(Some("testnet"), None, None)).unwrap();
         let g = known_genesis(TESTNET_CHAIN_ID).unwrap_or(g);
         assert_eq!(net.pin.genesis_hash, known_genesis(TESTNET_CHAIN_ID));
         let first = complete_pin(&net.pin, &status(TESTNET_CHAIN_ID, &g, "tboo"));
@@ -541,9 +588,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("blockula-known-{}-{}", crate::chain::now_ms(), std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // An entry the MCP wrote (its format), which the CLI reads and keeps.
-        std::fs::write(dir.join(KNOWN_CHAINS_FILE), r#"{"testnet https://blockula-testnet.fly.dev":{"chainId":"blockula-testnet-2","genesisHash":"aa","prefix":"tboo"}}"#).unwrap();
+        std::fs::write(dir.join(KNOWN_CHAINS_FILE), r#"{"testnet https://testnet-node.example":{"chainId":"blockula-testnet-2","genesisHash":"aa","prefix":"tboo"}}"#).unwrap();
         let known = KnownChains::in_dir(&dir);
-        let testnet = resolve(TESTNET_RPC, &ChainPin::default()).unwrap();
+        let testnet = resolve("https://testnet-node.example", &pin(Some("testnet"), None, None)).unwrap();
         assert_eq!(known.get(&testnet).unwrap().unwrap().genesis_hash.as_deref(), Some("aa"));
         let custom = resolve("https://rpc.example", &ChainPin::default()).unwrap();
         let p = Pin { chain_id: Some("c".into()), genesis_hash: Some("bb".into()), prefix: Some("boo".into()) };
@@ -622,7 +669,7 @@ mod tests {
         });
         let dir = root.join("cli");
         wallet(WalletCmd::New { rpc: None, prefix: None }, &dir).unwrap();
-        wallet(WalletCmd::Faucet { rpc: honest.clone() }, &dir).unwrap();
+        wallet(WalletCmd::Faucet { rpc: honest.clone(), to: None }, &dir).unwrap();
         let me = crate::validator_cli::wallet_keys(&dir).unwrap().address();
         for _ in 0..100 {
             if chain.lock().state.account(&me).balance > 0 {
@@ -631,7 +678,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let bob = Keys::from_seed([9; 32]).address();
-        let send = |rpc: &str, pin: ChainPin| wallet(WalletCmd::Send { to: bob.clone(), amount: "1".into(), memo: String::new(), rpc: rpc.into(), pin }, &dir);
+        let send = |rpc: &str, pin: ChainPin| wallet(WalletCmd::Send { to: bob.clone(), amount: "1".into(), memo: String::new(), rpc: rpc.into(), key: None, pin }, &dir);
         // The honest local node: signed and finalized.
         send(&honest, ChainPin::default()).unwrap();
         assert_eq!(chain.lock().state.account(&bob).balance, DROPS);
@@ -745,7 +792,7 @@ mod tests {
         });
         let dir = root.join("cli");
         wallet(WalletCmd::New { rpc: None, prefix: None }, &dir).unwrap();
-        wallet(WalletCmd::Faucet { rpc: honest.clone() }, &dir).unwrap();
+        wallet(WalletCmd::Faucet { rpc: honest.clone(), to: None }, &dir).unwrap();
         let me = crate::validator_cli::wallet_keys(&dir).unwrap().address();
         for _ in 0..100 {
             if chain.lock().state.account(&me).balance > 0 {
@@ -776,7 +823,7 @@ mod tests {
         }));
         let signer = crate::contrib_cli::Signer { key: None, from: None, rpc: node.clone(), pin: ChainPin::default() };
         // A send to a name: the name is what's signed (here nobody owns it, so the chain refuses it).
-        let err = wallet(WalletCmd::Send { to: "Count.boo".into(), amount: "1".into(), memo: String::new(), rpc: node.clone(), pin: ChainPin::default() }, &dir).unwrap_err().to_string();
+        let err = wallet(WalletCmd::Send { to: "Count.boo".into(), amount: "1".into(), memo: String::new(), rpc: node.clone(), key: None, pin: ChainPin::default() }, &dir).unwrap_err().to_string();
         assert!(err.contains("no one has claimed count.boo"), "{err}");
         assert!(posted.lock().iter().all(|t| t["action"]["to"] != mallory.as_str()), "the node's answer for the name was never signed");
         assert_eq!(posted.lock().last().unwrap()["action"]["to"], "count.boo");
@@ -869,7 +916,7 @@ mod tests {
         });
         let dir = root.join("cli");
         wallet(WalletCmd::New { rpc: None, prefix: None }, &dir).unwrap();
-        wallet(WalletCmd::Faucet { rpc: honest.clone() }, &dir).unwrap();
+        wallet(WalletCmd::Faucet { rpc: honest.clone(), to: None }, &dir).unwrap();
         let me_keys = crate::validator_cli::wallet_keys(&dir).unwrap();
         let me = me_keys.address();
         for _ in 0..100 {

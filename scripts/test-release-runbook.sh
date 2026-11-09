@@ -13,6 +13,13 @@
 # Every block is also run with its `( set -euo pipefail … )` taken off, against an attack it
 # refuses: the run must then fail open (a later step runs after a failed one), which proves the
 # test would catch a block written without stop-on-failure.
+#
+# The genuine releases are signed with the test release key (seed 0x5e × 32, published, so never
+# a real key), and the `blockula` must be built to trust it (`--features test-release-key`,
+# node/src/release_cli.rs): that's what a first install's binary does with the real key once the
+# key ceremony builds it in, so these cases pass the same before and after it (audit
+# review-r4-supply-1), and the ceremony's change to the built-in key id leaves this test green.
+#   cargo build --release --locked --manifest-path node/Cargo.toml --features test-release-key
 #   BLOCKULA_BIN=node/target/release/blockula bash scripts/test-release-runbook.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -94,13 +101,21 @@ chmod +x "$T/bin/"*
 ROOTFS=$T/root # stands in for / : usr/local/bin and var/lib/blockula
 PATH_RUN="$T/bin:$ROOTFS/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-"$BIN" keygen > "$T/release-key.json" 2> /dev/null
+# The release key: the test key the binary was built to trust (a bare hex seed is a key file).
+TEST_SEED=$(printf '5e%.0s' $(seq 32))
+printf '%s\n' "$TEST_SEED" > "$T/release-key.json"
 "$BIN" keygen > "$T/attacker-key.json" 2> /dev/null
 "$BIN" keygen > "$T/new-key.json" 2> /dev/null
 K=$("$BIN" release keyid --key "$T/release-key.json")
 AK=$("$BIN" release keyid --key "$T/attacker-key.json")
 NK=$("$BIN" release keyid --key "$T/new-key.json")
 [[ $K =~ ^[0-9a-f]{64}$ ]] || fail "release keyid printed '$K'"
+# The binary must trust the test key as its built-in one: a first pin of another key id is
+# refused naming K (an empty built-in key id would pin anything, and a real one refuses K).
+if "$BIN" release pin --key-id "$AK" --pin-file "$T/probe-pin" > "$T/probe" 2>&1 || ! grep -qF "built with release key $K, and you gave $AK" "$T/probe"; then
+  fail "$BIN wasn't built with the test release key $K: cargo build --release --locked --manifest-path node/Cargo.toml --features test-release-key ($(head -n 1 "$T/probe"))"
+fi
+ok "$BIN trusts the test release key as its built-in one (--features test-release-key)"
 
 # wrapper VERSION: a `blockula` that reports VERSION and is the real binary otherwise.
 wrapper() { printf '#!/bin/sh\nif [ "$1" = --version ]; then echo "blockula %s"; exit 0; fi\nexec "%s" "$@"\n' "$1" "$BIN"; }
@@ -119,7 +134,7 @@ release() {
     tar -czf "$dir/blockula-$t.tar.gz" -C "$T/stage" "blockula-$t"
   done
   printf '#!/bin/sh\ntouch "%s/INSTALL_SH_RAN"\n' "$T" > "$dir/install.sh"
-  echo '{"chain_id":"blockula-1"}' > "$dir/genesis-blockula-1.json"
+  echo '{"chain_id":"blockula-testnet-2"}' > "$dir/genesis-blockula-testnet-2.json"
   scripts/release-checksums.sh "$tag" "$dir" > /dev/null
   "$BIN" release sign --key "$key" "$dir/checksums.txt" > "$dir/checksums.txt.sig" 2> /dev/null
 }
@@ -196,8 +211,16 @@ machine fresh && MIRROR=$GENUINE
 env -i PATH="$PATH_RUN" sh -c 'command -v blockula' > /dev/null && fail "the fresh host has a blockula on PATH"
 expect first-install "installed blockula 9.9.9" "the genuine release on a fresh host"
 [ "$(cat "$T/home/.blockula/release-key-id")" = "$K" ] || fail "the first install didn't pin K"
-grep -qF "release key $K (given; pinned once this release verifies)" "$T/out" || fail "the first install didn't check the signature: $(cat "$T/out")"
+grep -qF "release key $K (given, and built into this blockula; pinned once this release verifies)" "$T/out" || fail "the first install didn't check the signature: $(cat "$T/out")"
 ok "first-install pinned the release key id it was given"
+# The genuine archive, but the key id given (from docs a compromised GitHub account edited) isn't
+# the one the binary was built with: refused before anything is pinned (review-r3-supply-4).
+machine fresh && MIRROR=$GENUINE
+GOOD_K=$K && K=$AK
+expect first-install refused "the genuine archive with another key id given than the one it was built with"
+K=$GOOD_K
+grep -qF "this blockula was built with release key $K, and you gave $AK" "$T/out" || fail "refused for another reason: $(cat "$T/out")"
+[ ! -e "$T/home/.blockula/release-key-id" ] || fail "a refused first install pinned a key"
 # GitHub serves the attacker's archive (re-signed checksums, its provenance): the announcement stops it.
 EVIL=$T/evil && release "$EVIL" v9.9.9 "$T/attacker-key.json" attacker
 machine fresh && MIRROR=$EVIL
@@ -292,7 +315,7 @@ fi
 
 # ---- the emergency patch (built in the private fork: no attestation; review-r2-supply-3) ----
 TAG=v9.9.11
-PATCH=$T/patch && release "$PATCH" v9.9.11 "$T/release-key.json" && rm "$PATCH/install.sh" "$PATCH/genesis-blockula-1.json"
+PATCH=$T/patch && release "$PATCH" v9.9.11 "$T/release-key.json" && rm "$PATCH/install.sh" "$PATCH/genesis-blockula-testnet-2.json"
 rm "$PATCH/checksums.txt" && scripts/release-checksums.sh v9.9.11 "$PATCH" > /dev/null && "$BIN" release sign --key "$T/release-key.json" "$PATCH/checksums.txt" > "$PATCH/checksums.txt.sig" 2> /dev/null
 machine 9.9.10 && MIRROR=$T/empty && mkdir -p "$MIRROR"
 FAKE_ATTEST=none expect patch-install "installed blockula 9.9.11" "a signed patch with a logged-in gh and no attestation"
@@ -307,13 +330,13 @@ FAKE_ATTEST=none fails_open patch-install "a patch signed by another key"
 TAG=v9.9.10
 machine 9.9.10 && MIRROR=$NEXT
 expect validator-genesis "installed blockula 9.9.10" "the release's genesis file"
-cmp -s "$ROOTFS/var/lib/blockula/genesis-blockula-1.json" "$NEXT/genesis-blockula-1.json" || fail "the genesis file wasn't installed"
-grep -qF -- "-u blockula $ROOTFS/usr/local/bin/blockula validator init --home $ROOTFS/var/lib/blockula/val --genesis $ROOTFS/var/lib/blockula/genesis-blockula-1.json" "$T/sudo.log" || fail "validator init didn't get the verified genesis file: $(cat "$T/sudo.log")"
+cmp -s "$ROOTFS/var/lib/blockula/genesis-blockula-testnet-2.json" "$NEXT/genesis-blockula-testnet-2.json" || fail "the genesis file wasn't installed"
+grep -qF -- "-u blockula $ROOTFS/usr/local/bin/blockula validator init --home $ROOTFS/var/lib/blockula/val --genesis $ROOTFS/var/lib/blockula/genesis-blockula-testnet-2.json" "$T/sudo.log" || fail "validator init didn't get the verified genesis file: $(cat "$T/sudo.log")"
 ok "validator-genesis: validator init got the verified genesis file"
-BADGEN=$T/badgenesis && release "$BADGEN" v9.9.10 "$T/release-key.json" && echo '{"chain_id":"evil"}' > "$BADGEN/genesis-blockula-1.json"
+BADGEN=$T/badgenesis && release "$BADGEN" v9.9.10 "$T/release-key.json" && echo '{"chain_id":"evil"}' > "$BADGEN/genesis-blockula-testnet-2.json"
 machine 9.9.10 && MIRROR=$BADGEN
 expect validator-genesis refused "a genesis file that isn't the signed one"
-[ ! -e "$ROOTFS/var/lib/blockula/genesis-blockula-1.json" ] || fail "the swapped genesis file was installed"
+[ ! -e "$ROOTFS/var/lib/blockula/genesis-blockula-testnet-2.json" ] || fail "the swapped genesis file was installed"
 fails_open validator-genesis "a swapped genesis file"
 
 # ---- moving the pin to a new release key ----

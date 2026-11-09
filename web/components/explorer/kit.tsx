@@ -4,11 +4,14 @@ import "@/app/explorer.css";
 import Link from "next/link";
 import { useEffect, useState, type ReactNode } from "react";
 import { Copy } from "@/components/ui";
+import { unreachableHint } from "@/lib/errors";
 import { GLOSSARY, type TermKey } from "@/lib/explorer/glossary";
+import { inertText } from "@/lib/explorer/inert";
 import { compactDrops, formatDrops, parseDrops, type Holding, type Me } from "@/lib/explorer/ledger";
 import { to } from "@/lib/explorer/routes";
 import type { KeyView, Label } from "@/lib/types";
 import { useWallet } from "@/lib/wallet";
+import { chainUnit } from "@/lib/format";
 
 /**
  * Who "you" are, for writing pages from your side. Known from the unlocked account, or from the
@@ -107,7 +110,7 @@ export function Amount({ drops, signed = false, unit = true, exact = false, clas
     <span className={`amt ${signed ? "signed" : ""} ${className}`} title={formatDrops(d)}>
       {sign}
       {exact ? formatDrops(abs, "") : compactDrops(abs)}
-      {unit && <small>FANG</small>}
+      {unit && <small>{chainUnit()}</small>}
     </span>
   );
 }
@@ -187,7 +190,7 @@ export function NotFound({ what, error }: { what: string; error: Error }) {
         <span className="eyebrow">{unreachable ? "The node is silent" : "Nothing here"}</span>
         <h1>{unreachable ? "Can't reach the node" : `No such ${what}`}</h1>
         <p className="dim">
-          {unreachable ? "The network picked at the top isn't answering. Try another, or start a local node with `blockula dev`." : `${error.message}. It may be on another network: check the one picked at the top.`}
+          {unreachable ? `The network picked at the top isn't answering. ${unreachableHint()}` : `${error.message}. It may be on another network: check the one picked at the top.`}
         </p>
         <Link href={to.explore()}>Back to the explorer</Link>
       </section>
@@ -226,6 +229,14 @@ export function Ext({ href, children, className }: { href: string | null | undef
 export function github(repo: string, kind: "issues" | "pull", n: number | null | undefined): string | null {
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || !Number.isSafeInteger(n) || (n as number) < 0) return null;
   return `https://github.com/${repo.split("/").map(encodeURIComponent).join("/")}/${kind}/${n}`;
+}
+
+/**
+ * Text a program or its deployer chose (a method's, an argument's or an event's name, an abort message), shown as
+ * text in a box of its own: what hides or reorders text removed, cut short. Never in the explorer's own words.
+ */
+export function Named({ text, max = 64 }: { text: unknown; max?: number }) {
+  return <code className="named">{inertText(text, max)}</code>;
 }
 
 export const plural = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString("en-US")} ${n === 1 ? one : many}`;

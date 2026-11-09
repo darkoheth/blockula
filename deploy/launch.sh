@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 🧛 Launches (or upgrades) a protocol v1 public testnet on Fly.io. Safe to re-run.
+# 🧛 Launches (or upgrades) a protocol v1 testnet on Fly.io. Safe to re-run. It launched
+# blockula-testnet-2, the public testnet until November 2026; a new launch takes a new CHAIN_ID.
 #   N validator apps: own dedicated IPv4 (p2p only) + volume each (scheduled snapshots off: a
 #     restored validator volume can double-sign), spread across regions
 #   1 public full node app with HTTPS at https://$RPC_APP.fly.dev: the API, the explorer, and the
@@ -13,7 +14,7 @@
 # under ~/.config/blockula/$CHAIN_ID (mode 700): consensus keys are uploaded only to their
 # validator, seeded onto its volume on first boot, then deleted from Fly; owner, founder, grant
 # and stand-in juror keys never leave this machine. (A public testnet is still one
-# operator's machines; independent operators come with the incentivized testnet, OPS-1.)
+# operator's machines; independent operators make their own keys: docs/GENESIS_CEREMONY.md.)
 #
 #   deploy/launch.sh                  launch, or upgrade the nodes of, $CHAIN_ID
 #   GENESIS_ONLY=1 deploy/launch.sh   rehearsal: only build keys, operator files, spec and genesis
@@ -38,10 +39,10 @@ EPOCH_BLOCKS=${EPOCH_BLOCKS:-3600}      # 1-hour epochs at 1 s blocks (DEC-12)
 DAY=86400                               # blocks a day at 1 s blocks
 FAUCET_FANG=${FAUCET_FANG:-2500000}     # per validator's consensus-key account (drips + fees)
 SELF_BOND=${SELF_BOND:-10000}           # FANG each owner bonds (the default min_self_bond)
-# Unbonding, and the evidence window with it: a week (mainnet: 21 days), so the weak-subjectivity
+# Unbonding, and the evidence window with it: a week (the default: 21 days), so the weak-subjectivity
 # period (half the evidence window) is 3.5 days, not hours, and unbonding is still a week's
 # exercise. Below governance's 14-day floor on the evidence window, which a vote then can't lower
-# further but can raise (params.rs `governance_band`; mainnet's genesis must start inside it).
+# further but can raise (params.rs `governance_band`; a blockula-1 genesis must start inside it).
 UNBONDING_BLOCKS=${UNBONDING_BLOCKS:-$((7 * DAY))}
 # The contribution pool, open from genesis.
 POOL_FANG=${POOL_FANG:-100000}          # its opening balance, out of the endowment
@@ -49,8 +50,10 @@ POOL_REPOS=${POOL_REPOS:-"jackdishman/blockula:10"}   # owner/name:weight …
 JURORS=${JURORS:-3}                     # stand-in founding jurors made on this laptop …
 JUROR_SOUL=${JUROR_SOUL:-25}            # … with this much Soul each (5 sits on a jury, 10 vouches)
 # JURORS_FILE: the founding jurors instead of stand-ins, one per line: `tboo1… <soul> <reason>`.
-VALIDATOR_VM=${VALIDATOR_VM:-shared-cpu-2x}
-VALIDATOR_MEMORY=${VALIDATOR_MEMORY:-2048mb}
+# Machine sizes: testnet-2's validators peaked at ~360 MB resident and ~2% of a core at 1 s blocks
+# in a set of five (measured 2026-11-02), so one shared CPU and 1 GB leave room.
+VALIDATOR_VM=${VALIDATOR_VM:-shared-cpu-1x}
+VALIDATOR_MEMORY=${VALIDATOR_MEMORY:-1024mb}
 RPC_VM=${RPC_VM:-shared-cpu-1x}
 RPC_MEMORY=${RPC_MEMORY:-1024mb}
 VOLUME_GB=${VOLUME_GB:-10}
@@ -73,7 +76,7 @@ if [ -n "${GENESIS_ONLY:-}" ] && [ -n "${REHEARSAL_DIR:-}" ]; then NET=$REHEARSA
 N=${#REGIONS[@]}
 # Downtime: a validator is jailed past DOWNTIME_MAX_MISSED of its last DOWNTIME_WINDOW leader
 # slots. Each of N validators leads one view in N, and one that's away misses a turn every N−1
-# blocks, so the chain default (50 of 100, about right for mainnet's 31) jails one of four after
+# blocks, so the chain default (50 of 100, about right for a set of 31) jails one of four after
 # ~3 minutes away. These defaults jail after half an epoch away (600 of 1,200 for four validators,
 # ~30 minutes), as long as the beacon's reveal half, which jails a validator away for all of it
 # anyway (docs/OPERATIONS.md "Jailed or tombstoned").
@@ -84,6 +87,8 @@ APPS=("$RPC_APP"); for i in $(seq 0 $((N - 1))); do APPS+=("$PREFIX-v$i"); done
 source deploy/fly-config.sh
 # The participation gate a restart waits for (PROGRESS_SECS between its checks, GATE_SECS at most).
 source deploy/restart-gate.sh
+# The keys' removal from Fly once they're on the volumes (keys_in_fly, remove_seeded_keys, has_secret).
+source deploy/key-removal.sh
 
 fly_ok() { [ -z "${GENESIS_ONLY:-}" ]; }
 if ! fly_ok && [ -n "${RESET:-}" ]; then echo "❌ RESET=1 with GENESIS_ONLY=1: a rehearsal makes no Fly calls, so it never resets anything" >&2; exit 1; fi
@@ -125,7 +130,6 @@ dedicated_v4() {
   [ -n "$ip" ] || { fly ips allocate-v4 -a "$1" --yes >/dev/null; ip=$(fly ips list -a "$1" --json | jq -r '[.[] | select(.Type == "v4")][0].Address'); }
   echo "$ip"
 }
-has_secret() { fly secrets list -a "$1" --json | jq -e --arg s "$2" 'map(.name // .Name) | index($s)' >/dev/null; }
 # Country of a Fly region, for the operator files' independence fields (DEC-14 display only).
 country_of() {
   case "$1" in
@@ -167,12 +171,12 @@ if [ ! -f "$NET/genesis.json" ]; then
     CONSENSUS=$(key "$NET/v$i/consensus.json")
     [ -f "$NET/v$i/validator.key" ] || (umask 077; jq -r .seed "$NET/v$i/consensus.json" > "$NET/v$i/validator.key")
     OWNER=$(key "$NET/owner-$i.json")
-    # Each validator publishes the public node as its HTTP endpoint: its sentry, as mainnet
+    # Each validator publishes the public node as its HTTP endpoint: its sentry, as independent
     # operators publish theirs (`genesis operator --http-addr`); validators' own HTTP stays on
     # Fly's private network, where the other nodes reach it (PEER_HTTP).
-    # No seat is flagged `--founder-or-foundation`: the four stand in for a mainnet genesis's
+    # No seat is flagged `--founder-or-foundation`: the four stand in for a public genesis's
     # independent operators. The founder's stand-in account is excluded from the bootstrap
-    # delegation as on mainnet; flagging the seats too would leave the
+    # delegation (DEC-5); flagging the seats too would leave the
     # delegation nobody to back, and DEC-3's cap (fewer such seats than f: none in a set of 4)
     # would keep a seat that left the set out for good (relaunch problem 2; staking test
     # `testnet_seats_leave_rejoin_and_get_the_bootstrap_delegation`).
@@ -219,7 +223,7 @@ $(printf "%b" "$ops")]
 reserved_names = ["blockula", "boo", "foundation", "treasury", "community", "validator", "admin", "support", "security", "official"]
 features = []
 
-# Mainnet's parameters, except durations short enough to exercise on a testnet: a week of
+# The default parameters, except durations short enough to exercise on a testnet: a week of
 # unbonding and of evidence (the weak-subjectivity period is half that), day-long votes, an
 # hour's timelock, spends open from genesis; and a downtime window sized for $N validators.
 [params]
@@ -278,7 +282,7 @@ label = "security grants (testnet stand-in)"
 SPEC
   # Each operator's allocation (its self-bond comes out of it) and its validator's faucet float.
   printf "%b" "$allocs" >> "$NET/spec.toml"
-  # Warnings are expected: a testnet breaks mainnet's independence policy (DEC-3, DEC-14) and
+  # Warnings are expected: a testnet breaks the genesis independence policy (DEC-3, DEC-14) and
   # opens the pool early (deploy/README.md lists them).
   $BIN genesis build --spec "$NET/spec.toml" --out "$NET/genesis.json"
   for i in $(seq 0 $((N - 1))); do cp "$NET/genesis.json" "$NET/v$i/genesis.json"; done
@@ -340,7 +344,6 @@ fly deploy . -c "$WORK/build.toml" --dockerfile deploy/Dockerfile --depot="${DEP
 # retry after any failure below finishes this launch, or takes a new CHAIN_ID).
 touch "$NET/launched"
 
-SEEDING=()
 DEPLOYS=()
 for i in $(seq 0 $((N - 1))); do
   app=$PREFIX-v$i
@@ -356,51 +359,16 @@ done
 failed=""
 for i in $(seq 0 $((N - 1))); do wait "${DEPLOYS[$i]}" || failed="$failed $PREFIX-v$i"; done
 [ -z "$failed" ] || { echo "❌ deploying$failed failed (fly logs -a <app>); rerun deploy/launch.sh, without RESET" >&2; exit 1; }
-# Which validators (by index) still hold their key in Fly, asked once the deploys applied the
-# staged secrets (a staged secret may not be listed before).
-for i in $(seq 0 $((N - 1))); do
-  if has_secret "$PREFIX-v$i" VALIDATOR_KEY_B64; then SEEDING+=("$i"); fi
-done
+# Which validators still hold their key in Fly, asked once the deploys applied the staged secrets.
+keys_in_fly
 
 rpc_toml > "$WORK/$RPC_APP.toml"
 echo "🌐 Deploying public node ${RPC_APP}…"
 fly deploy -c "$WORK/$RPC_APP.toml" --image "$IMAGE" --ha=false >/dev/null
 
-# Keys are on their volumes now: delete them from Fly so no other machine can ever load them.
-# Not staged, so every validator still holding its key restarts without the variable: all of them
-# together, once. One at a time is what nearly stalled the blockula-testnet-2 launch (each restart
-# waited out its peers' reconnection cooldowns, minutes before public-nat's were shortened, and a
-# gate that didn't wait for links took two of four validators out at once: no quorum, then a crawl
-# that jailed one). Even gated, it would cost a minute or two and a few missed slots per
-# validator, with the keys left in Fly until the last restart. Together, on a chain nobody uses yet,
-# the chain pauses once (slashing protection signs again once it sees the network standing still),
-# each validator misses about a slot, and they relink in one round. Before it, the public node and
-# each of them must answer (their process start times tell the gate their new processes from the
-# old ones), or nothing restarts and the keys stay for a rerun; after it, the participation gate
-# (deploy/restart-gate.sh).
-REMOVE=()
-for i in ${SEEDING[@]+"${SEEDING[@]}"}; do
-  if fly ssh console -a "$PREFIX-v$i" -C "test -f /data/home/.seeded" >/dev/null 2>&1; then
-    REMOVE+=("$i")
-  else
-    echo "⚠️  $PREFIX-v$i: couldn't confirm the key was seeded; VALIDATOR_KEY_B64 left in place" >&2
-  fi
-done
-if [ ${#REMOVE[@]} -gt 0 ]; then
-  names=""; for i in "${REMOVE[@]}"; do names="$names $PREFIX-v$i"; done
-  echo "🔒 Removing the keys seeded on their volumes from Fly, restarting$names together…"
-  gate_wait "before the restart" gate_answering "${REMOVE[@]}" \
-    || { echo "❌ $GATE_WHY: nothing restarted, and the keys stay in Fly. Rerun deploy/launch.sh (without RESET) to remove them." >&2; exit 1; }
-  STARTS=(); PIDS=()
-  for i in "${REMOVE[@]}"; do STARTS+=("$i=${GATE_STARTED[$i]}"); done
-  for i in "${REMOVE[@]}"; do fly secrets unset VALIDATOR_KEY_B64 -a "$PREFIX-v$i" >/dev/null & PIDS+=($!); done
-  failed=""
-  for k in $(seq 0 $((${#PIDS[@]} - 1))); do wait "${PIDS[$k]}" || failed="$failed $PREFIX-v${REMOVE[$k]}"; done
-  [ -z "$failed" ] || { echo "❌ removing VALIDATOR_KEY_B64 from$failed failed (fly logs -a <app>): rerun deploy/launch.sh (without RESET)" >&2; exit 1; }
-  echo "🔒$names: VALIDATOR_KEY_B64 removed from Fly secrets (restarted)"
-  gate_wait "after the restart" gate_check "${STARTS[@]}" \
-    || { echo "❌ the validators aren't back at full participation after the key removal: $GATE_WHY. The keys are off Fly; check fly logs -a <app> before anything else restarts a validator." >&2; exit 1; }
-fi
+# Keys are on their volumes now: delete them from Fly so no other machine can ever load them, with
+# one restart of those validators together and the participation gate (deploy/key-removal.sh).
+remove_seeded_keys || exit 1
 
 # Informational only: a failure here (e.g. a stale local DNS cache) must not skip anything above.
 for _ in $(seq 60); do curl -fsS "$RPC_URL/api/health" >/dev/null 2>&1 && break; sleep 5; done

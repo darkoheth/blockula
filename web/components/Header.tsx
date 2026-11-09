@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { DEFAULT_NETWORK, explorer, isNodeUrl, NETWORK, NETWORKS, RPC, setNetwork, type Network, type NetworkKey } from "@/lib/config";
+import { useEffect } from "react";
+import { DEFAULT_NETWORK, explorer, isNodeUrl, NETWORK, NETWORKS, RPC, SERVED, setNetwork, type Network, type NetworkKey } from "@/lib/config";
 import { isExplorerPath } from "@/lib/explorer/routes";
 import { useWallet } from "@/lib/wallet";
 import { CommandPalette, openPalette } from "./CommandPalette";
@@ -13,10 +14,23 @@ export function NetworkBadge() {
   const { client, status, chain } = useWallet();
   const kind = NETWORK.key === "custom" ? "custom" : NETWORK.mainnet ? "main" : "test";
   const chainId = chain.state === "mismatch" ? "wrong chain" : (status?.chain_id ?? client.pin.chainId ?? "…");
+  // A chain summoned with --name shows it (the genesis hash binds it); its id is in the tooltip.
+  const label = chain.state !== "mismatch" && status?.name ? status.name : chainId;
+  const path = usePathname();
+  // The served wallet has one chain, the node's: its name is the network, and the tab's title.
+  useEffect(() => {
+    if (SERVED && status) document.title = `${status.name || status.chain_id} Wallet`;
+  }, [status, path]);
+  if (SERVED)
+    return (
+      <span className="net-badge served" data-testid="network-badge" title={`Connected to ${RPC} (${chainId})`}>
+        <span className="net-name">{label === "…" ? "connecting…" : label}</span>
+      </span>
+    );
   return (
-    <span className={`net-badge ${kind}`} data-testid="network-badge" title={`Connected to ${RPC}`}>
+    <span className={`net-badge ${kind}`} data-testid="network-badge" title={`Connected to ${RPC} (${chainId})`}>
       <span className="net-name">{NETWORK.label}</span>
-      <span className="net-chain">{chainId}</span>
+      <span className="net-chain">{label}</span>
     </span>
   );
 }
@@ -28,7 +42,7 @@ export function Header() {
   const open = wallet && hint?.account;
   const known = Object.values(NETWORKS).filter((n): n is Network => !!n);
   // A program's records (a hunt, a claim, a Séance) belong to Programs; every other chain page to Explore.
-  const programs = /^\/(programs|hunt|claim|seance)(\/|$)/.test(path);
+  const programs = /^\/(programs?|hunt|claim|seance)(\/|$)/.test(path);
   const explore = isExplorerPath(path) && !programs;
   return (
     <>
@@ -56,7 +70,8 @@ export function Header() {
               <Link href="/devices" className={path === "/devices" ? "active" : ""}>Devices &amp; agents</Link>
             </>
           )}
-          <select
+          {/* The served wallet has no menu: it talks to the node that served it, and nothing else. */}
+          {!SERVED && <select
             className="net-select small"
             aria-label="Network"
             title={`Connected to ${RPC}`}
@@ -75,7 +90,7 @@ export function Header() {
               <option key={n.key} value={n.key}>{n.label}</option>
             ))}
             <option value="custom">{NETWORK.key === "custom" ? `Custom: ${RPC.replace(/^https?:\/\//, "")}` : "Custom node…"}</option>
-          </select>
+          </select>}
           {open && (
             <button
               className="link caps"

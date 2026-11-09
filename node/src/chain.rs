@@ -172,13 +172,14 @@ pub struct Genesis {
     pub reserved_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub soul_ledger: Vec<SoulEntry>,
-    /// Features on from genesis (`upgrade::KNOWN_FEATURES`).
+    /// Features on from genesis: ones the version block 1 runs knows (`upgrade::known_features`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
     /// Protocol versions scheduled from genesis, as `ScheduleUpgrade` proposals would schedule
-    /// them: dev and test chains only (`upgrade::check_genesis_upgrades`), and a chain that has
-    /// any runs `upgrade::PREVIEW_PROTOCOL_VERSION` (`upgrade::supported_version`). Absent on
-    /// every chain that starts at v1, so their genesis and its hash don't change.
+    /// them (`upgrade::check_genesis_upgrades`): a chain born at a released version (`blockula-1`
+    /// at v2, from block 1), or a dev or test chain on the preview version, which this binary
+    /// runs there only (`upgrade::supported_version`). Absent on every chain that starts at v1,
+    /// so their genesis and its hash don't change.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upgrades: Vec<crate::upgrade::ScheduledUpgrade>,
     /// Accounts whose validators the bootstrap delegation passes over (DEC-5: the founder's and
@@ -190,6 +191,43 @@ pub struct Genesis {
     /// ordinary allocation to the pool's account (`poc::pool_address`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pool_repos: BTreeMap<String, u64>,
+    /// What the chain calls itself (`blockula summon --name`), for wallets and explorers. Display
+    /// only: the protocol's unit is drops either way. Absent on every chain made without it, so
+    /// their genesis and its hash don't change; present, the genesis hash binds it (with a
+    /// `token` other than FANG), so a node can't rename a chain it serves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brand: Option<Brand>,
+}
+
+/// A chain's display name and description (`Genesis::brand`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Brand {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+/// The unit every chain had before `--token`: the genesis hash binds a `token` other than this.
+pub const DEFAULT_TOKEN: &str = "FANG";
+/// Longest chain name, in bytes.
+pub const MAX_CHAIN_NAME: usize = 48;
+/// Longest chain description, in bytes.
+pub const MAX_CHAIN_DESCRIPTION: usize = 280;
+
+/// A ticker is 2 to 8 characters, A–Z and 0–9, starting with a letter ("JACK", "B2B").
+pub fn check_token(t: &str) -> Result<()> {
+    let ok = (2..=8).contains(&t.len()) && t.starts_with(|c: char| c.is_ascii_uppercase()) && t.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+    ensure!(ok, "token must be 2–8 characters, A–Z and 0–9, starting with a letter (like JACK), not {t:?}");
+    Ok(())
+}
+
+/// A chain name is 1 to [`MAX_CHAIN_NAME`] bytes and a description up to [`MAX_CHAIN_DESCRIPTION`],
+/// neither with control characters or space around it.
+pub fn check_brand(b: &Brand) -> Result<()> {
+    let clean = |v: &str| v.trim() == v && !v.chars().any(|c| c.is_control());
+    ensure!(!b.name.is_empty() && b.name.len() <= MAX_CHAIN_NAME && clean(&b.name), "chain name must be 1–{MAX_CHAIN_NAME} bytes, with no control characters or space around it");
+    ensure!(b.description.len() <= MAX_CHAIN_DESCRIPTION && clean(&b.description), "chain description must be at most {MAX_CHAIN_DESCRIPTION} bytes, with no control characters or space around it");
+    Ok(())
 }
 
 fn default_epoch_blocks() -> u64 {
@@ -380,6 +418,9 @@ impl Genesis {
         for f in &self.features {
             state.upgrade.features.insert(f.clone(), crate::upgrade::Feature { activated_at: 0 });
         }
+        if self.features.iter().any(|f| f == crate::upgrade::PROGRAMS_FEATURE) {
+            crate::programs::on_activate(&mut state, None);
+        }
         state.upgrade.schedule = self.upgrades.clone();
         // P-ECON: the base fee and block-size limit for the first blocks (at the floor).
         crate::econ::init_genesis(&mut state);
@@ -414,6 +455,12 @@ impl Genesis {
     pub fn check(&self) -> Result<()> {
         use std::collections::BTreeSet;
         self.check_prefix()?;
+        if self.token != DEFAULT_TOKEN {
+            check_token(&self.token)?;
+        }
+        if let Some(b) = &self.brand {
+            check_brand(b)?;
+        }
         if let Some(t) = &self.contribution {
             t.check()?;
         }
@@ -509,19 +556,30 @@ impl Genesis {
             ensure!(system_account(prefix, a).is_none(), "bootstrap_excluded: {a} is a keyless system account");
             ensure!(i == 0 || self.bootstrap_excluded[i - 1] < *a, "bootstrap_excluded must be sorted, each account once");
         }
+        crate::upgrade::check_genesis_upgrades(&self.upgrades, &self.chain_id)?;
+        // The genesis block executes nothing: features on from genesis are first used in block 1,
+        // so that block's version must know them (a chain born at v2 from block 1 may start with
+        // programs on, but not `blockula-1` on this release, below; one that starts at v1 may not).
+        let first = crate::upgrade::version_in(&self.upgrades, 1);
         let mut features = BTreeSet::new();
         for f in &self.features {
             crate::upgrade::check_feature_name(f)?;
-            ensure!(crate::upgrade::KNOWN_FEATURES.contains(&f.as_str()), "unknown feature {f} (known: {})", crate::upgrade::KNOWN_FEATURES.join(", "));
+            crate::upgrade::check_known_feature(f, first).map_err(|e| anyhow!("{e}: block 1 runs v{first}"))?;
             ensure!(features.insert(f), "feature {f} is listed twice");
         }
-        crate::upgrade::check_genesis_upgrades(&self.upgrades, &self.chain_id)?;
         if self.chain_id == MAINNET_CHAIN_ID {
             ensure!(self.validator_admins.is_empty(), "{MAINNET_CHAIN_ID} has no admin keys: validator_admins must be empty");
             ensure!(!self.faucet, "{MAINNET_CHAIN_ID} has no faucet");
             ensure!(self.validators.iter().all(|v| keys.contains(v.public_key.as_str())), "every {MAINNET_CHAIN_ID} validator needs an operator (owner, self-bond, commission)");
-            // DEC-2: Ghost Mode ships disabled; only governance switches it on, after its audit.
-            ensure!(!self.features.iter().any(|f| f == crate::ghost::FEATURE), "{MAINNET_CHAIN_ID} starts with Ghost Mode off: governance activates it after its audit");
+            // DEC-2: Ghost Mode ships disabled, and stays off until it's audited: governance can't
+            // switch it on here either (`upgrade::check_may_activate`).
+            ensure!(!self.features.iter().any(|f| f == crate::ghost::FEATURE), "{MAINNET_CHAIN_ID} starts with Ghost Mode off: it isn't audited");
+            // And with programs off: this release knows the feature's name, not its rules, so it
+            // would start such a chain without the program state a release that runs them builds
+            // from the same genesis (two genesis states), and governance switches them on here
+            // only from v3 (`upgrade::check_may_activate`). The release that ships programs v0
+            // lifts this; a genesis without them is the same either way.
+            ensure!(!self.features.iter().any(|f| f == crate::upgrade::PROGRAMS_FEATURE), "{MAINNET_CHAIN_ID} starts with programs off: this release doesn't carry them, and governance switches them on from protocol v{}", crate::upgrade::MAINNET_PROGRAMS_ACTIVATION_VERSION);
             // Governance's own safety parameters start where a vote could take them at most.
             cp.check_governance_floors(&params).context(MAINNET_CHAIN_ID)?;
         }
@@ -613,6 +671,7 @@ pub struct Journal {
     pub(crate) beacon: crate::beacon::BeaconJournal,
     pub(crate) upgrade: crate::upgrade::UpgradeJournal,
     pub(crate) ghost: crate::ghost::GhostJournal,
+    pub(crate) programs: crate::programs::ProgramsJournal,
     /// Not an undo record: how far the sender's own staking moves (delegating, unbonding,
     /// redelegating) took its transferable balance down (`staking::own_move`). They keep its
     /// tokens in its holdings, short of rounding dust that stays in a pool, so the lock check
@@ -636,7 +695,7 @@ impl Journal {
 
     /// Folds a nested journal in, keeping the oldest values. Exhaustive, like `State::rollback`.
     fn absorb(&mut self, other: Journal) {
-        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade, ghost, lock_slack } = other;
+        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade, ghost, programs, lock_slack } = other;
         self.lock_slack = self.lock_slack.saturating_add(lock_slack);
         self.accounts.absorb(accounts);
         self.names.absorb(names);
@@ -661,6 +720,7 @@ impl Journal {
         self.beacon.absorb(beacon);
         self.upgrade.absorb(upgrade);
         self.ghost.absorb(ghost);
+        self.programs.absorb(programs);
     }
 }
 
@@ -670,6 +730,9 @@ impl Journal {
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct BlockInfo<'a> {
+    /// The chain the block is on (its genesis's `chain_id`): what the end-of-block steps read for
+    /// a rule only one chain has (governance's: `upgrade::check_may_activate`).
+    pub chain_id: &'a str,
     pub height: u64,
     /// The protocol version in force at `height` (`upgrade::version_at` on the state the block
     /// runs on): what every version-gated rule of the block's end-of-block steps reads.
@@ -693,6 +756,21 @@ pub enum Outcome {
     Applied,
     /// Included and charged, but the action failed (reason).
     Failed(String),
+}
+
+/// What [`State::apply_j`] is applying a tx for (docs/PROGRAMS-V0.md §6.4). For every tx but a
+/// program's (tags 62–64) the two differ only in whether the codec's rules run, as `true` and
+/// `false` did before programs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyMode {
+    /// Executing or judging a block: proposals, verification, execution, replay. Runs
+    /// `Tx::check_format`, counts the block's program fuel, and runs programs.
+    Block,
+    /// The mempool's simulations (`MempoolCheck::run`, `dry_run`, `simulate_queue`) and the fuzz
+    /// harness's dry run: the format was checked at the door, the block's program fuel isn't
+    /// counted, and programs never run (a program tx debits its worst case instead:
+    /// `programs::mempool_apply`).
+    Mempool,
 }
 
 /// Free localhost port, picked by the OS. Used when summoning local testnets.
@@ -944,6 +1022,8 @@ pub struct State {
     pub upgrade: crate::upgrade::Upgrades,
     /// 👻 Ghost Mode's shielded pool (ghost.rs), off until governance activates it.
     pub ghost: crate::ghost::Ghost,
+    /// Programs (protocol v2, programs/): no records until the feature first switches on.
+    pub programs: crate::programs::Programs,
     /// The authenticated tree over every record, as of the last `commit_block`.
     pub tree: crate::state::tree::Smt,
 }
@@ -977,7 +1057,9 @@ impl State {
     /// of unexecuted ancestors all run exactly this, in this order:
     ///
     /// 1. `poc_end_block`: Séances closing, and opening on their epoch-boundary cadence.
-    /// 2. `econ::end_block`: the base fee and size limit 17 blocks ahead (3.6), lapsed names.
+    /// 2. `econ::end_block`: the base fee and size limit 17 blocks ahead (3.6), lapsed names;
+    ///    then `programs::end_block`: the next block's program fuel rate (nothing while programs
+    ///    are dormant, docs/PROGRAMS-V0.md §5.6).
     /// 3. `staking::end_block`: the proposer's charge for the `skipped` txs (junk, CV-5), and
     ///    missed leader slots from `view`/`parent_view` (downtime, jailing).
     /// 4. `governance::end_block`: proposals whose voting ended or whose timelock is over.
@@ -995,9 +1077,10 @@ impl State {
     /// node before a height its binary can't execute (3.9).
     pub fn end_block(&mut self, b: &BlockInfo) {
         #[cfg(test)]
-        crate::upgrade::test_gate::saw(b.height, b.version);
+        crate::upgrade::test_gate::saw(b.chain_id, b.height, b.version);
         self.poc_end_block(b.height);
         crate::econ::end_block(self, b);
+        crate::programs::end_block(self, b);
         crate::staking::end_block(self, b);
         crate::governance::end_block(self, b);
         crate::ghost::end_block(self, b);
@@ -1033,24 +1116,32 @@ impl State {
     /// of unexecuted ancestors share, so both reach the same state. `each` gets every tx's result
     /// (`Err`: not admittable, so skipped; the proposer pays for it at the end of the block).
     /// `tx_bytes` (econ's fullness) counts every tx the block carried, skipped ones included.
+    ///
+    /// The txs run as one block pass (`programs::block_pass`): a block with a program tx runs them
+    /// on one thread and one engine, so `each` runs there too; the end-of-block steps run on the
+    /// caller's thread, as for every block.
     #[allow(clippy::too_many_arguments)]
-    pub fn run_block<'t>(&mut self, chain_id: &str, height: u64, hash: &str, proposer: &str, view: u64, parent_view: u64, txs: impl IntoIterator<Item = &'t Tx>, mut each: impl FnMut(&'t Tx, Vec<String>, Result<Outcome>)) {
+    pub fn run_block<'t>(&mut self, chain_id: &str, height: u64, hash: &str, proposer: &str, view: u64, parent_view: u64, txs: impl IntoIterator<Item = &'t Tx>, mut each: impl FnMut(&'t Tx, Vec<String>, Result<Outcome>) + Send) {
         // Fixed for the whole block: an upgrade its end-of-block steps schedule activates at least
         // `MIN_UPGRADE_LEAD` blocks later.
         let version = crate::upgrade::version_at(self, height);
-        let mut skipped = vec![];
-        let mut tx_bytes = 0u64;
-        for tx in txs {
-            let size = tx.size();
-            tx_bytes += size;
-            let named = self.named_by(tx);
-            let r = self.apply(tx, chain_id, proposer, height);
-            if r.is_err() {
-                skipped.push(size);
+        let txs: Vec<&'t Tx> = txs.into_iter().collect();
+        let (skipped, tx_bytes) = crate::programs::block_pass(txs.iter().copied(), || {
+            let mut skipped = vec![];
+            let mut tx_bytes = 0u64;
+            for &tx in &txs {
+                let size = tx.size();
+                tx_bytes += size;
+                let named = self.named_by(tx);
+                let r = self.apply(tx, chain_id, proposer, height);
+                if r.is_err() {
+                    skipped.push(size);
+                }
+                each(tx, named, r);
             }
-            each(tx, named, r);
-        }
-        self.end_block(&BlockInfo { height, version, hash, proposer, view, parent_view, skipped: &skipped, tx_bytes });
+            (skipped, tx_bytes)
+        });
+        self.end_block(&BlockInfo { chain_id, height, version, hash, proposer, view, parent_view, skipped: &skipped, tx_bytes });
     }
 
     /// The accounts `tx`'s action names, resolved as the state is now: just before it runs, which
@@ -1188,7 +1279,7 @@ impl State {
 
     /// Undoes everything recorded in `j` (values, and the dirty marks of keys it cleans up).
     pub fn rollback(&mut self, j: Journal) {
-        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade, ghost, lock_slack: _ } = j;
+        let Journal { accounts, names, validators, hunts, github, github_by_account, familiars, scalars, next_hunt_id, chain_params, poc, staking, governance, econ, beacon, upgrade, ghost, programs, lock_slack: _ } = j;
         accounts.restore(&mut self.accounts);
         names.restore(&mut self.names);
         validators.restore(&mut self.validators);
@@ -1213,16 +1304,17 @@ impl State {
         beacon.rollback(&mut self.beacon);
         upgrade.rollback(&mut self.upgrade);
         ghost.rollback(&mut self.ghost);
+        programs.rollback(&mut self.programs);
     }
 
     /// Checks that decide whether a tx can be included at all (at `height`). No state changes.
     /// Returns the sender, the signer's key id and record, what the tx is charged, and whether a
     /// validator's consensus key signed it for its owner (SF-13).
-    fn admit(&self, tx: &Tx, chain_id: &str, height: u64, full_checks: bool) -> Result<(String, String, KeyRecord, u64, bool)> {
+    fn admit(&self, tx: &Tx, chain_id: &str, height: u64, mode: ApplyMode) -> Result<(String, String, KeyRecord, u64, bool)> {
         if tx.chain_id != chain_id {
             bail!("wrong chain_id: expected {chain_id}");
         }
-        if full_checks {
+        if mode == ApplyMode::Block {
             tx.check_format()?;
         }
         tx.check_prefix(self.params.prefix())?;
@@ -1310,6 +1402,9 @@ impl State {
         }
         // Ghost Mode's own admission rules (on and unpaused; a shield's size, chain and proof).
         crate::ghost::admit(self, tx, height)?;
+        // Programs' own rules (no tx acts from a program; a program action needs the status, the
+        // state and the block's fuel it asks for).
+        crate::programs::admit(self, tx, height, mode)?;
         Ok((sender, signer, key, charge, consensus_key))
     }
 
@@ -1326,19 +1421,27 @@ impl State {
     ///   as junk).
     pub fn apply(&mut self, tx: &Tx, chain_id: &str, proposer: &str, height: u64) -> Result<Outcome> {
         let mut j = Journal::default();
-        self.apply_j(&mut j, tx, chain_id, proposer, height, true)
+        self.apply_j(&mut j, tx, chain_id, proposer, height, ApplyMode::Block)
     }
 
     /// `apply`, recording every change in `j` so the caller can roll back (dry runs, mempool
     /// checks, proposals) without cloning the state.
-    pub fn apply_j(&mut self, j: &mut Journal, tx: &Tx, chain_id: &str, proposer: &str, height: u64, full_checks: bool) -> Result<Outcome> {
+    pub fn apply_j(&mut self, j: &mut Journal, tx: &Tx, chain_id: &str, proposer: &str, height: u64, mode: ApplyMode) -> Result<Outcome> {
+        self.apply_j_with_id(j, tx, None, chain_id, proposer, height, mode)
+    }
+
+    /// [`State::apply_j`] for a caller that has `tx`'s id already (`id`: [`Tx::id`]; a wrong one
+    /// names the tx's run, receipt and fault wrongly). Only a program transaction's run is named
+    /// by it, and `None` has it computed when it is needed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_j_with_id(&mut self, j: &mut Journal, tx: &Tx, id: Option<&str>, chain_id: &str, proposer: &str, height: u64, mode: ApplyMode) -> Result<Outcome> {
         // Unsigned ghost txs have no sender, nonce or key: their proof authorizes them (ghost.rs).
         // They never reach `admit`, so a version-gated admission rule that must cover them goes in
         // `ghost::apply_unsigned` too.
         if tx.is_unsigned() {
-            return crate::ghost::apply_unsigned(self, j, tx, chain_id, proposer, height, full_checks);
+            return crate::ghost::apply_unsigned(self, j, tx, chain_id, proposer, height, mode);
         }
-        let (sender, signer, key, charge, consensus_key) = self.admit(tx, chain_id, height, full_checks)?;
+        let (sender, signer, key, charge, consensus_key) = self.admit(tx, chain_id, height, mode)?;
         let base = charge - tx.tip;
         // A distribution claim its sender can't pay for pays out of the claim (admission checked
         // the claim covers the fee and the new account's creation fee): the claim runs first, here.
@@ -1383,12 +1486,19 @@ impl State {
         self.supply -= base;
         self.j_credit(&mut fj, proposer, tx.tip);
         self.acct_mut(&mut fj, &sender).nonce += 1;
+        crate::programs::count_fuel(self, &mut fj, tx, height, mode);
         // Action phase (rolled back on failure). Accounts it opens pay the creation fee, and no
         // account may end up moving tokens its locks hold (fees above may: they're paid first).
         let free = crate::econ::free(self, &sender, height);
         let mut aj = Journal::default();
-        // A prepaid claim already ran.
-        let action = if prepaid { Ok(()) } else { self.apply_action(&mut aj, tx, &sender, &signer, &key, height) };
+        // A prepaid claim already ran. The mempool never runs a program: it debits the worst case.
+        let action = if prepaid {
+            Ok(())
+        } else if mode == ApplyMode::Mempool && crate::programs::is_program_tx(tx) {
+            crate::programs::mempool_apply(self, &mut aj, tx, &sender)
+        } else {
+            self.apply_action(&mut aj, tx, id, &sender, &signer, &key, height)
+        };
         let result = action.and_then(|()| {
             let touched = aj.touched_accounts();
             crate::econ::charge_new_accounts(self, &mut aj, &touched, &sender, &signer, &key)?;
@@ -1416,7 +1526,8 @@ impl State {
 
     /// The action phase of `apply_j` (no fee, nonce or admission). Multisig accounts run their
     /// approved actions through it too (governance.rs).
-    pub(crate) fn apply_action(&mut self, j: &mut Journal, tx: &Tx, sender: &str, signer: &str, key: &KeyRecord, height: u64) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_action(&mut self, j: &mut Journal, tx: &Tx, id: Option<&str>, sender: &str, signer: &str, key: &KeyRecord, height: u64) -> Result<()> {
         let sender = sender.to_string();
         match &tx.action {
             Action::Transfer { to, amount } => {
@@ -1437,6 +1548,9 @@ impl State {
                 }
                 self.j_debit(j, &sender, *amount)?;
                 self.j_credit(j, &to, *amount);
+                // A program takes in a plain transfer only while programs are on, within the value cap
+                // (docs/PROGRAMS-V0.md §7.1); an `Err` rolls the transfer back. Nothing for anyone else.
+                crate::programs::native_credit(self, j, &to, *amount, crate::programs::Credit::Transfer, height)?;
             }
             // Prices, expiry and the reserved list: econ.rs (DEC-11).
             Action::RegisterName { name } => crate::econ::register_name(self, j, &sender, name, height)?,
@@ -1601,6 +1715,8 @@ impl State {
                 }
                 let amount = h.amount;
                 self.j_credit(j, &to, amount);
+                // Never to a program (docs/PROGRAMS-V0.md §7.1): the award fails.
+                crate::programs::native_credit(self, j, &to, amount, crate::programs::Credit::Other, height)?;
                 let h = self.hunt_mut(j, *hunt_id).unwrap();
                 h.status = HuntStatus::Awarded;
                 h.awarded_to = Some(to);
@@ -1644,6 +1760,7 @@ impl State {
             Action::Propose { .. } | Action::Vote { .. } | Action::Unlock {} | Action::MultisigCreate { .. } | Action::MultisigPropose { .. } | Action::MultisigApprove { .. } | Action::ClaimDistribution { .. } => crate::governance::apply(self, j, tx, &sender, signer, key, height)?,
             Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::apply(self, j, tx, &sender, signer, key, height)?,
             Action::Shield { .. } | Action::PrivateTransfer { .. } | Action::Unshield { .. } | Action::SetGhostAddress { .. } | Action::GhostPause {} => crate::ghost::apply(self, j, tx, &sender, signer, key, height)?,
+            Action::UploadCode { .. } | Action::CreateProgram { .. } | Action::CallProgram { .. } | Action::ProgramsPause {} => crate::programs::apply(self, j, tx, id, &sender, signer, height)?,
             _ => self.apply_poc(j, tx, &sender, signer, key, height)?,
         }
         Ok(())
@@ -1717,8 +1834,13 @@ impl State {
 
     /// Sets a governance-adjustable parameter (`ParamChange`): within its bounds, and governance's
     /// own safety parameters only within their bands (`ChainParams::check_governance_change`, as
-    /// of the block it runs in).
+    /// of the block it runs in). A `program_*` key is programs' once they exist
+    /// (`programs::is_program_param`, read at `econ.height`: the block it runs in, since
+    /// `econ::end_block` runs before `governance::end_block`); until then it's unknown here, as in v1.
     pub(crate) fn exec_set_param(&mut self, j: &mut Journal, key: &str, value: u64) -> Result<()> {
+        if crate::programs::is_program_param(self, key, self.econ.height) {
+            return crate::programs::set_param(self, j, key, value);
+        }
         let params = self.params.clone();
         self.chain_params.check_governance_change(key, value, &params, self.econ.height)?;
         let mut next = self.chain_params.clone();
@@ -1813,6 +1935,7 @@ impl State {
             Action::Propose { .. } | Action::Vote { .. } | Action::Unlock {} | Action::MultisigCreate { .. } | Action::MultisigPropose { .. } | Action::MultisigApprove { .. } | Action::ClaimDistribution { .. } => crate::governance::describe(self, tx, &from, primary_name),
             Action::RenewName { .. } | Action::TransferName { .. } | Action::ReleaseName { .. } => crate::econ::describe(self, tx, &from, height, primary_name),
             Action::Shield { .. } | Action::PrivateTransfer { .. } | Action::Unshield { .. } | Action::SetGhostAddress { .. } | Action::GhostPause {} => crate::ghost::describe(self, tx, &from, primary_name),
+            Action::UploadCode { .. } | Action::CreateProgram { .. } | Action::CallProgram { .. } | Action::ProgramsPause {} => crate::programs::describe(self, tx, &from, primary_name),
             _ => self.describe_poc(tx, &from, primary_name),
         }
     }
@@ -1850,17 +1973,31 @@ pub fn check_validity(tx: &Tx, height: u64, max_validity: u64) -> Result<()> {
 
 /// The stateless part of the fee check (HTTP, gossip, block verification before the state is
 /// at hand): `fee` covers the tip plus the lowest base fee any parameters allow
-/// (`econ::lowest_base_fee`). The exact check needs the block's base fee: `econ::check_fee`.
+/// (`econ::lowest_base_fee`, and for a program tx the lowest fuel fee of the compute it declares,
+/// `programs::lowest_fuel_fee`). The exact check needs the block's base fee: `econ::check_fee`.
 pub fn check_fee(tx: &Tx) -> Result<()> {
-    let least = crate::econ::lowest_base_fee(tx.size());
+    let least = crate::econ::lowest_base_fee(tx.size()).saturating_add(crate::programs::lowest_fuel_fee(tx));
     match least.checked_add(tx.tip) {
         Some(c) if c <= tx.fee => Ok(()),
         _ => bail!("fee too low: this tx costs at least {} drops (base fee at least {least} + tip {}), but its fee allows {}", least.saturating_add(tx.tip), tx.tip, tx.fee),
     }
 }
 
+/// An address as `boo1abcdef…xyz123` (its first 10 and last 6 bytes), for messages. Safe on any
+/// string, not only on an address (a client's text is echoed through it too): where those bytes
+/// would cut a multi-byte character, it takes characters instead.
 pub fn short(addr: &str) -> String {
-    if addr.len() > 16 { format!("{}…{}", &addr[..10], &addr[addr.len() - 6..]) } else { addr.to_string() }
+    if addr.len() <= 16 {
+        return addr.to_string();
+    }
+    if let (Some(head), Some(tail)) = (addr.get(..10), addr.get(addr.len() - 6..)) {
+        return format!("{head}…{tail}");
+    }
+    let chars: Vec<char> = addr.chars().collect();
+    match chars.len() > 16 {
+        true => format!("{}…{}", chars[..10].iter().collect::<String>(), chars[chars.len() - 6..].iter().collect::<String>()),
+        false => addr.to_string(),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -1890,12 +2027,50 @@ pub struct SummonOpts {
     /// Genesis `params` overrides (`blockula dev` shortens durations with
     /// `ChainParams::dev_overrides`). `min_bond`, when set, wins for `min_self_bond`.
     pub params: BTreeMap<String, u64>,
+    /// Where other machines reach the validators (an IP or a DNS name): validator i is published
+    /// at `host:30300+i` (p2p) and `host:7070+i` (HTTP). `None`: 127.0.0.1 with free ports, a
+    /// chain for this machine only.
+    pub host: Option<String>,
+    /// Protocol versions scheduled from genesis (`Genesis::upgrades`). Empty by default, so every
+    /// caller that doesn't set it gets the genesis, and the genesis hash, it always had.
+    pub upgrades: Vec<crate::upgrade::ScheduledUpgrade>,
+    /// Features on from genesis (`Genesis::features`). Empty by default, like `upgrades`.
+    pub features: Vec<String>,
+    /// The chain's ticker (`Genesis::token`). `None`: FANG.
+    pub token: Option<String>,
+    /// The chain's display name and description (`Genesis::brand`). `None`: none.
+    pub brand: Option<Brand>,
 }
 
 impl SummonOpts {
     pub fn new(chain_id: &str, validators: usize) -> Self {
-        Self { chain_id: chain_id.into(), faucet: true, block_time_ms: 1000, validators, http_port: None, admins: vec![], epoch_blocks: default_epoch_blocks(), min_bond: None, contribution: None, address_prefix: default_address_prefix(), params: BTreeMap::new() }
+        Self { chain_id: chain_id.into(), faucet: true, block_time_ms: 1000, validators, http_port: None, admins: vec![], epoch_blocks: default_epoch_blocks(), min_bond: None, contribution: None, address_prefix: default_address_prefix(), params: BTreeMap::new(), host: None, upgrades: vec![], features: vec![], token: None, brand: None }
     }
+
+    /// These options with programs on from block 1 (docs/PROGRAMS-V0.md §1.5; `blockula summon
+    /// --programs`, `blockula dev --programs`): protocol v2 scheduled at height 1 and the
+    /// `programs` feature in the genesis, so META `programs` exists from block 0.
+    pub fn with_programs(mut self) -> Self {
+        self.upgrades = vec![crate::upgrade::ScheduledUpgrade { version: crate::upgrade::PROGRAMS_VERSION, activation_height: 1 }];
+        self.features = vec![crate::upgrade::PROGRAMS_FEATURE.to_string()];
+        self
+    }
+}
+
+/// The p2p and HTTP ports `summon --host` publishes validator `i` at: the defaults, counted up.
+pub const SUMMON_P2P_PORT: u16 = 30300;
+pub const SUMMON_HTTP_PORT: u16 = 7070;
+
+/// `summon`'s default epoch: about 10 minutes of blocks (600 at 1-second blocks, as before).
+pub fn summon_epoch_blocks(block_time_ms: u64) -> u64 {
+    (600_000 / block_time_ms.max(1)).max(2)
+}
+
+/// `host` as it goes before `:port` (an IPv6 address in brackets), checked as an address.
+pub(crate) fn summon_host(host: &str) -> Result<String> {
+    let h = if host.contains(':') && !host.starts_with('[') { format!("[{host}]") } else { host.to_string() };
+    check_host_port(&format!("{h}:{SUMMON_P2P_PORT}")).map_err(|_| anyhow!("--host must be an IP address or a DNS name, got {host:?}"))?;
+    Ok(h)
 }
 
 /// How far behind the (claimed) network height still counts as synced.
@@ -2009,6 +2184,15 @@ pub struct Chain {
     /// Every queued validator duty, in the lane or waiting for a slot in it: queued ids →
     /// (validator, kind of duty), as `staking::duty_of` said when it was admitted.
     duties: HashMap<String, (String, &'static str)>,
+    /// What this node keeps out of its mempool and its votes after a program execution fault in
+    /// one of its proposals' trials, the proposals of its own that never certified, the blocks
+    /// its verification ran clean, and the trial marker a crash leaves behind: node-local,
+    /// never state, and empty on a chain that has no program transactions
+    /// (`programs::fault`, docs/PROGRAMS-V0.md §6.2).
+    pub quarantine: crate::programs::fault::Quarantine,
+    pub strikes: crate::programs::fault::Strikes,
+    pub verified_clean: crate::programs::fault::VerifiedClean,
+    pub trial: crate::programs::fault::TrialMarker,
     /// Admission's simulated state per recently active sender (see [`Chain::submit_tx`]).
     sims: Sims,
     /// Mirror of the mempool and of recent failures, published for readers.
@@ -2037,6 +2221,11 @@ pub struct Chain {
     broken: Option<String>,
     /// Blocks `open` executed again because they were past the store's commit point.
     pub replayed: u64,
+    /// Blocks whose program receipts this binary computed otherwise than the logged ones while
+    /// replaying them (docs/PROGRAMS-V0.md §8.1; `programs::receipt::replayed`): 0 unless a binary
+    /// changed what a receipt says. This process's count, never persisted nor part of the state;
+    /// always 0 without programs, which have no receipts.
+    pub receipt_mismatches: u64,
     /// Writes `epochs.json` off the chain lock.
     epochs_saver: EpochsSaver,
     /// Consensus-block bytes executed since the last certificate stored on disk
@@ -2052,6 +2241,10 @@ pub struct Chain {
     /// state it executed, or one that diverged).
     #[cfg(test)]
     pub wrong_exec_root: bool,
+    /// Tests: this node's executor holds each finalized block this many simulated milliseconds
+    /// before executing it, as a node whose execution is slow does (`consensus/exec_delay.rs`).
+    #[cfg(test)]
+    pub exec_delay_ms: u64,
 }
 
 /// Epochs of validator-set history a node always keeps and serves: the weak-subjectivity period
@@ -2277,7 +2470,7 @@ impl MempoolCheck {
             } else {
                 // Kept txs stay applied (this is a private copy of the state); dropped ones don't.
                 let mut j = Journal::default();
-                let outcome = self.state.apply_j(&mut j, tx, &self.chain_id, &self.proposer, next, false);
+                let outcome = self.state.apply_j(&mut j, tx, &self.chain_id, &self.proposer, next, ApplyMode::Mempool);
                 let why = match outcome {
                     Ok(Outcome::Applied) => None,
                     Ok(Outcome::Failed(r)) => Some(format!("dropped from the mempool: {r}")),
@@ -2433,7 +2626,7 @@ fn state_records(state: &State) -> impl FnMut(store::RecordSink) -> Result<()> +
 impl Chain {
     /// Creates a new chain. With one validator, `home` gets genesis.json + validator.key.
     /// With N > 1, `home/v0 … home/v{N-1}` each get the shared genesis and their own key,
-    /// with localhost ports picked automatically.
+    /// with localhost ports picked automatically, or the ones `host` publishes them at.
     pub fn summon(home: &Path, o: &SummonOpts) -> Result<Vec<PathBuf>> {
         let (chain_id, faucet, block_time_ms, validators, http_port) = (o.chain_id.as_str(), o.faucet, o.block_time_ms, o.validators, o.http_port);
         let prefix = o.address_prefix.as_str();
@@ -2454,14 +2647,25 @@ impl Chain {
         if let Some(t) = &o.contribution {
             t.check()?;
         }
+        let host = o.host.as_deref().map(summon_host).transpose()?;
+        if host.is_some() && validators > usize::from(u16::MAX - SUMMON_P2P_PORT) + 1 {
+            bail!("--host publishes validator i at port {SUMMON_P2P_PORT} + i: at most {} validators", u16::MAX - SUMMON_P2P_PORT + 1);
+        }
         let keys: Vec<Keys> = (0..validators).map(|_| Keys::generate()).collect();
         let mut infos = vec![];
         for (i, k) in keys.iter().enumerate() {
-            let http = match (i, http_port) {
-                (0, Some(p)) => p,
-                _ => free_port()?,
+            let (p2p_addr, http_addr) = match &host {
+                // Fixed ports, so the machine's firewall and port forwards can be set up before the start.
+                Some(h) => (format!("{h}:{}", SUMMON_P2P_PORT + i as u16), format!("{h}:{}", SUMMON_HTTP_PORT + i as u16)),
+                None => {
+                    let http = match (i, http_port) {
+                        (0, Some(p)) => p,
+                        _ => free_port()?,
+                    };
+                    (format!("127.0.0.1:{}", free_port()?), format!("127.0.0.1:{http}"))
+                }
             };
-            infos.push(ValidatorInfo { address: k.address_with(prefix), public_key: hex::encode(k.public_key()), p2p_addr: format!("127.0.0.1:{}", free_port()?), http_addr: format!("127.0.0.1:{http}") });
+            infos.push(ValidatorInfo { address: k.address_with(prefix), public_key: hex::encode(k.public_key()), p2p_addr, http_addr });
         }
         let per_validator = 1_000_000_000 * DROPS_PER_FANG / validators as u64;
         let mut allocations: Vec<Allocation> = keys.iter().map(|k| Allocation { address: k.address_with(prefix), amount: per_validator, vesting: None, label: None }).collect();
@@ -2477,9 +2681,15 @@ impl Chain {
             }
             None => {}
         }
+        if let Some(t) = &o.token {
+            check_token(t)?;
+        }
+        if let Some(b) = &o.brand {
+            check_brand(b)?;
+        }
         let mut genesis = Genesis {
             chain_id: chain_id.to_string(),
-            token: "FANG".into(),
+            token: o.token.clone().unwrap_or_else(|| DEFAULT_TOKEN.into()),
             decimals: DECIMALS,
             block_time_ms,
             validators: infos,
@@ -2494,10 +2704,11 @@ impl Chain {
             operators: vec![],
             reserved_names: vec![],
             soul_ledger: vec![],
-            features: vec![],
-            upgrades: vec![],
+            features: o.features.clone(),
+            upgrades: o.upgrades.clone(),
             bootstrap_excluded: vec![],
             pool_repos: Default::default(),
+            brand: o.brand.clone(),
         };
         // Every validator stakes: each owns itself and bonds twice the minimum from its
         // allocation, so a light slash (downtime) doesn't leave it under-bonded.
@@ -2604,6 +2815,10 @@ impl Chain {
             mempool: vec![],
             lane: HashMap::new(),
             duties: HashMap::new(),
+            quarantine: Default::default(),
+            strikes: Default::default(),
+            verified_clean: Default::default(),
+            trial: crate::programs::fault::TrialMarker::new(home),
             mempool_ids: vec![],
             pool: Default::default(),
             pending: HashMap::new(),
@@ -2621,6 +2836,7 @@ impl Chain {
             keep_blocks: None,
             broken: None,
             replayed: 0,
+            receipt_mismatches: 0,
             epochs_saver,
             cert_bytes: CERT_SPACING_BYTES,
             halt,
@@ -2628,6 +2844,8 @@ impl Chain {
             junk_proposals: false,
             #[cfg(test)]
             wrong_exec_root: false,
+            #[cfg(test)]
+            exec_delay_ms: 0,
         };
         chain.replay_logs()?;
         if rebuilt_epochs {
@@ -2647,7 +2865,19 @@ impl Chain {
         chain.set_finalized_tip(chain.height());
         chain.publish();
         chain.live.publish_epochs(Arc::new(chain.epochs.clone()));
+        chain.quarantine_trials();
         Ok(chain)
+    }
+
+    /// What the last run's trial marker still names goes into the quarantine under the rule a
+    /// fault gets (docs/PROGRAMS-V0.md §6.2): the process stopped while trying those program
+    /// transactions, so they stop it at most once.
+    fn quarantine_trials(&mut self) {
+        let day = crate::params::blocks_per_day(self.state.params.block_time_ms);
+        for trial in crate::programs::fault::recover(&self.home) {
+            tracing::error!(tx = %trial.id, sender = %trial.sender, kind = %trial.kind, "the last run stopped while trying tx {}: quarantined", trial.id);
+            self.quarantine.hold(&trial, self.height + 1, day);
+        }
     }
 
     /// Executes the blocks logged past the commit point again (a crash came between the logs
@@ -3002,13 +3232,24 @@ impl Chain {
         crate::upgrade::check_next_with(&self.state, block.height, self.halt.supported)?;
         let version = crate::upgrade::version_at(&self.state, block.height);
         let mut named = Vec::with_capacity(block.txs.len());
-        for (i, tx) in block.txs.iter().enumerate() {
-            named.push(self.state.named_by(tx));
-            let outcome = self.state.apply(tx, &self.genesis.chain_id, &block.proposer, block.height).with_context(|| format!("replaying block {}", block.height))?;
-            check_replayed(block.height, i, &outcome, block.failed.get(&i))?;
+        // The block's txs run as one block pass (`programs::block_pass`).
+        crate::programs::block_pass(block.txs.iter(), || -> Result<()> {
+            for (i, tx) in block.txs.iter().enumerate() {
+                named.push(self.state.named_by(tx));
+                let outcome = self.state.apply(tx, &self.genesis.chain_id, &block.proposer, block.height).with_context(|| format!("replaying block {}", block.height))?;
+                // A program node fault halts here as executing the block would, before its outcome
+                // could be taken for the logged one's (docs/PROGRAMS-V0.md §6.2).
+                crate::programs::fault::halt_on_fault(&self.state, crate::programs::fault::Path::Startup, block.height, &self.halt.signal, None)?;
+                check_replayed(block.height, i, &outcome, block.failed.get(&i))?;
+            }
+            Ok(())
+        })?;
+        // The program receipts it computed again, against the logged ones it keeps (§8.1).
+        if !crate::programs::receipt::replayed(&mut self.state, &block) {
+            self.receipt_mismatches += 1;
         }
         let tx_bytes = block.txs.iter().map(Tx::size).chain(block.skipped.iter().copied()).sum();
-        self.state.end_block(&BlockInfo { height: block.height, version, hash: &block.hash, proposer: &block.proposer, view: block.view, parent_view: block.parent_view, skipped: &block.skipped, tx_bytes });
+        self.state.end_block(&BlockInfo { chain_id: &self.genesis.chain_id, height: block.height, version, hash: &block.hash, proposer: &block.proposer, view: block.view, parent_view: block.parent_view, skipped: &block.skipped, tx_bytes });
         if self.state.params.is_boundary(block.height) {
             self.record_epoch(block.height);
         }
@@ -3121,6 +3362,10 @@ impl Chain {
         let mut results = Vec::with_capacity(f.txs.len());
         let chain_id = self.genesis.chain_id.clone();
         self.state.run_block(&chain_id, f.height, &f.hash, &f.proposer, f.view, f.parent_view, &f.txs, |_, n, r| results.push((n, r)));
+        // A program node fault: this node stops rather than commit a block it ran otherwise than
+        // the quorum that certified it (docs/PROGRAMS-V0.md §6.2), unless its own verification ran
+        // this very block clean (then the fault is this node's doing, and a restart may cure it).
+        crate::programs::fault::halt_on_fault(&self.state, crate::programs::fault::Path::Execute, f.height, &self.halt.signal, Some((&self.verified_clean, &f.hash)))?;
         for (tx, (n, r)) in f.txs.into_iter().zip(results) {
             match r {
                 Ok(Outcome::Applied) => {
@@ -3142,11 +3387,17 @@ impl Chain {
         if self.state.params.is_boundary(f.height) && self.record_epoch(f.height) {
             self.sign_handoffs();
         }
+        // An alarm for a program total that drifted from its sum, once an epoch (§7.1).
+        if self.state.params.is_boundary(f.height) {
+            crate::programs::check_totals(&self.state);
+        }
         let commit = self.state.commit_block()?;
         let state_root = hex::encode(commit.root);
         #[cfg(test)]
         self.state.debug_check(f.height);
-        let block = Arc::new(Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, view: f.view, parent_view: f.parent_view, version: f.version, signal: f.signal, proposer: f.proposer, state_root, txs, hash: f.hash, signature: String::new(), failed, skipped, base_fee });
+        // Its program transactions' receipts, by index into `txs` (display only, §8.1).
+        let programs = crate::programs::receipt::for_block(&mut self.state, f.height, &txs, &failed);
+        let block = Arc::new(Block { height: f.height, prev_hash: f.parent, timestamp_ms: f.timestamp_ms, view: f.view, parent_view: f.parent_view, version: f.version, signal: f.signal, proposer: f.proposer, state_root, txs, hash: f.hash, signature: String::new(), failed, skipped, base_fee, programs });
         if let Some(cert) = &f.certificate {
             self.disk.remember_cert(f.height, cert.clone());
         }
@@ -3154,11 +3405,20 @@ impl Chain {
         let e = self.prepare_commit(block, &named, Some(f.cblock), commit.records, f.certificate)?;
         self.cert_bytes = if e.cert.is_some() { 0 } else { self.cert_bytes.saturating_add(cblock_bytes) };
         self.advance(&e.block);
+        // The mempool sheds the block's txs with the state it moved past them, under the same
+        // lock (audit PERF-1, TR-1): while the block is written (`execute_shared`, without the
+        // lock), admission and `next_nonce` count only what's still queued, and a proposal walks
+        // a mempool without them. Readers see them pending until `finish`.
+        self.shed_included();
+        // The node-local safeguards move with the block: entries expire, and proposals of this
+        // node's that the chain skipped take their strikes (docs/PROGRAMS-V0.md §6.2).
+        crate::programs::fault::on_block(self, f.height, f.view, f.parent_view);
         Ok(e)
     }
 
     /// After the writer committed the block: the tree adopts the new database snapshot, readers
-    /// get the new view, the mempool sheds the block's txs, and checkpoints get a snapshot.
+    /// get the new view and a mempool without the block's txs (admission's queues shed them in
+    /// `apply_block`), and checkpoints get a snapshot.
     fn finish(&mut self, e: Executed, written: Result<(Arc<Snap>, CommitPoint)>) -> Result<()> {
         let (snap, point) = match written {
             Ok(w) if self.height == e.block.height => w,
@@ -3389,9 +3649,24 @@ impl Chain {
         self.lane.extend(joined);
     }
 
-    /// Removes the txs the head block included from the mempool (cheap: ids are kept). A new
-    /// head also makes every admission simulation stale.
+    /// Removes the txs the head block included from the readers' mirror of the mempool (cheap:
+    /// ids are kept), published by the caller (`finish`). Admission's queues shed them already,
+    /// in `apply_block` ([`Chain::shed_included`]), and nothing in the head is queued again
+    /// (`has_tx` finds it through `head_ids`). The simulations admission built since then stay:
+    /// they ran on the state `finish` keeps (`adopt` only moves the tree onto the new database
+    /// snapshot), so a sender's next tx doesn't re-run its queue (review NR-2).
     fn drop_included(&mut self) {
+        for id in &self.head_ids {
+            self.mp.remove(id);
+        }
+    }
+
+    /// Removes the head block's txs from the queues admission and proposals use, with the
+    /// state's step past the block (`apply_block`). The readers' mirror (`mp`) keeps them as
+    /// pending until `finish` publishes the block with it ([`Chain::drop_included`]), so a
+    /// reader never sees the previous state without them (its `next_nonce` would be short, and
+    /// an included tx not found). A new head also makes every admission simulation stale.
+    fn shed_included(&mut self) {
         self.sims.clear();
         if self.head_ids.is_empty() {
             return;
@@ -3400,7 +3675,6 @@ impl Chain {
         self.remove_from_mempool(|id| included.contains(id));
         for id in &included {
             self.pool.remove(id);
-            self.mp.remove(id);
         }
         self.head_ids = included;
         self.rebuild_pending();
@@ -3458,6 +3732,22 @@ impl Chain {
         }
         self.rebuild_pending();
         self.publish_mempool();
+    }
+
+    /// A proposal for block `height` met node faults in the trials of `faulted` (docs/PROGRAMS-V0.md
+    /// §6.2). Each `Tx` fault quarantines its transaction (its id, its sender's program
+    /// transactions, an upload's code) and drops it from the mempool, with its sender's later
+    /// transactions; a `Setup` fault is this node's trouble, not the transaction's, and leaves it
+    /// queued.
+    pub fn quarantine_faulted(&mut self, faulted: &[(Tx, crate::programs::state::Fault)], height: u64) {
+        let day = crate::params::blocks_per_day(self.state.params.block_time_ms);
+        let mut dropped = vec![];
+        for (tx, fault) in faulted.iter().filter(|(_, f)| f.class == crate::programs::state::FaultClass::Tx) {
+            let record = crate::programs::fault::Record::of(tx);
+            self.quarantine.hold(&record, height, day);
+            dropped.push((record.id, format!("not proposed: program execution faulted on this node ({})", fault.what)));
+        }
+        self.drop_from_mempool((height, dropped));
     }
 
     /// Drops mempool txs that expired or can no longer apply (included ones went already).
@@ -3532,7 +3822,7 @@ impl Chain {
     }
 
     /// The mempool in the order a proposal takes it ([`proposal_order`]): the validator-duty
-    /// lane first, then by tip per byte.
+    /// lane first, then by tip per byte (per share of the scarcer resource: [`TipRate`]).
     pub fn proposal_txs(&self) -> Vec<&Tx> {
         proposal_order(&self.mempool, |i| self.lane.contains_key(&self.mempool_ids[i]))
     }
@@ -3544,6 +3834,8 @@ impl Chain {
         if self.pool.contains(&id) || self.has_tx(&id) {
             return Ok((id, false));
         }
+        // What a program execution fault on this node holds back (docs/PROGRAMS-V0.md §6.2).
+        self.quarantine.refuses(&tx, &id, self.height() + 1)?;
         let unsigned = tx.is_unsigned();
         let sender = if unsigned { String::new() } else { tx.sender()? };
         let next = self.height() + 1;
@@ -3561,6 +3853,9 @@ impl Chain {
         // Ghost Mode: a bounded share of the mempool, and one queued spend per note (a high enough
         // tip displaces one). Unsigned ghost txs have no sender: no queue, nonce or simulation.
         let mut replaces = crate::ghost::mempool_admit(&self.mempool, &self.mempool_ids, &tx, own, relay, crate::econ::max_tip(&self.state, relay), evict)?;
+        // Programs: a bounded number of pending uploads, each one a block can carry, and nothing
+        // queued behind its sender's pending upload or create that needs it.
+        crate::programs::mempool_admit(&self.state, &self.mempool, &tx, next)?;
         let asks = crate::econ::name_asked_for(&self.state, &tx);
         if let Some(name) = &asks {
             self.first_to_ask(&tx, name)?;
@@ -3662,7 +3957,7 @@ impl Chain {
         let (next, proposer, chain_id) = (self.height() + 1, self.fee_sink(), self.genesis.chain_id.clone());
         let try_apply = |state: &mut State| -> Result<Journal> {
             let mut j = Journal::default();
-            let outcome = state.apply_j(&mut j, tx, &chain_id, &proposer, next, false);
+            let outcome = state.apply_j(&mut j, tx, &chain_id, &proposer, next, ApplyMode::Mempool);
             match outcome {
                 Ok(Outcome::Applied) => Ok(j),
                 Ok(Outcome::Failed(r)) => {
@@ -3708,7 +4003,7 @@ impl Chain {
         for &i in queue {
             let t = &self.mempool[i];
             let mut j = Journal::default();
-            let why = match state.apply_j(&mut j, t, chain_id, proposer, next, false) {
+            let why = match state.apply_j(&mut j, t, chain_id, proposer, next, ApplyMode::Mempool) {
                 Ok(Outcome::Applied) => continue,
                 Ok(Outcome::Failed(r)) => r,
                 Err(e) => e.to_string(),
@@ -3718,8 +4013,8 @@ impl Chain {
         Ok(SenderSim { state, applied: queue.len(), used: 0 })
     }
 
-    /// The tx a full mempool gives up for `tx`: the lowest tip per byte if `tx` pays more (among
-    /// equals, the newest arrival). Only another sender's last queued tx can go, so nobody is
+    /// The tx a full mempool gives up for `tx`: the lowest tip per byte (per share: [`TipRate`]) if
+    /// `tx` pays more (among equals, the newest arrival). Only another sender's last queued tx can go, so nobody is
     /// left with a nonce gap, and every queued tx still applies after its predecessors. Validator
     /// duties in the lane never go.
     fn eviction_victim(&self, tx: &Tx, sender: &str) -> Result<usize> {
@@ -3729,11 +4024,12 @@ impl Chain {
             Some(i) if TipRate::of(tx) > TipRate::of(&self.mempool[i]) => Ok(i),
             Some(i) => {
                 let low = TipRate::of(&self.mempool[i]);
-                let mut need = (low.tip as u128 * tx.size() as u128 / low.size.max(1) as u128 + 1).min(u64::MAX as u128);
+                let mut need = (low.tip as u128 * TipRate::of(tx).share as u128 / low.share.max(1) as u128 + 1).min(u64::MAX as u128);
                 // Never ask for a tip past this tx's cap (review of fix-fees): a mempool full of
                 // smaller txs tipping near theirs can't be outbid until blocks drain it or the
-                // base fee (and with it every cap) rises.
-                let mut cap = crate::econ::max_tip(&self.state, crate::econ::base_fee(&self.state, self.height() + 1, tx.size()));
+                // base fee (and with it every cap) rises. A program tx's base fee includes its fuel.
+                let next = self.height() + 1;
+                let mut cap = crate::econ::max_tip(&self.state, crate::econ::base_fee(&self.state, next, tx.size()).saturating_add(crate::programs::fuel_fee(&self.state, tx, next)));
                 // An unsigned ghost tx tips a whole multiple of the fee grid (review of fix-fees-2).
                 if tx.is_unsigned() {
                     let grid = crate::ghost::FEE_GRID as u128;
@@ -3908,6 +4204,23 @@ impl Chain {
         self.execute(f)
     }
 
+    /// Tests: the first half of [`Chain::execute`], the block applied in memory. Until
+    /// [`Chain::execute_end`] the chain is in the window `execute_shared` leaves while the block
+    /// is written without the lock: admission, `next_nonce` and proposals run in it.
+    #[cfg(test)]
+    pub(crate) fn execute_begin(&mut self, f: Finalized) -> Result<Executed> {
+        self.execute_in_memory(f)
+    }
+
+    /// Tests: the rest of [`Chain::execute`] for a block [`Chain::execute_begin`] applied.
+    #[cfg(test)]
+    pub(crate) fn execute_end(&mut self, mut e: Executed) -> Result<()> {
+        let written = self.writer.clone().lock().persist(&mut e);
+        self.finish(e, written)?;
+        self.revalidate_mempool();
+        Ok(())
+    }
+
     /// The next block with `txs`, as consensus would hand it over (tests).
     #[cfg(test)]
     pub fn test_block(&self, txs: Vec<Tx>) -> Finalized {
@@ -4078,13 +4391,16 @@ pub const MAX_PENDING_PER_SENDER: usize = 64;
 /// claim is reported or attested once (the chain refuses repeats), so the lane stays small: at
 /// most 2 × 64 validators × 5 kinds × this many txs (a reveal still owed by a validator that left
 /// the set counts too), plus, while the set is one or two members, their admissions and one
-/// candidate's readiness. Duties past it, or behind their sender's other txs (the lane is a prefix of
-/// each sender's queue), queue like any tx and join the lane once what's ahead of them is gone.
+/// candidate's readiness, and, once programs exist, each active validator's pause signature (one
+/// while its vote is live: docs/PROGRAMS-V0.md §7.2). Duties past it, or behind their sender's
+/// other txs (the lane is a prefix of each sender's queue), queue like any tx and join the lane
+/// once what's ahead of them is gone.
 pub const DUTY_LANE_PER_KIND: usize = 2;
 
 /// Mempool txs in the order a proposal takes them: those `first` picks (the validator-duty lane,
-/// by index) ahead of the rest, then the highest tip per byte (earlier arrival first among
-/// equals), each sender's txs still in nonce (arrival) order.
+/// by index) ahead of the rest, then the highest tip per byte (per share of the scarcer resource:
+/// [`TipRate`]; earlier arrival first among equals), each sender's txs still in nonce (arrival)
+/// order.
 pub fn proposal_order(mempool: &[Tx], first: impl Fn(usize) -> bool) -> Vec<&Tx> {
     use std::cmp::Reverse;
     use std::collections::{BinaryHeap, VecDeque};
@@ -4116,22 +4432,26 @@ pub fn proposal_order(mempool: &[Tx], first: impl Fn(usize) -> bool) -> Vec<&Tx>
     out
 }
 
-/// A tx's tip per byte, compared exactly (cross-multiplied in u128, no floats).
+/// A tx's tip per share of the block resource it uses more of (docs/PROGRAMS-V0.md §5.6): its
+/// bytes, or the program fuel its own bytes declare (`programs::share`). For every tx that declares
+/// no fuel (all but tags 62–64) the share is its size times a constant, so those compare exactly as
+/// tip per byte. Compared exactly (cross-multiplied in u128, no floats). Proposer and mempool
+/// policy, not consensus.
 #[derive(Clone, Copy, Debug)]
 pub struct TipRate {
     pub tip: u64,
-    pub size: u64,
+    pub share: u64,
 }
 
 impl TipRate {
     pub fn of(tx: &Tx) -> Self {
-        Self { tip: tx.tip, size: tx.size().max(1) }
+        Self { tip: tx.tip, share: crate::programs::share(tx) }
     }
 }
 
 impl Ord for TipRate {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.tip as u128 * other.size as u128).cmp(&(other.tip as u128 * self.size as u128))
+        (self.tip as u128 * other.share as u128).cmp(&(other.tip as u128 * self.share as u128))
     }
 }
 impl PartialOrd for TipRate {
@@ -4170,6 +4490,92 @@ mod tests {
         assert_eq!(c.height(), 2);
         assert_eq!(c.state.primary_name(&alice.address()).unwrap(), "alice.boo");
         fs::remove_dir_all(home).ok();
+    }
+
+    /// `summon --name/--description/--token`: the genesis carries the chain's name and ticker,
+    /// the genesis hash binds them (so a node serving the genesis can't rename the chain), and a
+    /// chain made without them hashes as it always did.
+    #[test]
+    fn summon_names_the_chain_and_the_genesis_hash_binds_it() {
+        let base = std::env::temp_dir().join(format!("blockula-brand-{}-{}", now_ms(), std::process::id()));
+        let summon = |dir: &str, token: Option<&str>, brand: Option<Brand>| {
+            let home = base.join(dir);
+            Chain::summon(&home, &SummonOpts { token: token.map(String::from), brand, ..SummonOpts::new("jack-in-the-block", 1) }).map(|_| Genesis::load(&home.join("genesis.json")).unwrap())
+        };
+        let hash = |g: &Genesis| hex::encode(crate::consensus::genesis_block(g).digest_bytes());
+        let jack = Brand { name: "Jack in the Block".into(), description: "A ledger for Jack's friends.".into() };
+        let g = summon("jack", Some("JACK"), Some(jack.clone())).unwrap();
+        assert_eq!((g.token.as_str(), g.brand.as_ref()), ("JACK", Some(&jack)));
+        g.check().unwrap();
+        // Renaming it, or changing its ticker or description, gives another chain.
+        let h = hash(&g);
+        for edit in [
+            (|g: &mut Genesis| g.brand.as_mut().unwrap().name = "Jack in the Box".into()) as fn(&mut Genesis),
+            |g| g.brand.as_mut().unwrap().description.clear(),
+            |g| g.token = "BOX".into(),
+            |g| g.brand = None,
+            |g| g.token = DEFAULT_TOKEN.into(),
+        ] {
+            let mut other = g.clone();
+            edit(&mut other);
+            assert_ne!(hash(&other), h);
+        }
+        // Without a brand and with FANG, the hash is the one chains always had: brand-free bytes.
+        let plain = summon("plain", None, None).unwrap();
+        assert_eq!((plain.token.as_str(), plain.brand.is_none()), (DEFAULT_TOKEN, true));
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("brand").is_none(), "no brand key in an unbranded genesis.json");
+        let (id, prefix) = (plain.chain_id.as_bytes(), plain.address_prefix.as_bytes());
+        let legacy_seed = <commonware_cryptography::Blake3 as commonware_cryptography::Hasher>::hash(&[b"BLOCKULA_GENESIS_V2", &(id.len() as u32).to_be_bytes(), id, &(prefix.len() as u32).to_be_bytes(), prefix, &plain.created_at_ms.to_be_bytes(), serde_json::to_string(&plain.validators).unwrap().as_bytes()]);
+        let legacy = crate::consensus::CBlock::new(legacy_seed, 0, 0, 0, plain.created_at_ms, String::new(), 0, crate::consensus::hex_32(&plain.initial_state().root()), vec![]).with_versions(crate::consensus::GENESIS_PROTOCOL_VERSION, crate::consensus::GENESIS_PROTOCOL_VERSION);
+        assert_eq!(hash(&plain), hex::encode(legacy.digest_bytes()));
+        // A ticker alone (no name) is bound too.
+        let ticker = summon("ticker", Some("JACK"), None).unwrap();
+        assert_ne!(hash(&ticker), hash(&Genesis { token: DEFAULT_TOKEN.into(), ..ticker.clone() }));
+        // What's refused, by summon and by the genesis check.
+        for (i, bad) in ["J", "jack", "JACKJACKJ", "1JACK", "JA CK", "JÄCK"].into_iter().enumerate() {
+            assert!(summon(&format!("badtoken{i}"), Some(bad), None).unwrap_err().to_string().contains("token must be"), "{bad:?}");
+            assert!(Genesis { token: bad.into(), ..plain.clone() }.check().is_err(), "{bad:?}");
+        }
+        let named = |name: &str, description: &str| Some(Brand { name: name.into(), description: description.into() });
+        for (i, bad) in [named("", ""), named(" Jack", ""), named("Jack\nBlock", ""), named(&"x".repeat(MAX_CHAIN_NAME + 1), ""), named("Jack", &"x".repeat(MAX_CHAIN_DESCRIPTION + 1)), named("Jack", "line\u{7}")].into_iter().enumerate() {
+            assert!(summon(&format!("badname{i}"), None, bad.clone()).unwrap_err().to_string().contains("chain "), "{bad:?}");
+        }
+        assert!(summon("emoji", Some("B2B"), named("🦇 Jack in the Block", "")).is_ok(), "names can be any printable text");
+        fs::remove_dir_all(base).ok();
+    }
+
+    /// `summon --host`: other machines reach the validators at the host, on fixed ports counted up
+    /// from the defaults, and each operator's proof of possession signs those addresses (the
+    /// genesis checks it). Without a host the chain stays on 127.0.0.1.
+    #[test]
+    fn summon_publishes_its_validators_at_the_host() {
+        let base = std::env::temp_dir().join(format!("blockula-host-{}-{}", now_ms(), std::process::id()));
+        let summon = |name: &str, host: Option<&str>, validators: usize| {
+            let home = base.join(name);
+            Chain::summon(&home, &SummonOpts { host: host.map(String::from), ..SummonOpts::new("hosted", validators) }).map(|_| Genesis::load(&home.join("genesis.json")).unwrap())
+        };
+        let addrs = |g: &Genesis| g.validators.iter().map(|v| (v.p2p_addr.clone(), v.http_addr.clone())).collect::<Vec<_>>();
+        let g = summon("dns", Some("ledger.example.org"), 2).unwrap();
+        assert_eq!(addrs(&g), [("ledger.example.org:30300".into(), "ledger.example.org:7070".into()), ("ledger.example.org:30301".into(), "ledger.example.org:7071".into())]);
+        assert_eq!(g.operators.iter().map(|o| (o.p2p_addr.clone(), o.http_addr.clone())).collect::<Vec<_>>(), addrs(&g), "the stake records publish the same addresses");
+        g.check().unwrap();
+        // A Tailscale address, and an IPv6 one (bracketed before its port).
+        assert_eq!(addrs(&summon("tailnet", Some("100.101.102.103"), 1).unwrap()), [("100.101.102.103:30300".into(), "100.101.102.103:7070".into())]);
+        assert_eq!(addrs(&summon("v6", Some("fd00::1"), 1).unwrap()), [("[fd00::1]:30300".into(), "[fd00::1]:7070".into())]);
+        for (i, bad) in ["two words", "", "host/path"].into_iter().enumerate() {
+            let err = summon(&format!("bad{i}"), Some(bad), 1).unwrap_err().to_string();
+            assert!(err.contains("--host must be an IP address or a DNS name"), "{bad:?}: {err}");
+        }
+        let local = summon("local", None, 2).unwrap();
+        assert!(local.validators.iter().all(|v| v.p2p_addr.starts_with("127.0.0.1:") && v.http_addr.starts_with("127.0.0.1:")));
+        fs::remove_dir_all(base).ok();
+    }
+
+    /// `summon`'s default epoch is about 10 minutes of blocks, as 600 one-second blocks were.
+    #[test]
+    fn summon_epochs_last_about_ten_minutes() {
+        assert_eq!([1_000, 5_000, 2_000, 60_000, 600_000, 0].map(summon_epoch_blocks), [600, 120, 300, 10, 2, 600_000]);
     }
 
     fn signed(c: &Chain, from: &str, keys: &Keys, nonce: u64, action: Action) -> Tx {
@@ -5436,6 +5842,7 @@ mod scaffold {
             upgrades: vec![],
             bootstrap_excluded: vec![],
             pool_repos: Default::default(),
+            brand: None,
         }
     }
 
@@ -5689,8 +6096,8 @@ mod scaffold {
         // Upgrades and features.
         crate::upgrade::exec_deactivate_feature(s, &mut j, "ghost").unwrap();
         assert!(crate::upgrade::exec_deactivate_feature(s, &mut j, "ghost").is_err());
-        crate::upgrade::exec_activate_feature(s, &mut j, "ghost", h).unwrap();
-        assert!(crate::upgrade::exec_activate_feature(s, &mut j, "warp", h).is_err());
+        crate::upgrade::exec_activate_feature(s, &mut j, "scaffold-1", "ghost", h).unwrap();
+        assert!(crate::upgrade::exec_activate_feature(s, &mut j, "scaffold-1", "warp", h).is_err());
         assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, h, h, h).is_err(), "only after now");
         crate::upgrade::exec_schedule_upgrade(s, &mut j, 9, 100, h, h).unwrap();
         assert!(crate::upgrade::exec_schedule_upgrade(s, &mut j, 10, 80, h, h).unwrap_err().to_string().contains("must come after it"), "only after the last one");
@@ -5741,19 +6148,20 @@ mod scaffold {
     }
 
     /// P7 (docs/PROGRAMS-PLAN.md): a version-gated rule, here the test-only `upgrade::test_gate`
-    /// (admission refuses its memo from v2 on), flips at the activation height on every path a
-    /// node runs on its own (mempool admission and revalidation, execution, the end-of-block
-    /// steps, and replay from the block logs) and nowhere else. `consensus.rs` and the simulator
-    /// cover propose and verify.
+    /// (admission refuses its memo from the preview version on), flips at the activation height on
+    /// every path a node runs on its own (mempool admission and revalidation, execution, the
+    /// end-of-block steps, and replay from the block logs) and nowhere else. `consensus.rs` and the
+    /// simulator cover propose and verify.
     #[test]
     fn a_version_gated_rule_flips_at_its_height_on_every_path() {
         const AT: u64 = 4;
+        let preview = crate::upgrade::PREVIEW_PROTOCOL_VERSION;
         let mut g = genesis("scaffold-1");
-        g.upgrades = vec![crate::upgrade::ScheduledUpgrade { version: crate::upgrade::PREVIEW_PROTOCOL_VERSION, activation_height: AT }];
+        g.upgrades = vec![crate::upgrade::ScheduledUpgrade { version: preview, activation_height: AT }];
         g.check().unwrap();
         let (home, mut c) = open("version-gate", &g);
-        // This binary runs v2 on a chain whose genesis schedules it.
-        assert_eq!(c.halt.supported, crate::upgrade::PREVIEW_PROTOCOL_VERSION);
+        // This binary runs the preview version on a chain whose genesis schedules it.
+        assert_eq!(c.halt.supported, preview);
         let (owner, bob) = (keys(22), keys(24));
         let gated = |c: &Chain, nonce_ahead: u64| {
             let mut tx = signed(c, &owner, Action::Transfer { to: bob.address(), amount: FANG });
@@ -5763,25 +6171,26 @@ mod scaffold {
             tx.sign(&owner)
         };
         crate::upgrade::test_gate::record();
-        // Below v2 the rule doesn't exist: admitted (at the next height, 1), included, applied.
+        // Below the preview version the rule doesn't exist: admitted (at the next height, 1),
+        // included, applied.
         let early = gated(&c, 0);
         c.submit(early.clone()).unwrap();
         c.produce_block().unwrap();
         assert!(c.failure(&early.id()).is_none() && c.block(1).unwrap().txs.iter().any(|t| t.id() == early.id()));
         c.produce_block_with(vec![]).unwrap();
-        // Admitted for block 3, but block 3 leaves it out: from block 4 (v2) on it no longer
-        // applies, so revalidation drops it from the mempool.
+        // Admitted for block 3, but block 3 leaves it out: from block 4 (the preview version) on
+        // it no longer applies, so revalidation drops it from the mempool.
         let late = gated(&c, 0);
         c.submit(late.clone()).unwrap();
         c.produce_block_with(vec![]).unwrap();
         assert_eq!(c.height(), AT - 1);
-        assert!(!c.mempool.iter().any(|t| t.id() == late.id()), "dropped once the next height runs v2");
+        assert!(!c.mempool.iter().any(|t| t.id() == late.id()), "dropped once the next height runs the preview version");
         assert!(c.failure(&late.id()).unwrap().0.contains("test gate"));
         // Mempool admission for block 4 refuses it outright; an ungated tx still goes in.
         assert!(c.submit(gated(&c, 0)).unwrap_err().to_string().contains("test gate"));
         let plain = signed(&c, &owner, Action::Transfer { to: bob.address(), amount: FANG });
         c.submit(plain.clone()).unwrap();
-        // Execution: a block at v2 that carries one anyway skips it (unadmittable).
+        // Execution: a block at the preview version that carries one anyway skips it (unadmittable).
         let forced = gated(&c, 1);
         c.produce_block_with(vec![plain.clone(), forced.clone()]).unwrap();
         let b = c.block(AT).unwrap();
@@ -5789,19 +6198,22 @@ mod scaffold {
         assert_eq!(b.skipped, vec![forced.size()]);
         assert!(c.failure(&forced.id()).unwrap().0.contains("test gate"));
         c.produce_block_with(vec![]).unwrap();
-        // Each block carries the version in force at its height, and its end-of-block steps saw it.
+        // Each block carries the version in force at its height, and its end-of-block steps saw it,
+        // and the chain's id (`State::run_block` hands it on: chain-scoped rules read it there).
         let versions: Vec<(u64, u32)> = (1..=AT + 1).map(|h| (h, c.block(h).unwrap().version)).collect();
-        assert_eq!(versions, vec![(1, 1), (2, 1), (3, 1), (4, 2), (5, 2)]);
-        assert_eq!(crate::upgrade::test_gate::take(), versions);
+        assert_eq!(versions, vec![(1, 1), (2, 1), (3, 1), (4, preview), (5, preview)]);
+        let seen: Vec<(String, u64, u32)> = versions.iter().map(|&(h, v)| (g.chain_id.clone(), h, v)).collect();
+        assert_eq!(crate::upgrade::test_gate::take(), seen);
         let root = c.state.root();
         drop(c);
         // Replay from the block logs: block 1's gated tx applies again (v1) and block 4 skips the
-        // other (v2), to the same root, the end-of-block steps seeing the same versions.
+        // other (the preview version), to the same root, the end-of-block steps seeing the same
+        // versions and chain id (`Chain::replay`'s, from the genesis).
         fs::remove_file(home.join(store::DB_FILE)).unwrap();
         crate::upgrade::test_gate::record();
         let c = Chain::open(&home).unwrap();
         assert_eq!((c.height(), c.state.root()), (AT + 1, root));
-        assert_eq!(crate::upgrade::test_gate::take(), versions);
+        assert_eq!(crate::upgrade::test_gate::take(), seen);
         drop(c);
         fs::remove_dir_all(home).ok();
     }
@@ -6504,6 +6916,87 @@ mod persistence {
         println!("block written in {total:?}; the chain lock was free throughout the 300 ms write");
         drop(c);
         drop(chain);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// Audit PERF-1 / TR-1: the mempool sheds a block's txs in the locked step that moves the
+    /// state past them. In the window `execute_shared` leaves while the block is written (the
+    /// lock free, readers still on the previous block), a sender's next nonce is admitted (it
+    /// was refused with a false "expected"), `next_nonce` counts only what's still queued, and a
+    /// validator's own tx gets the nonce right after its included one (it got one past that,
+    /// which could never apply). Readers see the previous mempool until the block is on disk.
+    #[test]
+    fn the_mempool_sheds_a_block_with_its_state() {
+        let (h, mut c, alice) = active("shed", 3);
+        // Alice pays the validator, the validator's own txs pay alice (existing accounts both).
+        let (a, me) = (alice.address(), c.system_fee_payer().unwrap());
+        let pay = |to: &str, amount: u64| Action::Transfer { to: to.into(), amount };
+        let (n0, k0) = (c.next_nonce(&a), c.next_nonce(&me));
+        let t1 = tx(&c, &alice, pay(&me, 1));
+        c.submit(t1.clone()).unwrap();
+        let t2 = tx(&c, &alice, pay(&me, 2));
+        c.submit(t2.clone()).unwrap();
+        let s1 = c.submit_system(pay(&a, 3), "duty").unwrap();
+        assert_eq!((t1.nonce, t2.nonce, s1.nonce), (n0, n0 + 1, k0));
+        let height = c.height();
+        let f = c.test_block(c.mempool.clone());
+        let written = c.execute_begin(f).unwrap();
+        // The window: the state is past the block, and so is the mempool.
+        assert_eq!(c.state.account(&a).nonce, n0 + 2);
+        assert_eq!((c.pending_count(&a), c.next_nonce(&a), c.mempool.len()), (0, n0 + 2, 0));
+        let t3 = tx(&c, &alice, pay(&me, 4));
+        assert_eq!(t3.nonce, n0 + 2);
+        c.submit(t3.clone()).expect("the sender's next nonce is admitted");
+        let s2 = c.submit_system(pay(&a, 5), "duty").unwrap();
+        assert_eq!(s2.nonce, k0 + 1, "the nonce after its included tx");
+        // A tx the block included is known (accepted again idempotently), not queued again.
+        assert_eq!(c.submit_tx(t1.clone()).unwrap(), (t1.id(), false));
+        assert_eq!(c.mempool.len(), 2);
+        // Readers are on the previous block until it's written, with its txs still pending, so
+        // what they make of it adds up: `/api/account`'s next nonce is admission's.
+        let (view, mp) = (c.view(), c.live.mempool());
+        assert_eq!(view.height, height);
+        assert!(mp.contains(&t1.id()) && mp.contains(&t2.id()) && mp.contains(&t3.id()));
+        assert_eq!(view.state.account(&a).nonce + mp.pending_count(&a) as u64, c.next_nonce(&a));
+        c.execute_end(written).unwrap();
+        assert!(!c.live.mempool().contains(&t1.id()) && c.live.mempool().contains(&t3.id()) && c.live.mempool().contains(&s2.id()));
+        // What the window admitted runs in the next block.
+        c.produce_block().unwrap();
+        for t in [&t3, &s2] {
+            assert!(c.failure(&t.id()).is_none() && c.tx_location(&t.id()).is_some(), "{} ran", t.nonce);
+        }
+        assert_eq!((c.state.account(&a).nonce, c.state.account(&me).nonce), (n0 + 3, k0 + 2));
+        drop(c);
+        fs::remove_dir_all(h).ok();
+    }
+
+    /// Review NR-2: the simulations admission builds while a block is written stay once the
+    /// block is on disk (they ran on the state `finish` keeps), so a sender's next tx is one dry
+    /// run, not its whole queue again. What they admitted runs.
+    #[test]
+    fn simulations_built_while_a_block_is_written_are_kept() {
+        let (h, mut c, alice) = active("windowsims", 3);
+        let (a, me) = (alice.address(), c.system_fee_payer().unwrap());
+        let pay = |amount: u64| Action::Transfer { to: me.clone(), amount };
+        let n0 = c.state.account(&a).nonce;
+        let t1 = tx(&c, &alice, pay(1));
+        c.submit(t1.clone()).unwrap();
+        let f = c.test_block(c.mempool.clone());
+        let written = c.execute_begin(f).unwrap();
+        // The window: alice's first tx runs on the state, her second on a simulation of the first.
+        let rebuilt = c.sims.rebuilt;
+        for amount in [2, 3] {
+            c.submit(tx(&c, &alice, pay(amount))).unwrap();
+        }
+        assert_eq!(c.sims.rebuilt, rebuilt + 1, "one queued tx simulated");
+        c.execute_end(written).unwrap();
+        assert!(!c.live.mempool().contains(&t1.id()), "the readers' mirror shed the block");
+        // On disk now: her third tx runs on the window's simulation, which applied her two.
+        c.submit(tx(&c, &alice, pay(4))).unwrap();
+        assert_eq!(c.sims.rebuilt, rebuilt + 1, "her queue wasn't simulated again");
+        c.produce_block().unwrap();
+        assert_eq!((c.pending_count(&a), c.state.account(&a).nonce), (0, n0 + 4));
+        drop(c);
         fs::remove_dir_all(h).ok();
     }
 

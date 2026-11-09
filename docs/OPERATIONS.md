@@ -1,6 +1,8 @@
 # Operating Blockula
 
-For validator operators, sentry and RPC operators, and the release and incident teams. It closes the documentation side of OPS-1, OPS-4, OPS-5, OPS-6, OPS-7, SF-14 and CRY-2 (weak subjectivity) in [MAINNET.md](MAINNET.md), and follows the decisions in [MAINNET-DESIGN.md](MAINNET-DESIGN.md) (DEC-3, DEC-14, section 3.9).
+For validator operators, sentry and RPC operators, and the release and incident teams, on a chain you launch or join ([LAUNCH.md](LAUNCH.md)). Examples that name `blockula-testnet-2` come from the public testnet, which ran from October to November 2026. It follows the protocol's design in [MAINNET-DESIGN.md](MAINNET-DESIGN.md) (DEC-3, DEC-14, section 3.9). Ids like OPS-7 or SF-13 are items of the mainnet readiness list it was first written against (MAINNET-DESIGN.md's note says where to read it).
+
+New to running a node? Start with [RUN-A-NODE.md](RUN-A-NODE.md): a full node at home or on a small server, connecting your wallet, SDK, MCP and CLI to it, and becoming a validator, sized for today's network. This document is the reference for running validators professionally.
 
 Some of what's below needs protocol v1 code that is still landing. Those parts are marked **(planned: P-…)** with the package that delivers them; everything else works with today's binary.
 
@@ -11,14 +13,15 @@ Some of what's below needs protocol v1 code that is still landing. Those parts a
 3. [Reference hardware](#reference-hardware), [Bandwidth](#bandwidth), [Disk sizing](#disk-sizing)
 4. [Ports and firewall](#ports-and-firewall), [Time](#time), [Sentries](#sentries)
 5. [Running a validator](#running-a-validator)
-6. [Keys, backups and restores](#keys-backups-and-restores)
+6. [Keys, backups and restores](#keys-backups-and-restores), [Moving a validator](#moving-a-validator)
 7. [Upgrades](#upgrades)
-8. [Incident response](#incident-response)
-9. [Runbooks](#runbooks) (one per alert)
-10. [Weak subjectivity](#weak-subjectivity): what a joining node trusts, and checkpoints in releases
-11. [Releases](#releases) (and [installing and upgrading](#installing-and-upgrading) one), [npm packages](#npm-packages) and [repository settings](#repository-settings-github)
-12. [Monitoring](#monitoring)
-13. [Checklists](#checklists)
+8. [Programs (optional, off by default)](#programs-optional-off-by-default): limits, exit codes, the quarantine and the trial marker, metrics
+9. [Incident response](#incident-response) (including [programs: a fault, a stop and the pause](#programs-a-fault-a-stop-and-the-pause))
+10. [Runbooks](#runbooks) (one per alert)
+11. [Weak subjectivity](#weak-subjectivity): what a joining node trusts, and checkpoints in releases
+12. [Releases](#releases) (and [installing and upgrading](#installing-and-upgrading) one), [npm packages](#npm-packages) and [repository settings](#repository-settings-github)
+13. [Monitoring](#monitoring)
+14. [Checklists](#checklists)
 
 ## Roles and topology
 
@@ -46,16 +49,17 @@ A validator's HTTP API locks the same state the consensus engine uses, so a publ
 
 ## Validator set and hosting policy
 
-- **Active-set cap: 32 at genesis** (DEC-3). Votes are equal-weight; the set is the top 32 candidates by pool stake (planned: P-STAKE). The cap rises by governance once certificates shrink: a ⅔ certificate is ~73 KB at n = 32 and every validator re-broadcasts two per view (see [Bandwidth](#bandwidth)).
-- **Genesis target: 21–32 independent operators.** Halting the chain takes ⌊(n−1)/3⌋+1 validators (11 of 32), so independence is the security budget.
-- **No hosting provider, ASN or jurisdiction above ¼ of the active set** (8 of 32), always below ⅓ (DEC-14). Operators declare provider, ASN and jurisdiction at registration and whenever they move; the founder publishes the distribution monthly and asks operators in an over-represented provider, ASN or jurisdiction to move. Count by the ASN that actually routes the validator's IP (`whois -h whois.radb.net <ip>` or `curl ipinfo.io/<ip>/org`), not the reseller's brand.
-- **The founder's nodes stay small.** The founder runs **at most 3 validators**, on Fly.io: `performance-8x` machines (8 dedicated vCPUs, 32 GB; `performance-4x` with 16 GB is the floor), each with a dedicated IPv4 for p2p and a volume sized per [Disk sizing](#disk-sizing). Fly volumes top out at 500 GB at the time of writing: plenty for an empty chain for years, not for a sustained flood, so the founder's validators must run with block pruning (the validator default) and watch `HostDiskFillsWithinAWeek`. The public RPC nodes and the founder's sentries also run on Fly. The founder's share of the set shrinks as independent operators join.
+- **Active-set cap: 32 by default** (`max_validators`, DEC-3). Votes are equal-weight; the set is the top 32 candidates by pool stake. The cap rises by governance once certificates shrink: a ⅔ certificate is ~73 KB at n = 32 and every validator re-broadcasts two per view (see [Bandwidth](#bandwidth)).
+- **Independence is the security budget.** Halting the chain takes ⌊(n−1)/3⌋+1 validators (11 of 32). The mainnet's design asked for 21–32 independent operators at genesis; a chain you launch with friends is as safe as the people who run its validators.
+- **No hosting provider, ASN or jurisdiction above ¼ of the active set** (8 of 32), always below ⅓ (DEC-14). Genesis operators declare provider, ASN and jurisdiction in their operator files, and the genesis builder checks the caps; after genesis the chain can't see where nodes run, so whoever coordinates its operators keeps the count and asks operators in an over-represented provider, ASN or jurisdiction to move. Count by the ASN that actually routes the validator's IP (`whois -h whois.radb.net <ip>` or `curl ipinfo.io/<ip>/org`), not the reseller's brand.
 - **Recommended providers, mixed.** Bare metal and dedicated servers give unmetered or generously included bandwidth and predictable disks:
   - Latitude.sh, OVHcloud, Cherry Servers, Hetzner (dedicated). **Hetzner:** its terms have restricted crypto workloads before (mining is banned, and some blockchain node operators have been asked to leave); every operator must check the current terms and get written confirmation before running a validator there.
   - Regional and colocation providers spread ASNs and jurisdictions better than any big brand. They are welcome.
   - AWS and GCP work, but **internet egress is billed per GB**: ~12 TB/month of certificates alone costs on the order of $1,000 per validator per month at list prices. Use them only with committed-use egress pricing, or for sentries in front of a bare-metal validator.
 
 ## Reference hardware
+
+Sized for a full active set of 32 validators and full blocks. On a small set a node needs far less: measured on a chain of 4 validators (release 0.5.2, idle), a validator used about 80 MB of memory and 1–2% of a core, and sent about 59 KB/s, roughly 150 GB a month. [RUN-A-NODE.md](RUN-A-NODE.md#what-it-takes) has the numbers by set size; plan for this table as the set grows.
 
 | | Minimum | Recommended | Why |
 |---|---|---|---|
@@ -110,7 +114,7 @@ Transactions add far more than an idle chain: a transfer is stored in both logs 
 
 So:
 
-- **Validators at genesis: 2 TB NVMe** (1 TB minimum, with `--prune-blocks 43200`, half a day), on a volume you can grow without downtime. `HostDiskAlmostFull` (80%) and `HostDiskFillsWithinAWeek` give you time to grow it.
+- **Validators: 2 TB NVMe** (1 TB minimum, with `--prune-blocks 43200`, half a day), on a volume you can grow without downtime. `HostDiskAlmostFull` (80%) and `HostDiskFillsWithinAWeek` give you time to grow it.
 - **Archival RPC nodes** (`--archive`, or full nodes' default) keep everything and need the most disk: plan from the archive column above.
 - Losing `state.redb` costs no data: the node rebuilds it on start, by replaying its block logs from genesis (or from `base.state.zst` after a fast sync, or, on a pruned validator, from its newest local snapshot). That takes as long as the history; restarts otherwise take seconds.
 
@@ -126,7 +130,7 @@ So:
 | 9090, 9093, 3000, 9100 | monitoring | localhost, or the private link to the monitoring host |
 | Outbound | all | p2p to peers, NTP (UDP 123, or TCP 4460 for NTS), HTTPS to GitHub (contribution checks) |
 
-`blockula run --bind` sets the interface for **both** HTTP and p2p. A validator that binds `0.0.0.0` for p2p therefore also listens for HTTP on every interface, and the firewall is what keeps HTTP private. With nftables (Debian/Ubuntu):
+`blockula run --bind` sets the interface for **both** HTTP and p2p; `--http-bind` and `--p2p-bind` set one of them apart. Bind a validator's p2p to every interface and its HTTP to this machine, or to the private link its sentries and monitoring use: `--p2p-bind 0.0.0.0 --http-bind 127.0.0.1` (or the WireGuard address, `--http-bind 10.8.0.2`). With `--bind 0.0.0.0` alone, HTTP listens on every interface too, and only the firewall keeps it private: the node then logs "keep it private" at start. Use the firewall either way. With nftables (Debian/Ubuntu):
 
 ```bash
 # /etc/nftables.conf (excerpt): drop everything inbound except SSH (admin), p2p and the private link.
@@ -172,7 +176,7 @@ The rule: **validators serve consensus, sentries serve people.**
 
 - A validator's HTTP listens on a private interface (or is firewalled to one) and answers only its operator's sentries and monitoring. Validator-to-validator HTTP, where it's needed at all, also runs only over private links.
 - Each operator runs at least one sentry, ideally two in different regions. The sentry does the public work: the API and explorer, `/api/sync` and snapshots for joiners, tx intake with rate limits.
-- Register the sentry's public URL as your validator's `http_addr` (that's what other nodes and the explorer use), not the validator's own address. `deploy/launch.sh` does the same for the testnet.
+- Register the sentry's public URL as your validator's `http_addr` (that's what other nodes and the explorer use), not the validator's own address. `deploy/launch.sh` does the same for the validators it launches. Other nodes fetch the validator-set handoffs your validator signs from there too (`/api/epochs`; the sentry pulls them from the validator in its `--peer-http`), and on a public chain they skip an `http_addr` on a private or loopback address.
 
 **Today:** a sentry is a full node. It joins with `blockula join` (HTTP sync from its validator over the private link), forwards txs and faucet requests to the validator with `--peer-http http://<validator-private-ip>:7070`, and authenticates that forwarding with a shared `BLOCKULA_FORWARDER_SECRET` (≥ 32 chars, same value on both). Put a reverse proxy in front for TLS and rate limits, and tell the node which header carries the client IP:
 
@@ -209,23 +213,23 @@ sudo install -d -o blockula -g blockula -m 700 /var/lib/blockula
 ```
 
 2. **Install a verified binary**, as your own user with `gh auth login` done: [a first install](#a-first-install) (paste the block there). It checks the archive against the release announcement in the operators' channel, then the release's offline signature against the release key id, which it pins in `~/.blockula/release-key-id`. Every later upgrade is checked against that pin ([Upgrading](#upgrading)). Nothing the release ships, its `install.sh` included, runs before those checks pass.
-3. **The genesis file and the validator home.** Take the genesis file from the signed release, checked against the pinned key, not from a node: `blockula release fetch` puts only files that match the release's signed `checksums.txt` into `genesis-$V`. Then `validator init` creates the validator home and its consensus key.
+3. **The genesis file and the validator home.** Take the genesis file from the signed release, checked against the pinned key, not from a node: `blockula release fetch` puts only files that match the release's signed `checksums.txt` into `genesis-$V`. Releases ship the retired public testnet's (`genesis-blockula-testnet-2.json`); for a chain someone launched, take its genesis hash from its creator and pin it ([LAUNCH.md](LAUNCH.md)). Then `validator init` creates the validator home and its consensus key.
 
 <!-- runbook-test: validator-genesis -->
 ```bash
 ( set -euo pipefail
   V=vX.Y.Z
-  /usr/local/bin/blockula release fetch $V --file genesis-blockula-1.json --dir genesis-$V
-  sudo install -m 644 genesis-$V/genesis-blockula-1.json /var/lib/blockula/genesis-blockula-1.json
+  /usr/local/bin/blockula release fetch $V --file genesis-blockula-testnet-2.json --dir genesis-$V
+  sudo install -m 644 genesis-$V/genesis-blockula-testnet-2.json /var/lib/blockula/genesis-blockula-testnet-2.json
   sudo -u blockula /usr/local/bin/blockula validator init --home /var/lib/blockula/val \
-    --genesis /var/lib/blockula/genesis-blockula-1.json \
+    --genesis /var/lib/blockula/genesis-blockula-testnet-2.json \
     --public-p2p-addr <your-ip>:30300 --public-http-addr https://<your sentry>
 )
 ```
 
 Each block runs in a subshell with `set -euo pipefail`, so it stops at the first command that fails: fill in the `<…>` values, paste it whole, and nothing after a failed check runs. The blocks hold no comments, so they paste the same into bash and zsh. `scripts/test-release-runbook.sh` runs them as they're written here (CI).
 
-At genesis, keys come from the [genesis ceremony](GENESIS_CEREMONY.md) instead, and the home is built from the published `genesis.json` (verify its hash).
+A chain's first validators make their keys before its genesis exists instead: `blockula summon` does it for a chain you launch ([LAUNCH.md](LAUNCH.md)), and a chain built from a reviewed spec holds a [genesis ceremony](GENESIS_CEREMONY.md), with each home built from the published `genesis.json` (verify its hash).
 
 Run it under systemd:
 
@@ -247,8 +251,10 @@ ExecStart=/usr/local/bin/blockula run --home /var/lib/blockula/val --bind 0.0.0.
 Restart=on-failure
 RestartSec=10
 # Deliberate stops stay stopped until an operator acts: 10 --halt-height reached, 11 a protocol
-# version this binary doesn't run is in force, 12 another instance is signing with this key.
-RestartPreventExitStatus=10 11 12
+# version this binary doesn't run is in force, 12 another instance is signing with this key,
+# 13 a program faulted while executing a certified block (a restart replays it). 14, a thread the
+# OS wouldn't start for a program, restarts.
+RestartPreventExitStatus=10 11 12 13
 LimitNOFILE=65536
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -262,7 +268,7 @@ WantedBy=multi-user.target
 
 `/etc/blockula/env` (mode 600, root) holds `BLOCKULA_FORWARDER_SECRET=…` and a fine-grained, public-read-only `GITHUB_TOKEN=…` (validators check contribution claims against GitHub; without a token they hit the anonymous rate limit). Then `sudo systemctl enable --now blockula`, `journalctl -u blockula -f`, and `curl -s 127.0.0.1:7070/api/health`.
 
-Exit codes: `0` never for a validator (it runs until stopped), `1` an error (the log says what), `10`, `11` and `12` the deliberate stops in the unit above ([Halted](#halted), [Upgrade required](#upgrade-required), [Slashing protection](#slashing-protection)).
+Exit codes: `0` never for a validator (it runs until stopped), `1` an error (the log says what), `10`, `11`, `12` and `13` the deliberate stops in the unit above that stay stopped ([Halted](#halted), [Upgrade required](#upgrade-required), [Slashing protection](#slashing-protection), and 13, a program that faulted while the node executed a certified block: [A program fault](#a-program-fault-exit-13)), and `14` a stop that restarts (the node couldn't start a thread or build an engine for a program, or a block it had verified clean faulted when it executed it: [A resources stop](#a-resources-stop-exit-14)). A node whose startup replay meets a block in a protocol version this binary doesn't run exits `11`, a full node as well as a validator; on a chain with programs, one whose replay meets a program fault exits 13 or 14 the same way. [Programs](#programs-optional-off-by-default) lists what each means and the limits a validator needs.
 
 Double-signing protection, in layers:
 
@@ -305,6 +311,27 @@ What that means for you: the watch adds a few seconds to a restart once the node
 
 **Quarterly restore drill** (OPS-6): on a testnet, restore a validator from its offline key backup onto a fresh host following the steps above, time it, and record the result in the operator log.
 
+## Moving a validator
+
+To another machine, another IP, or another provider. The rule is the same as for a restore: **never let two copies of `validator.key` run**, even for a minute. Two copies double-sign, which slashes 5% of the pool and tombstones the validator for good.
+
+1. **Prepare the new host** (hardware, firewall, time, verified binary), and start nothing on it.
+2. **Stop the old node, and keep it stopped:** `systemctl disable --now blockula`. If you can't be sure it stays down (a provider that restarts machines), power it off and detach its volume.
+3. **Copy the home** to the new host: `validator.key`, the newest `slashing-protection.json`, `genesis.json` and `node.json`. Chain data can come along or be synced again ([Restoring after losing a validator host](#keys-backups-and-restores), steps 4–5).
+4. **Publish the new addresses** if they changed:
+
+   ```bash
+   blockula validator set-addr --key <home>/validator.key --rpc <a node URL> \
+     --p2p <new host>:30300 --http https://<your sentry> --home <home>
+   ```
+
+   It sends `update_validator` with the validator's current commission (read from `/api/validators`), so only the addresses change. Sign with the consensus key (for its owner, once an epoch) or the owner's key. Your node advertises the p2p address in `node.json`, which `--home` updates, and other validators also take the chain's record as a starting point when they start. Give either flag alone to change one address. On a public chain, loopback and private addresses are refused unless you pass `--allow-private-addr`.
+5. **Start the new node.** The startup guard refuses a home last used by another machine (`BLOCKULA_INSTANCE_ID`): once you've proven the old node is down, start it once with `--i-know-this-key-is-not-running-elsewhere`. Then check it signs (`blockula status`), has its peers, and proposes blocks.
+
+**Genesis validators** advertise the p2p address in the genesis file, whatever the chain records later, so give them DNS names at genesis: moving one is then a DNS change. `set-addr` still updates what the chain publishes.
+
+**A loopback or private address published by mistake** (`validator init` once defaulted to 127.0.0.1): run `set-addr` with the right address. Nothing needs to move.
+
 ## Upgrades
 
 Upgrades are announced, released, signalled, scheduled and activated at a height (`node/src/upgrade.rs`, MAINNET-DESIGN 3.9). Nobody restarts everything at once.
@@ -314,6 +341,8 @@ Upgrades are announced, released, signalled, scheduled and activated at a height
 - a **validator exits with code 11** (systemd keeps it down, `RestartPreventExitStatus`), and does so again on every start until it's upgraded;
 - a **full node keeps serving reads** at that height, with `/api/health` 503 and `"halted": "upgrade_required"`, until it's upgraded.
 
+(A node whose *startup replay* meets such a block, after a downgrade with its database gone or behind its block log, exits 11 too, full node or validator.)
+
 Install the new binary ([Upgrading](#upgrading)) and start it: it executes the new version's blocks and catches up.
 
 **The hard-fork process.**
@@ -321,10 +350,10 @@ Install the new binary ([Upgrading](#upgrading)) and start it: it executes the n
 1. **Announce** at least two weeks ahead (planned upgrades): the version number, what changes, the release date, and the proposed activation height. Post in the operator channel and publicly.
 2. **Release** a signed, reproducible build ([Releases](#releases)). Operators install it with `blockula release install` ([Upgrading](#upgrading)), which checks the ML-DSA signature against their pinned release key id and provenance; ideally they rebuild it too.
 3. **Install and signal.** Each operator restarts onto the new binary in their own maintenance window, one node at a time, each only once the previous one is back (below). Across the network, never more than ⌊(n−1)/3⌋ validators out at once (one more halts the chain), counting any down for other reasons and any still reconnecting, so one at a time on sets of four to six: coordinate in the operator channel. The new binary signals the new version in every block it proposes. `GET /api/upgrade` shows readiness: the newest signal from each active validator and whether ≥ ⅔ are ready.
-4. **Schedule.** Once ≥ ⅔ of the active set signal the version, a `ScheduleUpgrade { version, activation_height }` proposal goes to governance (a ⅔ supermajority; MAINNET-DESIGN 3.5; `blockula gov propose upgrade`). Pick the height so the vote, the timelock, a cancellation's vote (below; the node refuses heights that leave no room for one) and a margin for stragglers fit before it. Every node then shows `blockula_upgrade_next_version` and `…_next_height`; nodes without the new binary fire `BlockulaUpgradeRequired`, and `…Soon` a day before.
+4. **Schedule.** Once ≥ ⅔ of the active set signal the version, a `ScheduleUpgrade { version, activation_height }` proposal goes to governance (a ⅔ supermajority; MAINNET-DESIGN 3.5; `blockula gov propose upgrade`). Pick the height so the vote, the timelock, a cancellation's vote (below; the node refuses heights that leave no room for one) and a margin for stragglers fit before it. Every node then shows `blockula_upgrade_next_version` and `…_next_height`; nodes without the new binary fire `BlockulaUpgradeRequired`, and `…Soon` a day before. Their logs say it too, without Prometheus: a node logs each scheduled version it runs once (INFO), and one it doesn't every hour from when it's scheduled (WARN: "protocol vN activates at #H (in about …): install a release that supports it").
 5. **Activate.** At the height every upgraded node switches rules. Watch `/api/upgrade` and the explorer: blocks from the activation height on carry the new `version`. Stragglers halt cleanly (above) instead of diverging; they upgrade and continue.
 
-**Withdrawing a scheduled upgrade** (the release is pulled for a bug, a reproducibility failure or a release-key incident; the release slips past the height). Until the activation is near, governance can take it back: a `CancelUpgrade { version, activation_height }` proposal (`blockula gov propose cancel-upgrade <version> --title "…"`, which looks the height up in `/api/upgrade`; SDK `proposal.cancelUpgrade(version, height)`). It needs the same ⅔ supermajority as scheduling (or, during the bootstrap, ⅔ of the council), has no timelock (it runs the block after its vote closes: it keeps the rules in force), and withdraws that entry and any upgrade scheduled after it. It can be proposed once the `ScheduleUpgrade` has run (while that one is still being voted on, vote nay), and only while it would land at least 64 blocks before the activation: at least `voting_blocks + 65` blocks ahead (a week and a bit on mainnet). Every `ScheduleUpgrade` has to leave room for one (at the voting period in force when it was proposed), and a cancellation that finds nothing to withdraw when it runs (a second one, a stale one) fails and changes nothing. Once it has run, `/api/upgrade` no longer lists the version, `blockula_upgrade_next_*` drop, and nobody halts at that height. The withdrawn version number (and every one up to it) is spent: the chain refuses to schedule it again (`/api/upgrade`'s `withdrawn.highest_version`), because halts and readiness signals compare only numbers, and a binary of the pulled release would run a re-scheduled version with the pulled rules. Ship the fixed release as the number the cancellation's outcome names ("ship the next upgrade as vN or later", also `/api/upgrade`'s `next_version`: past every spent number and every superseded proposal's own), signal it, and propose its `ScheduleUpgrade` after the cancellation has run: any `ScheduleUpgrade` proposed in or before the cancellation's block (still voting or queued when it ran) is superseded and fails when it would run, since it was proposed against the schedule the cancellation withdrew from (the cancellation's outcome lists them, and each one's own outcome names the same number). A `ScheduleUpgrade` waiting in a multisig for approvals when the cancellation ran (the foundation's k-of-n keys, say) is superseded too: the chain refuses the approval that would file it ("superseded"; `/api/multisig` shows it as `superseded`), so abandon it (let it expire), treat its number as spent, and file the fixed release's `Propose` as a new multisig action after the cancellation (review-fix-ops-2; the outcome counts them). The numbers of the superseded proposals that had passed (their vote ended by the block the cancellation ran in, whatever the proposal ids: every vote of a block closes before anything runs in it) are spent by the chain too, since their releases may be out and signalled, and so is the number of one superseded while still being voted on that passes anyway (when its vote closes). A number whose `ScheduleUpgrade` was rejected, or that waited in a multisig, isn't spent by the chain (filing one mustn't spend numbers); the advice goes past those that were open or stored when the cancellation ran (`withdrawn.superseded_version`), since a release may carry them, and if a release for any number was published, never reuse it. Anyone can push the advice up by filing an upgrade proposal at the top of the step while a cancellation is pending (at most 16 numbers per cancellation, and the step moves with it): a number between `withdrawn.highest_version` and the advice is still accepted, so use one only if you know no release carries it. Versions move up in steps of at most 16 past the newest ever scheduled, withdrawn or superseded, so the advised number is always one the chain accepts (review-r3-gov-1), and an upgrade activates at most 365 days after its proposal's vote ends, so a mistaken huge version is refused when it's proposed (review-r2-gov-1). A node already running the pulled release keeps following the chain (it runs the rules in force); replace it with the previous or the fixed release before the fixed one's activation, since it halts there.
+**Withdrawing a scheduled upgrade** (the release is pulled for a bug, a reproducibility failure or a release-key incident; the release slips past the height). Until the activation is near, governance can take it back: a `CancelUpgrade { version, activation_height }` proposal (`blockula gov propose cancel-upgrade <version> --title "…"`, which looks the height up in `/api/upgrade`; SDK `proposal.cancelUpgrade(version, height)`). It needs the same ⅔ supermajority as scheduling (or, during the bootstrap, ⅔ of the council), has no timelock (it runs the block after its vote closes: it keeps the rules in force), and withdraws that entry and any upgrade scheduled after it. It can be proposed once the `ScheduleUpgrade` has run (while that one is still being voted on, vote nay), and only while it would land at least 64 blocks before the activation: at least `voting_blocks + 65` blocks ahead (a week and a bit at the default voting period). Every `ScheduleUpgrade` has to leave room for one (at the voting period in force when it was proposed), and a cancellation that finds nothing to withdraw when it runs (a second one, a stale one) fails and changes nothing. Once it has run, `/api/upgrade` no longer lists the version, `blockula_upgrade_next_*` drop, and nobody halts at that height. The withdrawn version number (and every one up to it) is spent: the chain refuses to schedule it again (`/api/upgrade`'s `withdrawn.highest_version`), because halts and readiness signals compare only numbers, and a binary of the pulled release would run a re-scheduled version with the pulled rules. Ship the fixed release as the number the cancellation's outcome names ("ship the next upgrade as vN or later", also `/api/upgrade`'s `next_version`: past every spent number and every superseded proposal's own), signal it, and propose its `ScheduleUpgrade` after the cancellation has run: any `ScheduleUpgrade` proposed in or before the cancellation's block (still voting or queued when it ran) is superseded and fails when it would run, since it was proposed against the schedule the cancellation withdrew from (the cancellation's outcome lists them, and each one's own outcome names the same number). A `ScheduleUpgrade` waiting in a multisig for approvals when the cancellation ran (the foundation's k-of-n keys, say) is superseded too: the chain refuses the approval that would file it ("superseded"; `/api/multisig` shows it as `superseded`), so abandon it (let it expire), treat its number as spent, and file the fixed release's `Propose` as a new multisig action after the cancellation (review-fix-ops-2; the outcome counts them). The numbers of the superseded proposals that had passed (their vote ended by the block the cancellation ran in, whatever the proposal ids: every vote of a block closes before anything runs in it) are spent by the chain too, since their releases may be out and signalled, and so is the number of one superseded while still being voted on that passes anyway (when its vote closes). A number whose `ScheduleUpgrade` was rejected, or that waited in a multisig, isn't spent by the chain (filing one mustn't spend numbers); the advice goes past those that were open or stored when the cancellation ran (`withdrawn.superseded_version`), since a release may carry them, and if a release for any number was published, never reuse it. Anyone can push the advice up by filing an upgrade proposal at the top of the step while a cancellation is pending (at most 16 numbers per cancellation, and the step moves with it): a number between `withdrawn.highest_version` and the advice is still accepted, so use one only if you know no release carries it. Versions move up in steps of at most 16 past the newest ever scheduled, withdrawn or superseded, so the advised number is always one the chain accepts (review-r3-gov-1), and an upgrade activates at most 365 days after its proposal's vote ends, so a mistaken huge version is refused when it's proposed (review-r2-gov-1). A node already running the pulled release keeps following the chain (it runs the rules in force); replace it with the previous or the fixed release before the fixed one's activation, since it halts there.
 
 **Too late for a vote** (fewer than `voting_blocks + 65` blocks to go, or the cancellation didn't pass): the chain will switch at the height, and every node without a binary that supports the version halts at the block before it (exit 11). Either ship a fixed release of that version and get ≥ ⅔ of the set onto it before the height, or stop the chain on purpose and fix it while it's stopped:
 
@@ -339,7 +368,92 @@ A restart takes a validator out until it's back: it loads the state database, ex
 
 **Coordinated stop at a height** (incidents, emergency patches): `blockula run … --halt-height H` executes block `H` and stops. A validator doesn't vote on or propose anything above `H` and exits with code 10 (and again at once on every start with the same flag); a full node keeps serving reads at `H`. If at least ⅓ of the set runs with the same `H`, the chain itself stops at `H`. Remove the flag (or raise it) to continue.
 
-The public testnet (`blockula-testnet-2`) runs the same version gating as mainnet: a release that changes no rules is a redeploy (`deploy/launch.sh`, validators in parallel, so blocks pause briefly), and a new protocol version goes through a `ScheduleUpgrade` the validators pass as its bootstrap council, as above, which is how upgrades are rehearsed before mainnet ([deploy/README.md](../deploy/README.md), "Day 2").
+The public testnet (`blockula-testnet-2`, until it was retired in November 2026) ran the same version gating: a release that changes no rules was a redeploy (`deploy/launch.sh`, validators in parallel, so blocks pause briefly), and a new protocol version went through a `ScheduleUpgrade` the validators passed as its bootstrap council, as above ([deploy/README.md](../deploy/README.md), "Day 2").
+
+## Programs (optional, off by default)
+
+Programs are small WebAssembly programs that anyone can upload and run on a chain ([PROGRAMS-V0.md](PROGRAMS-V0.md) is the specification). A chain has none unless it was made with them (`blockula summon --programs`, `blockula dev --programs`: [LAUNCH.md](LAUNCH.md#programs-experimental-off-by-default)) or its governance switched them on ([GOVERNANCE.md](GOVERNANCE.md#programs-optional-off-by-default)). On a chain without them nothing here applies: the node computes what it always did, and exits 13 and 14 never happen. This section is for the operators of a chain that has them. It's an experiment, and the people running the validators carry the consequences of it.
+
+### What a chain takes on
+
+- **Third-party code runs on every validator.** It runs in a fuel-metered interpreter, and what it does is the same on every node of one release. The failure to watch for is one node differing from the others (another build, another architecture, a machine that's short of memory). The node never lets that become an outcome: it leaves a transaction out, abstains from a vote, or stops (below).
+- **Every validator runs the same release.** A fault that only some validators hit is the sign of a mismatch, and it costs the chain proposals. Upgrade together ([Upgrades](#upgrades)).
+- **A pause needs people.** Any `f + 1` validators can pause programs for three days, and only validators can. Know who to ask, and read [the pause](#the-pause) before you need it. On a chain of 1 to 3 validators `f + 1` is 1: any one validator can pause programs for three days alone, and can keep renewing while a fix is pending, up to 30 days in any 60 (the cap). Choose validators you trust.
+- **Each validator needs a fee float on its own account.** The pause is signed by the validator's key from that account, like its other duties.
+- **Programs hold FANG.** The chain's unit is worthless by design, but a program's balance is still the chain's: a cap (`program_value_cap`, 10,000,000 FANG by default) bounds what programs control, and governance can lower it or switch programs off (exit-only: calls that pay users out still work).
+
+Where a chain stands: `curl -s 127.0.0.1:7070/api/params | jq .programs` (`status` is `on`, `exit_only` or `paused`; the key is absent until programs were first switched on), `/api/fees` (a `fuel` section appears with them), and `blockula_programs_status` in `/metrics` (1 on, 2 exit-only, 3 paused).
+
+### Limits a validator needs
+
+Each block that holds a program transaction runs on a thread of its own with a 64 MiB stack (`blockula-program-pass`), and the engine on it holds the code that block's transactions load. A node runs such a *pass* when it executes a certified block, replays an unexecuted ancestor, packs a proposal, verifies a block, or replays its block log at start. Per pass that is:
+
+- one thread with a **64 MiB stack**: virtual memory, of which tens of KiB are touched;
+- **under 32 MiB** of translated code (a pass's engine is dropped past 1 MiB of loaded code, which bounds it);
+- on a validator **at most two passes run at once** (the runtime has two workers and each pass blocks one; nothing else enforces it), so allow 128 MiB of virtual stack and under 64 MiB of translated code. A full node runs one at a time.
+- A node that serves views (a full node always; a validator only with `--program-views`) adds up to **two concurrent views**, each a 64 MiB thread and an engine (`--view-max-fuel` bounds one).
+
+A node that can't start a thread (it tries three times) or build an engine stops with **exit 14** when that happens while it executes a certified block (below); proposing, it leaves the program transactions out of its proposal, and verifying, it abstains. What can refuse it:
+
+| Limit | What to set |
+|---|---|
+| Strict overcommit, `vm.overcommit_memory = 2` | The stacks count against the commit limit: leave room for the 64 MiB stacks above (a few hundred MiB) beyond the node's own memory, or use the default heuristic overcommit |
+| A container or cgroup memory cap | Counts the stack: size the cap for the node's usual memory plus the above |
+| A task or process limit (`TasksMax=` in the unit, `LimitNPROC=`, a container's pids limit) | The node needs a handful of threads more than before; the unit above sets neither, so systemd's default applies, which is generous. Don't set a tight one |
+| An address-space limit (`ulimit -v`, `LimitAS=`) | Don't set one on a validator |
+
+None of this changes for a chain without programs.
+
+### Exit codes
+
+`0` never for a validator (it runs until stopped), `1` an error (the log says what), and the deliberate stops: `10` `--halt-height` reached, `11` a protocol version in force that this binary doesn't run, `12` another instance is signing with this key, `13` a program faulted while the node executed a certified block, `14` the node couldn't start a thread or build an engine for a program, or a block it had verified clean faulted when it executed it.
+
+- **10, 11, 12 and 13 stay down.** The unit lists them in `RestartPreventExitStatus`, and `deploy/entrypoint.sh` idles instead of restarting. **13 stays down** because a certified block is one a quorum ran without a fault: a node that faults on it differs from them, and a restart would replay the same block and most likely fault again. An operator looks first.
+- **14 restarts.** A thread the OS refused is cured by a restart: the block wasn't committed, so consensus delivers it again. It is in neither stay-down list, so systemd restarts it every `RestartSec` (10 seconds in the unit above) for as long as it recurs: **if it exits 14, or crashes, again at the same height, stop the unit yourself.** The unit as written never trips systemd's own start limit, because its starts are ten seconds apart. Optionally add `StartLimitIntervalSec=600` and `StartLimitBurst=5` to its `[Unit]` section: after five starts in ten minutes systemd stops restarting it and leaves it failed (until `systemctl reset-failed blockula`), which ends a 14 loop for you.
+- **Full nodes exit too.** A full node that meets a 13 doesn't exit: it stops following the chain and goes on serving reads at its height (`/api/health`: `halted: "program_fault"`). On a 14 it exits, because nothing restarts a process that doesn't, so its supervisor restarts it.
+- **A startup replay can halt too, for any halt.** A node (validator or full node) whose replay of its block log meets a block it can't run exits with that halt's code: 13 or 14 for a program fault, and **11** for a block in a protocol version this binary doesn't support (a downgrade, with the database gone or behind the log). It used to exit 1.
+
+The node prints why, then `exit code N (kind): see docs/OPERATIONS.md, "Upgrades" and "Incident response"`. `/api/health` and `/api/status` report the kind (`program_fault`, `program_resources`) while a full node is parked, and `blockula_halted` and `blockula_halt_info{kind}` in `/metrics` do.
+
+### What a node remembers: the quarantine, the trial marker and strikes
+
+All three are this node's own, never consensus, and they only ever hold back program transactions; every one of them expires.
+
+**The quarantine.** When a program transaction faults the node while it *proposes* (the packing trial), the node leaves it out, drops it from its mempool, and quarantines it:
+- the transaction's id, until the chain passes its `valid_until`;
+- its sender's *program* transactions (tags 62 to 64; its transfers and everything else go through), for 600 blocks (`MEMPOOL_TTL_BLOCKS`: ten minutes at 1-second blocks, fifty at 5-second ones);
+- for an upload, its code hash, for a day of blocks.
+
+A call's or a create's declared code is never quarantined: it belongs to other people. The quarantine holds at most 1,024 ids, 1,024 senders and 256 code hashes, and a restart empties it. While an entry lasts, this node's door refuses the transaction ("quarantined on this node after a program execution fault, until block N: see its log"), and its verification abstains from a block that carries a quarantined id (and only that). Other nodes aren't told: a fault on one node alone (memory, a bad build) quarantines a valid transaction there only, for at most an hour, and the others include it. There is no list: read the sizes in `blockula_program_quarantined{kind="tx"|"sender"|"code"}` and the entries in the log, where each fault is an error line, `a program execution fault on this node: leaving the transaction out of this proposal`, with the `path`, `height`, `tx`, `class` and `fault` fields.
+
+**The trial marker.** Before a proposal or a verification tries a program transaction, the node writes its id, sender, kind, `valid_until` (and an upload's code hash) to `<home>/program-trial`, and empties the entry when the trial ends. The file is a fixed 4 KiB of text lines (`id sender kind valid_until hash`) and then zeros, written in one `pwrite` with no `fsync`; an all-zero file, or none, means nothing was in flight. At start the node reads it and removes it, and quarantines each record under the rule above, with an error log: `the last run stopped while trying tx <id>: quarantined`. So a transaction that kills the process (an abort, a stack overflow, an out-of-memory kill, a panic outside the program thread) kills a validator at most once while it proposes or verifies, instead of looping it through its own mempool and its peers' gossip. A host that dies loses only this hint.
+
+**What the marker does not cover** (finding S4C-R9). It covers the *trials* of proposing and verifying. It marks nothing when the node *executes a certified block*, replays the block log at start, or replays an unexecuted ancestor before it proposes or votes. So a transaction that kills the process there restarts into the same crash, with no marker to name it. That matches the rule for exit 13 (a node that faults on a certified block differs from the quorum that certified it), and for you it means:
+- A **crash loop** (the process dies and the supervisor restarts it) at the same height, without a "the last run stopped while trying" line, is this case. **Stop the unit yourself:** a process that dies on a signal is not one of the stay-down exit codes, so systemd restarts it every `RestartSec` for as long as it recurs. The journal's last lines before the death name the height; the transaction is one of the program transactions of that block, which you read from any other node: `curl -s 127.0.0.1:7070/api/block/<height> | jq '[.txs[] | select(.kind | IN("upload_code","create_program","call_program")) | {id, from, kind}]'`. Compare with the other operators, and see [A program fault](#a-program-fault-exit-13).
+- The marker can't tell a crash the transaction caused from an unrelated kill. If many validators are killed together while they verify the same block that carries a program transaction (a zone outage), that transaction and its sender's program transactions are quarantined on all of them, for up to the transaction's validity (an hour at most) and 600 blocks. It stalls nothing, and an honest sender resubmits.
+
+**Strikes.** A leader whose proposals carrying a program transaction never certify (other validators fault on it and abstain, so the view is nullified) counts a strike against that transaction for each such view of its own. At two strikes the leader drops it from its mempool ("not certified in two proposals: other validators may be faulting on it") and holds its sender's program transactions at its own door for 600 blocks ("held on this node until block N: two of this node's proposals carrying this sender's program transactions weren't certified; other nodes accept them"). `blockula_program_uncertified_proposals_total` counts the strikes. A view can also be skipped for reasons that have nothing to do with the transaction (a slow link, an overloaded proposer): then an innocent sender is held at that one node for 600 blocks and the others include it.
+
+**The verified-clean set.** Verification remembers the digests of the last 64 blocks it ran through without a fault (in memory only, and only for blocks that carry a program transaction). It decides what exit 14 means below.
+
+### Metrics
+
+With programs on, `/metrics` adds (nothing before they were first switched on):
+
+| Series | Reading |
+|---|---|
+| `blockula_programs_status` | 1 on, 2 exit-only, 3 paused |
+| `blockula_program_block_fuel`, `blockula_program_fuel_rate` | The last executed block's counted fuel; the milli-drops per fuel the next block charges (it rises 12.5% per full block, falls when blocks are empty, never below `program_fuel_floor_rate`) |
+| `blockula_program_value_held_drops`, `blockula_program_sponsored_drops` | FANG program accounts hold; deposits programs paid themselves. Their sum is what the cap bounds |
+| `blockula_program_state_bytes` | Program state's accounted bytes (the storage price curve reads it) |
+| `blockula_program_node_faults_total{path,class}` | **Faults this process met** (never an outcome). `path` is `propose`, `verify`, `execute` or `startup`; `class` is `tx` (tied to a transaction) or `setup` (a thread or engine this node couldn't make). Any increase is an event: read the log. |
+| `blockula_program_quarantined{kind}` | Entries the quarantine holds now (`tx`, `sender`, `code`) |
+| `blockula_program_uncertified_proposals_total` | Strikes: program transactions this node proposed in a view that never certified |
+| `blockula_program_accounting_drift` | **1 when the last epoch-boundary check found a program total (value held, sponsored, escrow) that differs from its sum.** A bookkeeping bug that moves the cap is an alarm, not a silence |
+| `blockula_replay_cache_hits_total` | Ancestor replays that started from a cached post-state. No alert; a lagging verifier shows hits |
+| `blockula_program_views_total{outcome}` | Views served: `ok`, `failed`, `refused`, `limited`, `fault` |
+
+The reference alerts don't watch these yet. Page on `increase(blockula_program_node_faults_total[15m]) > 0` (a ticket, not a page, for `class="setup"` on one node) and on `blockula_program_accounting_drift == 1`, and watch `blockula_program_uncertified_proposals_total` across the set.
 
 ## Incident response
 
@@ -355,7 +469,7 @@ The public testnet (`blockula-testnet-2`) runs the same version gating as mainne
 
 - **Incident commander (IC):** the core-team on-call engineer, until they hand over. The IC runs the incident, decides what to ask of operators, and owns communication.
 - **Security lead:** decides embargoes, private patch distribution and disclosure timing, together with the IC.
-- **Operators decide for their own nodes.** There are no admin keys on mainnet (DEC-10): the team can ask operators to stop at a height or install a patch, but each operator verifies and acts. A fix takes effect when ≥ ⅔ of the set runs it.
+- **Operators decide for their own nodes.** No key overrides an operator's node: the team can ask operators to stop at a height or install a patch, but each operator verifies and acts. A fix takes effect when ≥ ⅔ of the set runs it.
 - **Governance** makes any change to state or parameters after the incident (no emergency admin path).
 
 ### Channels
@@ -381,7 +495,75 @@ The public testnet (`blockula-testnet-2`) runs the same version gating as mainne
 
 **Key compromise:** the operator stops the validator at once. In protocol v1 the stake belongs to the cold owner account, so a stolen consensus key can't move it, nor the owner's balance (the system txs it signs for the owner carry no tip), but it can still equivocate and get the pool slashed, and make the owner pay base fees for system txs. Protocol v1 has no consensus-key rotation: the owner undelegates the self-bond, registers a new validator with a fresh key generated offline, and asks delegators to redelegate (P-STAKE). Report it in the operator channel so others watch for votes from the old key.
 
-**Vulnerability reported privately:** the security lead triages within the SECURITY.md targets, decides severity with the IC, and runs the private patch flow below. Credit and bounty per [BUG_BOUNTY.md](BUG_BOUNTY.md).
+**Vulnerability reported privately:** the security lead triages within the SECURITY.md targets, decides severity with the IC, and runs the private patch flow below. Credit per [BUG_BOUNTY.md](BUG_BOUNTY.md).
+
+### Programs: a fault, a stop and the pause
+
+These apply only to a chain that has programs. A program transaction is third-party code, so a fault in running it is never taken for the transaction's outcome (Section "Exit codes" above says what each exit means). Read the log first: every fault is an error line, `a program execution fault on this node: …`, with the `path`, `height`, `tx`, `class` and `fault` fields, and `blockula_program_node_faults_total{path,class}` counts them.
+
+#### A program fault (exit 13)
+
+The log ends with `block H can't be executed here: a program execution fault in tx <id> (<what>); this node stopped rather than guess an outcome`, then `exit code 13 (program_fault)`. This node executed a block that a quorum certified, and the program transaction in it faulted *here*. The validators that certified it ran it without a fault, so this node differs from them: its binary, its build, its hardware or its memory. A restart replays the same block and most likely faults again, so the unit stays down (`RestartPreventExitStatus`), and the rest of the set goes on if a quorum is left.
+
+1. **Don't restart yet.** Keep the journal (`journalctl -u blockula --since …`) and note the height and the transaction id.
+2. **Are you alone?** Ask in the operator channel and compare `/api/status` (`version`, `git_sha`, `height`) on other validators. Others advancing past `H` means this node is the odd one. Check that your binary is the announced release (`blockula release install` verifies it against the pinned key), the architecture the others run, and the machine: `dmesg | grep -i -E 'oom|mce|hardware'`, memory errors (bad RAM can produce a different result), a container's memory cap.
+3. **Several validators exited 13 on the same transaction?** That is a defect in the engine or its integration, not a node: SEV-1. Don't discuss the transaction in public. Report it privately ([SECURITY.md](../SECURITY.md)): a transaction that crashes or faults the engine is a vulnerability. Then pause programs while the fix is made ([the pause](#the-pause)) and ship the fix as a release ([Patch distribution](#patch-distribution)); a rules change needs a scheduled version ([Upgrades](#upgrades)).
+4. **Restart once you know why.** The node replays the block. If it passes, the cause was local and gone. If it exits 13 again, the cause is still there: don't loop it. Check the machine again (step 2), reinstall the announced release, and see whether a full node of that release on other hardware (`blockula join`) executes the block. Never copy the validator's home to another machine to test it ([Keys, backups and restores](#keys-backups-and-restores)). Until it executes, the node can't vote on the next block.
+
+A full node that meets this doesn't exit: it parks at its height, serves reads, and `/api/health` says `"halted": "program_fault"`. Handle it the same way.
+
+#### A resources stop (exit 14)
+
+The log reads `block H can't be executed here: this node couldn't make what a program transaction needs (<what>); it stopped rather than guess an outcome, and a restart may cure it`, then `exit code 14 (program_resources)`. The OS refused a thread three times, or an engine wouldn't build. That is this node's environment, not the transaction: the block wasn't committed, so consensus delivers it again, and the supervisor restarts the node on its own (14 is in neither stay-down list; systemd restarts it every `RestartSec` for as long as it recurs, so **stop the unit yourself if it exits 14, or crashes, again at the same height**).
+
+1. After the restart, check it executes past `H` (`blockula_height`).
+2. Find the limit that refused it ([Limits a validator needs](#limits-a-validator-needs)): `TasksMax` or a pids limit, a memory cap, `vm.overcommit_memory = 2`, an out-of-memory condition (`dmesg`).
+3. If it stops again with 14 at the same height and you can't find the limit, treat it as a fault ([above](#a-program-fault-exit-13)).
+
+A full node exits 14 too, for its supervisor to restart.
+
+#### The verified-clean retry: a 14 that comes back as 13
+
+The exit-14 message can read instead `this node verified block H without a fault, then faulted executing it (tx <id>: <what>): restarting once`. Before it voted for that block, this node ran the same transactions on the same state without a fault. A fault a moment later is the node's doing (a transient panic, an engine or instantiation error under memory pressure), not a sign it differs from the quorum, so it's treated like a resource stop: exit 14, and the supervisor restarts it once. The set of verified digests lives in memory, so it doesn't survive the restart. **If the block faults again after the restart, it exits 13 and stays down**, and you are in [A program fault](#a-program-fault-exit-13) with a node that has now faulted twice on a block it once verified: look for memory pressure first, then at the machine.
+
+#### Program transactions are not certified: `blockula_program_uncertified_proposals_total` rises on some validators
+
+A leader counts a strike when its proposal carrying a program transaction fails to certify. That happens when other validators fault on the transaction and abstain, and it also happens when a view is skipped for reasons that have nothing to do with it (a slow link, an overloaded proposer). So a strike counter that rises on one validator proves nothing by itself, and a validator with a poor link rises alone by definition. The evidence is on the *other* validators.
+
+1. **Look for the faults on the other validators:** the error line `a program execution fault on this node: abstaining` with `path=verify`, or a rise in `blockula_program_node_faults_total{path="verify",class="tx"}`. Strikes without those are a network or proposer problem, not the engine: check the leader's link, clock and load, and **do not pause**.
+2. If the faults are there on some validators and not on others, **the set disagrees about the engine.** That is a consensus defect, not a node's problem, and strikes only limit what it costs (two views per leader). It can come from a mixed set (one validator on another release or architecture) or from a defect that some machines trigger and others don't. Compare `/api/status`'s `git_sha` across the set in the operator channel; if one validator is on another release, fix that ([Upgrades](#upgrades)).
+3. If the releases match, **pause, then fix.** Agree on the pause ([below](#the-pause)); while it runs no program transaction is admitted, the chain's blocks carry none, and the strikes stop. Then report privately and ship the fix.
+
+#### Accounting drift
+
+`blockula_program_accounting_drift 1` means a total in program state (value held, sponsored deposits, escrow) differs from the sum of the accounts, records and blobs it should equal. The log has `program accounting drift: …` with what was recorded and what was found. The cap and exit-only read those totals, so treat it as SEV-1: pause ([below](#the-pause)), keep the log, report privately.
+
+#### The pause
+
+A pause stops new program transactions (uploads, creates and calls, including the ones that would withdraw FANG) and native credits to programs for three days, from the block after enough validators signed. It moves no funds, ends by itself, has no undo, and leaves views, plain transfers and everything else running. It is the one thing validators can do together in minutes when the engine itself is in doubt; governance takes days.
+
+**Who and how many.** A validator of the current epoch's active set, `f + 1` of them: `⌊(n − 1) / 3⌋ + 1` (1 of 1 to 3, 2 of 4, 3 of 7, 4 of 10). A signature waits a day for the others. Two signatures in adjacent epochs count together; one older than a day doesn't.
+
+**1. Agree before you sign.** Say so in the operator channel, name who signs, and sign within the hour. A lone signature that doesn't reach the threshold changes nothing and costs its fee, and its validator can't sign again until its signature lapses (a day), but it spends nothing else. A signature that starts or renews a pause is what spends a validator's 30-day window.
+
+**2. Check you may sign.** `blockula program pause --key <home>/validator.key --rpc http://127.0.0.1:7070` prints what a pause does, the live signatures (`Live signatures: 1 of the 2 needed`), whether this validator may sign now and why not, and asks before it signs. It uses the chain's own admission rules, so a refused signature is never charged. The rules it applies:
+- a validator with a live signature of its own can't sign again until it lapses;
+- a validator that started or renewed a pause may sign again only after 30 days, **unless a fix is pending**: a `ScheduleUpgrade` or a `DeactivateFeature { programs }` proposal that is voting or queued, or an upgrade scheduled and not yet active. The CLI prints `a fix is pending.` or `a fix is not pending.`;
+- **the cap:** a run of pauses (one pause, then renewals while it runs) never extends past 30 days from its start, whether or not a fix is pending. Past that, `this pause has reached its 30-day cap`. A new run can't start within 60 days of the last run's start (`programs can be paused again from block N`). So a second, unrelated incident within 60 days of a run's start gets exit-only and `--halt-height` ([Coordinated restart at a height](#coordinated-restart-at-a-height)), not a pause. These are days at the chain's block time.
+
+**3. Which form.** There are two ways to sign a pause, and one that doesn't work.
+- **The duty form (the default; what `blockula program pause` signs).** The validator's *consensus key* (`validator.key`), from the validator's *own account* (the validator's address). It needs a fee float on that account. It is a validator duty, so it has a slot in the mempool's lane and a full mempool can't keep it out. It may carry a tip, out of that account's transferable FANG, like any key on that account; you don't need one.
+- **The owner-key form.** When the validator is owned by another account, the owner can sign it from its own account with an owner key, with `wallet.programsPause()` of the SDK (the CLI signs only the duty form). It may tip too. It isn't a duty, so in a full mempool it competes by its tip: use it only if the validator's own account can't pay. A validator that owns itself has one account and one key, and the two forms are the same.
+- **Not admitted:** the consensus key signing *from the owner's account* (the form validators use for their other system transactions, with the owner paying). A pause isn't one of those, so the chain answers `this key isn't authorized on <owner>`. If you see that, you signed with the wrong key for that account.
+- Whichever form signs, the validator counts once. An owner key counts for the lowest-addressed of the validators that owner runs; sign for the others with their own consensus keys.
+
+**4. Confirm.** `curl -s 127.0.0.1:7070/api/params | jq .programs` shows `status` (`paused` once enough signed), `pause` (`from`, `until`, `started`, `signers`), `votes` (live signatures, with their heights), `pause_signed` and `fix_pending`. `blockula_programs_status 3`. A refused program transaction reads `programs are paused until block N`.
+
+**5. Renew while the fix is pending.** The pause lapses at `until` on its own. If the fix isn't live, `f + 1` validators sign again *before* it lapses (a signature during a pause counts toward renewing it; each renewal moves `until` three days past its block and never back), until the fix lands or the 30-day cap. The window doesn't apply while a fix is pending (item 2), so the same validators can renew. Plan the fix path to fit: proposed at `t`, a `ScheduleUpgrade` takes the voting period and the timelock to run, then a cancellation's voting period and 66 blocks before the version may activate (about 7 days and 66 blocks at the governance floors, 16 at the default periods), and the cap covers either. Propose the `DeactivateFeature { programs }` and the `ScheduleUpgrade` in the first hour so that `fix_pending` holds. **`fix_pending` holds only while a proposal is voting or queued, or an upgrade is scheduled and not yet active.** A proposal nobody votes for is rejected at its close, and a `DeactivateFeature` stops counting the moment it executes, so keep a `ScheduleUpgrade` open or scheduled until the fix is live, and check `fix_pending` in `/api/params` before each renewal (the CLI prints it).
+
+**6. Afterwards.** The pause ends by itself. Exit-only (a `DeactivateFeature { programs }` that passed) keeps value-free calls and withdrawals working while the fix is made; `ActivateFeature { programs }` turns programs back on ([GOVERNANCE.md](GOVERNANCE.md#programs-optional-off-by-default)).
+
+**Rehearse it** on a throwaway chain before you need it. Run `export BLOCKULA_HOME=$(mktemp -d)` first, so that the CLI's wallet and its remembered chains stay out of `~/.blockula`, then `blockula dev --programs` (the chain is in `$BLOCKULA_HOME/dev`, so the key to pass is `$BLOCKULA_HOME/dev/validator.key`, and the node answers on `http://127.0.0.1:7070`, the default for `--rpc`). Run the commands above with that key. To have something to refuse, upload a sample program: the guests in `node/vm/tests/programs` and `scripts/test-program-cli.sh` show the calls (`blockula wallet new` and `blockula wallet faucet` give the account its FANG). A dev chain has one validator, so one signature pauses at once, and its votes last 60 blocks. For step 5, open a fix with `blockula gov propose deactivate programs --title "…" --key $BLOCKULA_HOME/dev/validator.key` (it asks nothing), then vote with `blockula gov vote <id> aye 1 --digest <the digest blockula gov show <id> prints> --key $BLOCKULA_HOME/dev/validator.key`.
 
 ### Patch distribution
 
@@ -439,7 +621,7 @@ Post-mortem (published): summary; impact (duration, heights, who was affected); 
 
 ### Tabletop exercise
 
-Run one before the incentivized testnet ends (OPS-5), then every six months. Template:
+Run one before a chain other people depend on goes live (OPS-5), then every six months. Template:
 
 | | |
 |---|---|
@@ -498,8 +680,9 @@ The node restarted in the last 15 minutes. Was it you? If not: `journalctl -u bl
 
 - `halt_height`: it was started with `--halt-height` and reached it. Expected during a coordinated restart; otherwise remove the flag.
 - `upgrade_required`: the protocol version in force at the next height isn't supported by this binary. Install the release for it ([Upgrades](#upgrades)) and restart.
+- `program_fault` (a full node parked on it) and `program_resources`: on a chain with programs, a program faulted while the node executed a certified block ([A program fault](#a-program-fault-exit-13), [A resources stop](#a-resources-stop-exit-14)).
 
-Validators exit instead (code 10 or 11, `BlockulaNodeDown`): `journalctl -u blockula -n 50` shows the same reason.
+Validators exit instead (code 10, 11 or 13, `BlockulaNodeDown`; 14 restarts): `journalctl -u blockula -n 50` shows the same reason.
 
 ### Upgrade required
 
@@ -530,7 +713,7 @@ A skipped view is charged to its leader whatever skipped it. With one validator 
 **Sizing it.** Pick how long away should jail, T, for the set the chain runs: `downtime_max_missed` ≈ T / ((n − 1) × block time), and `downtime_window` twice that (half its turns may be missed). The beacon already jails a validator away for the whole second half of an epoch (it can't reveal), so a T longer than half an epoch adds little. `deploy/launch.sh` sizes a testnet's genesis for half an epoch (`DOWNTIME_*`: 600 of 1,200 for four validators; `blockula-testnet-2` predates it and runs the default); with 1-hour epochs that's 300 of 600 for 7, 85 of 170 for 22 and 60 of 120 for 31. The default 50 of 100 fits a set of about 31 and jails a small one within minutes. The window counts turns, so the time it allows grows with the set: re-tune it when the set's size changes by about half. Both are the token holders' parameters (`params::VALIDATOR_KEYS`: the supermajority, never the bootstrap council), and a change restarts every validator's record.
 
 - `BlockulaValidatorMissingSlots`: it has missed half the slots its window allows (with a wide window, `BlockulaValidatorNotSigning` and the peer alerts usually fire first). It's proposing nothing when its turn comes: check [Peers](#peers), [Time](#time), CPU, and that its blocks aren't refused (`rejecting block` lines on other nodes mean its proposals are invalid, for example a stale binary).
-- `BlockulaValidatorJailed`: it missed too many slots (or committed to the randomness beacon and didn't reveal, so check that `beacon-secrets.json` survived), lost a light slash, and leaves the set at the next epoch boundary. Fix the cause, wait out `jail_blocks` (`curl -s 127.0.0.1:7070/api/validators | jq '.jailed'` shows `until`), make sure the self-bond is still at least `min_self_bond`, then have the owner send `Unjail` (`blockula validator unjail <validator address> --key <owner seed file> --rpc …`). It rejoins at a boundary once its stake ranks.
+- `BlockulaValidatorJailed`: it missed too many slots (or committed to the randomness beacon and didn't reveal, so check that `beacon-secrets.json` survived), lost a light slash, and leaves the set at the next epoch boundary. Fix the cause, wait out `jail_blocks` (`curl -s 127.0.0.1:7070/api/validators | jq '.jailed'` shows `until`), make sure the self-bond is still at least `min_self_bond`, then have the owner send `Unjail` (`blockula validator unjail <validator address> --key <owner seed file> --rpc …`). It rejoins at a boundary once its stake ranks. A jailed validator's node keeps following the chain (its peers keep it as a secondary peer until it unjails), so `--rpc` may be its own node. Up to v1.0.0 a jailed node that stayed online stopped following about two epochs after it left the set, until it was restarted, and an `Unjail` sent through it never left its mempool: with those versions, restart it or send the `Unjail` through another node.
 - `BlockulaValidatorTombstoned`: it signed two conflicting votes. Its pool was slashed and it can never be active again. Treat it as a key compromise or a copied home ([Keys, backups and restores](#keys-backups-and-restores)): stop every copy, find out how two instances signed, and register a new validator with a new key. Delegators should move their stake (`blockula stake undelegate`, then `withdraw` after unbonding).
 
 Validators pay for their own system transactions (attestations, beacon commits and reveals, equivocation reports) from the owner account when the owner is a separate account (SF-13); `BLOCKULA_SYSTEM_FEES=self` makes the consensus key's own account pay instead. Keep a fee float there. They carry no tip, so a congested mempool keeps them in a small lane of their own (never evicted, first in proposals) rather than refusing them, as long as nothing else from the paying account is queued ahead of them: under congestion, send nothing untipped from the account that pays them (or set `BLOCKULA_SYSTEM_FEES=self`). A duty that stops applying while it waits is dropped, unrun and uncharged, and so is everything the paying account queued behind it, which waits on its nonce ("an earlier transaction from the same account was dropped"). That's routine for claim attestations: every active validator attests each claim, and one that arrives after the attestations that settle it, but before their block runs, is dropped. An owner tx signed in that block or two comes back dropped: check it (`tx_status`, `client.tx`) before sending it again, since it can still run if the gap ahead of it fills and it's resubmitted, or keep the owner's own txs clear of the duties with `BLOCKULA_SYSTEM_FEES=self`. Once Ghost Mode is on, don't shield from that account: nothing queues behind a shield, so its duties are refused until the shield is included (a missed beacon reveal gets the validator jailed). On a faucet chain, the faucet drips from the consensus key's account, so with `BLOCKULA_SYSTEM_FEES=self` (or a validator that owns itself) the drips queue ahead of its duties too. Pending equivocation evidence waits in `evidence.json` across restarts. Signed for the owner, a system tx whose action would fail is refused rather than charged, and the consensus key may update the validator for its owner once an epoch (audit F04). The validator's terms (commission, addresses) and `Unjail` are the owner's call: the consensus key never changes them from the validator's own account when the owner is another account, so a multisig owner's changes go through its approvals (`blockula multisig propose`). While the active set carries over only one or two members, a candidate node that a quorum of them admitted also sends `ValidatorReady` once, in the epoch's last tenth ("ready to join the validator set", [A set of one or two](#a-set-of-one-or-two)): it changes nothing but its readiness record, and it's a lane duty, like a member's admission. Both go through a multisig owner like the other system txs: no `BLOCKULA_SYSTEM_FEES=self` needed.
@@ -555,10 +738,10 @@ A joining node checks every block, snapshot and certificate against a validator 
 
 Both parameters are governance's (the evidence window is the token holders' alone, by supermajority; `unbonding_blocks`, which the bootstrap council can also change, can't fall below it), and a shorter window shortens the period, but never below **a week**: governance can't take the evidence window below two weeks (`params::EVIDENCE_WINDOW_FLOOR_DAYS`, twice the weekly checkpoint cadence below), so the weekly signed checkpoint is always fresh enough. A node enforces the shortest period it knows of: the genesis parameters', the one its release recorded with its newest checkpoint (`weak_subjectivity_blocks` in `node/checkpoints/<chain id>.json`, set when governance has shortened it), once it has executed the chain the one its own state's parameters set, and, before it syncs, the shortest one its peers report in `/api/status` (`join` asks every peer it will use; a full node asks on every start, and with an empty home waits until a peer answers). A peer's report only ever shortens the period, and never below the week the protocol allows, so a lying peer can at worst ask you for a checkpoint a week old. When a peer reports a shorter period than your root meets, `join` (or the first start) refuses and says which peer and what period; take a fresher checkpoint (the weekly one, or `blockula checkpoint`) or pass `--allow-stale-checkpoint`. One honest peer is enough; a joiner whose every peer lies after a shortening is only protected by a checkpoint younger than a week, so list peers run by independent operators. A fast-synced node also warns when the state it installed sets a period its root was older than.
 
-**Test chains** may start below that floor, and then only move up: the public testnet (`blockula-testnet-2`) has a week of unbonding and of evidence, so its period is **3.5 days** (302,400 blocks), and `blockula dev` has minutes. A node joining the testnet later than that needs a checkpoint: `blockula checkpoint --peer https://blockula-testnet.fly.dev --genesis-hash <hash>`, a release's compiled-in one while it's fresh, or, for the testnet's own public node, one its validators agree on over the operator's private network ([deploy/README.md, Sync trust](../deploy/README.md#sync-trust)). Every such checkpoint is one operator's word until the testnet has independent operators.
+**Test chains** may start below that floor, and then only move up: a testnet from `deploy/launch.sh` (as `blockula-testnet-2` was) has a week of unbonding and of evidence, so its period is **3.5 days** (302,400 blocks), and `blockula dev` has minutes. A node joining such a testnet later than that needs a checkpoint: `blockula checkpoint --peer https://<its public node> --genesis-hash <hash>`, a release's compiled-in one while it's fresh, or, for the testnet's own public node, one its validators agree on over the operator's private network ([deploy/README.md, Sync trust](../deploy/README.md#sync-trust)). Every such checkpoint is one operator's word until the testnet has independent operators.
 
 **What a node trusts:**
-- **The genesis hash.** `join` refuses a genesis nobody pinned: either this release knows the chain id (the hash is compiled in from `node/checkpoints/<chain id>.json`) or you pass `--genesis-hash`. A known chain's genesis must match the compiled-in hash, for validators too. `node/checkpoints/blockula-1.json` is a placeholder until the genesis ceremony, so every binary refuses `blockula-1` until the release that launches mainnet fills in the hash the genesis builders reproduced ([GENESIS_CEREMONY.md](GENESIS_CEREMONY.md), section 6).
+- **The genesis hash.** `join` refuses a genesis nobody pinned: either this release knows the chain id (the hash is compiled in from `node/checkpoints/<chain id>.json`) or you pass `--genesis-hash`. A known chain's genesis must match the compiled-in hash, for validators too. `node/checkpoints/blockula-1.json` is a placeholder without a hash, so every binary refuses `blockula-1`: there's no mainnet, and no chain can pass for one.
 - **Checkpoints**, `(height, block hash, validator-set hash, block time)`: compiled into each release, plus your own with `join --checkpoint HEIGHT:HASH[:SET_HASH[:TIMESTAMP_MS]]` (repeatable; saved in the home's `join.json` and enforced on every start; `HEIGHT:HASH::TIMESTAMP_MS` leaves the set out). The set hash is of the set that certifies the block after `height`; the time is the block's `timestamp_ms`, which its hash covers (`blockula checkpoint` prints all four, and release checkpoints carry them). Pinning it is what defeats a forged history, since every later set must descend from it. A node refuses a genesis, snapshot, epoch anchor or sync batch that contradicts a checkpoint. It also refuses a snapshot it can't check against one: a checkpoint older than the snapshot that pins no set.
 - **Validator-set history.** Nodes serve it in `/api/epochs?from=` pages and keep the weak-subjectivity period of it plus a quarter (older changes are dropped once it passes 8 MiB). A joiner fetches and verifies only the history after its newest root, keeps only what it verified, and its validator signs handoffs only for set changes its own state shows.
 - **Freshness.** A node with an empty home (`join`, or `run` before its first sync) refuses to sync when its newest root (the newest checkpoint, or the genesis) is older than the period (the shortest of this release's and its peers' reports, above). Age is measured against the highest the chain can have reached by the wall clock, counted from the newest block whose time the node trusts (the newest checkpoint that records its time, or the genesis): blocks are at least a block time apart, so missed slots only make a root look older, and only those missed since that block count. A chain's missed slots add up over its lifetime (every timed-out view, every outage), so a checkpoint without its time would be measured from the genesis and, on an old chain, could look older than the period even when taken at the tip; one with its time is as old as its time says (review-r3-sync-1). An empty home whose newest checkpoint has no time (the older `HEIGHT:HASH[:SET_HASH]` forms) reads it from the first peer that serves that block (`/api/sync`: the block itself, whose hash covers its time), and counts from the genesis only when none does (validators keep about two days of blocks; full nodes keep everything). The time is part of what you trust, like the hash: a node refuses a checkpoint whose time is earlier than the genesis (or an earlier timed checkpoint) allows or later than its clock, a block at that height carrying another time, and a later block earlier than that time allows. `--allow-stale-checkpoint` overrides the refusal. A node with history only warns: its own head is its root, and after an outage longer than the period it's in the same position as a joiner.
@@ -580,7 +763,7 @@ blockula join --genesis https://rpc.op-a.example --home /var/lib/blockula/full -
 
 Every release carries a fresh checkpoint for each live chain it knows, in `node/checkpoints/<chain id>.json`. It's compiled into the binary and attached to the release as `checkpoints-<chain id>.json`, listed in `checksums.txt`, so the offline release signature covers both.
 
-1. In the release PR, take the checkpoint from at least three nodes run by different operators, not only the project's: `blockula checkpoint --json --peer … --peer … --peer …`. Append it to the file's `checkpoints` (keep the earlier ones; `scripts/pin-network.sh <chain id> <genesis hash> --checkpoint HEIGHT:HASH:SET_HASH` does it, and pins a new chain) and note in the PR which operators' nodes you asked and when. A chain with one operator (the public testnet today, all of whose nodes the project runs) can't meet that: take it from several of its nodes (`--peer` each validator and the public node) and say in the PR that it's one operator's word, which is what it is for joiners too ([deploy/README.md, Sync trust](../deploy/README.md#sync-trust)).
+1. In the release PR, take the checkpoint from at least three nodes run by different operators, not only the project's: `blockula checkpoint --json --peer … --peer … --peer …`. Append it to the file's `checkpoints` (keep the earlier ones; `scripts/pin-network.sh <chain id> <genesis hash> --checkpoint HEIGHT:HASH:SET_HASH` does it, and pins a new chain) and note in the PR which operators' nodes you asked and when. A chain with one operator (as the public testnet was: the project ran all its nodes) can't meet that: take it from several of its nodes (`--peer` each validator and the public node) and say in the PR that it's one operator's word, which is what it is for joiners too ([deploy/README.md, Sync trust](../deploy/README.md#sync-trust)).
 2. Two reviewers rerun it against nodes they pick, with `--height <H>`, and must get the same entry.
 3. Tag and release as in [Releases](#releases). A release's checkpoint is only useful to joiners for the period after it was taken, so take it within a day or two of the tag.
 4. **Between releases**, roots still go stale after ~10.5 days (less, if governance has shortened the evidence window, never less than a week: then also set `weak_subjectivity_blocks` in the release's file to the period the nodes report in `/api/status`). Every week the release team takes a checkpoint the same way (steps 1 and 2) and signs it on the offline machine like `checksums.txt`, with the same verified binary: `blockula release sign --key release-key.json checkpoint-<chain id>-<height>.txt > checkpoint-<chain id>-<height>.txt.sig`, where the file holds the `HEIGHT:HASH:SET_HASH:TIMESTAMP_MS` line. It's published with the signature through the same channels as the release key id; joiners verify it with `blockula release verify --sig checkpoint-<chain id>-<height>.txt.sig checkpoint-<chain id>-<height>.txt` (against the release key id they pinned; `--key-id` names one explicitly) and pass it with `--checkpoint`.
@@ -594,10 +777,11 @@ Every release is reproducible, carries SLSA build provenance, and is signed offl
 ### How a release is made
 
 1. A maintainer tags `vX.Y.Z` on `main` and pushes the tag. `.github/workflows/release.yml`:
-   - builds the four targets with `scripts/release-build.sh`: the toolchain pinned in `rust-toolchain.toml`, Linux in a digest-pinned `rust` image, `--locked`, `SOURCE_DATE_EPOCH` from the commit, build paths remapped, deterministic archives;
+   - builds the wallet every node serves at `/wallet/` once, with `scripts/release-wallet.sh` (`npm ci`, then the static export `npm run build:wallet`, in a digest-pinned `node` image, the commit as its build id, a deterministic `blockula-wallet.tar.gz`), and rebuilds it on a fresh runner from a different directory, failing unless it's byte-identical;
+   - builds the four targets with `scripts/release-build.sh`, each with that wallet built in (`BLOCKULA_WALLET`): the toolchain pinned in `rust-toolchain.toml`, Linux in a digest-pinned `rust` image, `--locked`, `SOURCE_DATE_EPOCH` from the commit, build paths remapped, deterministic archives;
    - rebuilds the x86_64 Linux archive on a fresh runner from a different directory and fails unless it's byte-identical;
    - refuses a tag that isn't `vX.Y.Z` or isn't `node/Cargo.toml`'s version, so `blockula --version` prints the tag;
-   - writes `checksums.txt` with `scripts/release-checksums.sh`: a first line naming the tag (`# blockula-release vX.Y.Z`), then the archives, `install.sh`, committed genesis files and the checkpoint files `node/checkpoints/*.json` (see [Checkpoints in releases](#checkpoints-in-releases)), and attests every file with GitHub artifact attestations (SLSA provenance, `actions/attest-build-provenance`). The tag line is what binds the offline signature to this version: without it, an older release's genuine signature would pass for a newer one (audit supply-chain-B-2);
+   - writes `checksums.txt` with `scripts/release-checksums.sh`: a first line naming the tag (`# blockula-release vX.Y.Z`), then the archives (`blockula-wallet.tar.gz` too), `install.sh`, committed genesis files and the checkpoint files `node/checkpoints/*.json` (see [Checkpoints in releases](#checkpoints-in-releases)), and attests every file with GitHub artifact attestations (SLSA provenance, `actions/attest-build-provenance`). The tag line is what binds the offline signature to this version: without it, an older release's genuine signature would pass for a newer one (audit supply-chain-B-2);
    - creates a **draft** release. Only that last job can write to the repo.
 
    Everything up to here runs on GitHub, so OPS-7's adversary (a compromised GitHub account, runner, action or release workflow) can change any of it: the tag, the archives, `install.sh`, the genesis and checkpoint files, `checksums.txt`, the provenance. Steps 2 and 3 are what the signer checks before vouching for it. Write down the commit you reviewed for the release (the release PR's merge commit) yourself, when you review it: it's `COMMIT` below.
@@ -609,7 +793,7 @@ Every release is reproducible, carries SLSA build provenance, and is signed offl
    COMMIT=<reviewed commit> CHECKSUMS=/tmp/rel/checksums.txt scripts/reproduce-release.sh vX.Y.Z aarch64-unknown-linux-gnu  # emulated on x86: slow
    ```
 
-   With `COMMIT`, the script refuses a tag that isn't that commit, and checks `checksums.txt`'s other lines as in step 3. Each builder posts the result in the release issue and sends the signer the line it prints (`<sha256>  blockula-<target>.tar.gz`) on the operators' channel, which GitHub doesn't control: GitHub serves the draft to each of them separately, so the signer must sign the archives the builders rebuilt, not just a draft that says so. macOS archives reproduce only with the same Xcode as the release run (its log prints `xcodebuild -version`).
+   The script rebuilds the wallet first (in the pinned `node` image) and refuses unless it's the draft's `blockula-wallet.tar.gz`, then builds the binary with it. With `COMMIT`, it refuses a tag that isn't that commit, and checks `checksums.txt`'s other lines as in step 3. Each builder posts the result in the release issue and sends the signer the lines it prints (`<sha256>  blockula-wallet.tar.gz` and `<sha256>  blockula-<target>.tar.gz`) on the operators' channel, which GitHub doesn't control: GitHub serves the draft to each of them separately, so the signer must sign the archives the builders rebuilt, not just a draft that says so. macOS archives reproduce only with the same Xcode as the release run (its log prints `xcodebuild -version`).
 3. **Check what you'll sign**, on an online machine with a checkout you trust, against the exact `checksums.txt` you'll carry offline:
 
    ```bash
@@ -619,7 +803,7 @@ Every release is reproducible, carries SLSA build provenance, and is signed offl
      --signer-workflow jackdishman/blockula/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z
    ```
 
-   `scripts/check-release-files.sh` refuses unless the tag is the commit you reviewed, the first line is `# blockula-release vX.Y.Z`, both Linux archives are listed with the hashes the builders rebuilt (and they agree), `install.sh`, every `genesis-<id>.json` and every `checkpoints-<id>.json` hash exactly like the commit's `scripts/install.sh`, `genesis/<id>/genesis.json` and `node/checkpoints/<id>.json` (and all of the commit's are listed), the four archives are listed, and nothing else is (audit F49, review-r2-supply-4). Provenance adds that the files came out of the release workflow.
+   `scripts/check-release-files.sh` refuses unless the tag is the commit you reviewed, the first line is `# blockula-release vX.Y.Z`, both Linux archives and `blockula-wallet.tar.gz` are listed with the hashes the builders rebuilt (and they agree), `install.sh`, every `genesis-<id>.json` and every `checkpoints-<id>.json` hash exactly like the commit's `scripts/install.sh`, `genesis/<id>/genesis.json` and `node/checkpoints/<id>.json` (and all of the commit's are listed), the four archives are listed, and nothing else is (audit F49, review-r2-supply-4). Provenance adds that the files came out of the release workflow.
 4. **Sign offline.** Carry `checksums.txt` (only that file) to the offline signing machine. It holds the release key and one `blockula` binary, and nothing else: no checkout, no `npm ci`, no Node.js tooling. A signing process trusts every line of code it loads, and the monorepo's npm tree (the wallet's toolchain included, with install scripts) is far more than the signer needs (audit supply-chain-B-4). The binary is one the signer verified before taking it offline: their own reproduced build (step 2's `scripts/reproduce-release.sh`, whose archive matched; take `blockula` out of it), or a release fetched and checked as in [To an offline machine](#to-an-offline-machine). Note its SHA-256 in the release issue, and carry new binaries over only the same way. A binary built with an older release key than the one signing (after a rotation) still checks the new key's signature when `--key-id` names it, with a note that it isn't the key it trusts; move its pin with the rotation statement (`blockula release pin --key-id <new> --rotation …`, as operators do) so that its `install` and `fetch` trust the new key too.
 
    ```bash
@@ -638,7 +822,7 @@ Every release is reproducible, carries SLSA build provenance, and is signed offl
 ### The release key
 
 - One ML-DSA-65 key, generated on the offline signing machine (set up as in step 4 above: the key and a verified `blockula`, nothing else) with `blockula keygen > release-key.json`. Its **key id** is the hex BLAKE3 of the public key: `blockula release keyid --key release-key.json`. The key doesn't exist yet; generate it this way from the start, never on a machine that has had a checkout or an npm tree.
-- Publish the key id in SECURITY.md, this file, `scripts/install.sh` (`BUILTIN_KEY_ID`), `node/src/release_cli.rs` (`BUILTIN_KEY_ID`, the key a fresh `blockula release install` trusts when nothing is pinned, and the only one it lets an operator pin by `--key-id`), `mcp/src/release.ts` (`RELEASE_KEY_ID`, the key the MCP's `install_node` requires), the website, the operators' channel and the project's social accounts, so a single compromised channel can't swap it. A test (`built_in_key_id_matches_install_sh`) fails unless the three built-in copies are equal. The `release_cli` unit tests pass their built-in id explicitly and don't depend on it, but `scripts/test-release-runbook.sh` signs its stand-in releases with keys it generates, so once a key id is built in, its first-install cases are refused ("this blockula was built with release key …") and the required Node check goes red (audit review-r4-supply-1). The ceremony PR has to give that test a binary built with its own test key id (for example a non-default cargo feature that takes the built-in id from a committed test key at compile time, never a runtime setting) before it fills in the real one; don't merge it by bypassing the check or by deleting those cases. **Release key id:** *not generated yet* (the maintainer fills this in at the key ceremony).
+- Publish the key id in SECURITY.md, this file, `scripts/install.sh` (`BUILTIN_KEY_ID`), `node/src/release_cli.rs` (`BUILTIN_KEY_ID`, the key a fresh `blockula release install` trusts when nothing is pinned, and the only one it lets an operator pin by `--key-id`), `mcp/src/release.ts` (`RELEASE_KEY_ID`, the key the MCP's `install_node` requires), the website, the operators' channel and the project's social accounts, so a single compromised channel can't swap it. A test (`built_in_key_id_matches_install_sh`) fails unless the three built-in copies are equal. Nothing else depends on the value (audit review-r4-supply-1): the `release_cli` unit tests pass their built-in id explicitly, `scripts/test-install.sh` runs on copies of `install.sh` with the key id each case needs, and `scripts/test-release-runbook.sh` runs a `blockula` built with the non-default cargo feature `test-release-key` (CI builds it just for that step), which trusts the test key that signs its stand-in releases (seed `0x5e` × 32, published, so it can never sign a real release) instead of the built-in id: a compile-time choice, never a runtime setting, and no release, image or reproduction enables it (`scripts/check-pins.sh` refuses the feature there). So the ceremony PR is three lines, the three copies, plus this document and SECURITY.md; don't merge it by bypassing a check. **Release key id:** *not generated yet* (the maintainer fills this in at the key ceremony).
 - **Operators pin it once.** Their first `blockula release install --key-id K` writes K to `~/.blockula/release-key-id` once the release verifies (`blockula release pin --key-id K` pins it by hand; `blockula release pin` shows it). A binary built after the key ceremony pins only the key id it was built with: given another, `install`, `fetch` and `pin` refuse and name both, since one of them isn't genuine (audit review-r3-supply-4). From then on, `blockula release install` and `fetch` check against the pin and refuse a different `--key-id`. `blockula release verify` checks against the pin (or, with nothing pinned, the built-in key) unless `--key-id` names one: it pins nothing, so it checks the key named and says when that isn't the key `install` would trust. `install.sh` relies on this: after a rotation it names the new key, which an older installed `blockula` wasn't built with (review-r4-supply-2). They never take the key id from a release again, or from SECURITY.md, which a compromised GitHub account can edit.
 - Back it up like a validator key (encrypted, offline, two locations). **Rotation:** on the offline machine, sign a statement naming the new key id with the old key, and publish both through the same channels as the key id:
 
@@ -780,6 +964,8 @@ Every operator runs the reference stack in [`deploy/monitoring`](../deploy/monit
 - Each operator is in the on-call rotation for their own nodes. The core team runs a network-wide rotation (primary and secondary, weekly handover, escalation to the security lead after 15 minutes without acknowledgement for a SEV-1).
 - The project runs a public status page fed by the public RPC nodes' health (`/api/health`).
 
+On a chain with programs, add rules for the series in [Programs, Metrics](#metrics) (the reference alerts don't cover them yet).
+
 Logs go to the journal (`journalctl -u blockula`). Keep at least 14 days (`SystemMaxUse=` in `journald.conf` sized for it); attach the relevant window to every incident.
 
 ## Checklists
@@ -790,7 +976,8 @@ Logs go to the journal (`journalctl -u blockula`). Keep at least 14 days (`Syste
 - [ ] chrony with NTS sources; offset < 10 ms.
 - [ ] Binary installed with `blockula release install` ([A first install](#a-first-install)), release key id pinned (`blockula release pin` shows it); genesis file from `blockula release fetch`, its hash checked.
 - [ ] Consensus key and owner key backed up offline, encrypted, two places; restore tested.
-- [ ] systemd unit with `BLOCKULA_INSTANCE_ID` and `RestartPreventExitStatus=10 11 12`; `GITHUB_TOKEN` set (public-read-only).
+- [ ] systemd unit with `BLOCKULA_INSTANCE_ID` and `RestartPreventExitStatus=10 11 12 13`; `GITHUB_TOKEN` set (public-read-only).
+- [ ] On a chain with programs: no tight `TasksMax`, memory or address-space limit ([Limits a validator needs](#limits-a-validator-needs)); a fee float on the validator's own account; the pause read, and the other validators' operators known ([The pause](#the-pause)).
 - [ ] Provider volume snapshots off on the validator volume.
 - [ ] At least one sentry, registered as `http_addr`; validator HTTP private.
 - [ ] Monitoring stack running; receivers and heartbeat tested with a test alert.

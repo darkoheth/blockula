@@ -1,6 +1,6 @@
 # Security policy
 
-Blockula is an unaudited testnet: it has had an internal review but no third-party audit yet (see the README). Nothing on it has real value, but the code is meant to secure a mainnet one day, so we want to hear about every vulnerability now.
+Blockula is software for running your own ledger. It has had an internal review but no third-party audit (see the README). FANG has no value on any chain, but the chains people launch with Blockula should still be safe to run, so we want to hear about every vulnerability.
 
 ## Reporting
 
@@ -17,7 +17,7 @@ Include what you found, how to reproduce it (a deterministic repro, such as a fa
 
 Especially wanted: anything that halts or splits the chain, mints or moves FANG without authorization, bypasses a session key's limits, forges a signature or certificate, or makes nodes disagree on state.
 
-Known limitations listed in [docs/PLAN.md](docs/PLAN.md#known-limits) and [docs/MAINNET.md](docs/MAINNET.md) are known, but a concrete exploit of one is still welcome.
+Known limitations listed in [docs/PLAN.md](docs/PLAN.md#known-limits) are known, but a concrete exploit of one is still welcome.
 
 ## Fuzzing findings
 
@@ -32,11 +32,11 @@ These are targets, not guarantees:
 
 ## Bug bounty
 
-[docs/BUG_BOUNTY.md](docs/BUG_BOUNTY.md) has the scope, severity tiers, rewards, rules and safe harbor. It opens, funded, on the incentivized testnet at least a month before mainnet; until the amounts are confirmed there, valid reports are rewarded under its table once it is.
+[docs/BUG_BOUNTY.md](docs/BUG_BOUNTY.md) has the scope, severity levels, rules and safe harbor. There's no paid bounty program: any reward is at the maintainers' discretion, and nothing in these files is an offer to pay.
 
 ## Audits
 
-No third-party audit yet. The scope for the external audit of the mainnet code (SEC-1) is [docs/AUDIT_SCOPE.md](docs/AUDIT_SCOPE.md); reports will be published here when they're done.
+No third-party audit. [docs/AUDIT_SCOPE.md](docs/AUDIT_SCOPE.md) is the scope an external audit of the protocol would cover; a report would be published here.
 
 The internal review of protocol v1 and its fix rounds (October 2026) is [docs/AUDIT-2026-10.md](docs/AUDIT-2026-10.md): its findings, their fixes, and the risks and limits that remain. AI models ran it. It is not a third-party audit and doesn't replace one.
 
@@ -44,9 +44,9 @@ The internal review of protocol v1 and its fix rounds (October 2026) is [docs/AU
 
 Release archives carry SLSA build provenance, the Linux builds are reproducible, and `checksums.txt` is signed offline with the Blockula release key (ML-DSA-65). How to check all three: [docs/OPERATIONS.md "Releases"](docs/OPERATIONS.md#releases). `blockula release install vX.Y.Z` installs a release only if its signature checks against the release key id you pinned at your first install (`~/.blockula/release-key-id`), and a new key id is accepted only with a rotation statement signed by the pinned key. Once the key exists, a `blockula` binary also knows it, and won't pin any other key id you give it. The MCP's `install_node` checks against the same pin. This file is in a repository a compromised GitHub account could edit, so take the key id from here and from a channel GitHub doesn't control (the website, the operators' channel), check they agree, and pin it once. Release key id: *not generated yet*; it will be published here, in OPERATIONS.md, in `scripts/install.sh`, in `node/src/release_cli.rs` and in `mcp/src/release.ts`.
 
-## Testing on the public testnet
+## Testing
 
 Good-faith research is welcome. Please:
-- Prefer a local chain (`blockula dev`, or `scripts/local-testnet.sh` for 4 validators) for anything disruptive.
-- Don't degrade the public testnet for others (no flooding, sustained load or deliberate halts), and don't touch other people's accounts or data.
+- Test on a chain of your own (`blockula dev`, or `scripts/local-testnet.sh` for 4 validators). The public testnet was retired in November 2026.
+- Don't degrade chains other people run (no flooding, sustained load or deliberate halts) without their operators' consent, and don't touch other people's accounts or data.
 - Give us a reasonable chance to fix an issue before disclosing it.

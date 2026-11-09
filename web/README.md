@@ -1,31 +1,75 @@
 # Blockula wallet (web)
 
-The passkey wallet at `https://<RP_ID>`. A passkey unlocks an ML-DSA-65 key that lives only in the tab's memory; the account is a list of owner and session keys on-chain (see the root README).
+The passkey wallet, and an explorer, for a chain you [launched](../docs/LAUNCH.md). A passkey unlocks an ML-DSA-65 key that lives only in the tab's memory; the account is a list of owner and session keys on-chain (see the root README).
+
+Every node serves it at `/wallet/` (`http://localhost:7070/wallet/`): the binary embeds a static export of this app, so a friend needs only the link. Its node is the page's origin, its passkey domain the page's host name, its chain the one that node reports (pinned on first use, as for a custom node), and it has no network picker.
+
+```sh
+npm run build:wallet                # the served build: SDK, then the static export into web/out
+cargo build --release --locked --manifest-path node/Cargo.toml   # embeds web/out (node/build.rs)
+npm run wallet                      # or: this app as its own server for the node on this machine, http://localhost:3000
+```
+
+The served build (`BLOCKULA_SERVED=1`, `next.config.ts`) is `output: "export"` under `basePath: "/wallet"`: no proxy.ts and no `headers()`, since no Next server runs it; the node sets the headers and a CSP that hashes each page's inline scripts (node/src/wallet.rs). Code that differs reads `SERVED`, `BASE_PATH`, `servedConfig()` and `appPath()` from `lib/config.ts`. A static export can't list every id, so each dynamic route (`app/tx/[id]` and the rest) exports one page under the placeholder `_`, the node serves it for every id, and the page reads the id with `useRouteParam` (`lib/route-param.ts`), never `useParams`. A new dynamic route needs the same split: a server `page.tsx` with `export const generateStaticParams = servedStaticParams("id")` (a function only in the served build: one returning `[]` would make the route static elsewhere) and a client `view.tsx` (and its entry in `scripts/wallet-built.mjs`). `E2E_SERVED=1 npm run test:e2e -w @blockula/web` adds the e2e of a real node serving it (`e2e/served.spec.ts`).
+
+`npm run wallet` binds passkeys to `localhost`, so it works only on the machine that runs it. Friends use the node's `/wallet/` (over HTTPS for passkeys: `tailscale serve`), or see [docs/BUILD-ON-IT.md, "Give friends a link"](../docs/BUILD-ON-IT.md#5-give-friends-a-link) to host this app yourself.
 
 ```sh
 npm run build -w @blockula/sdk      # the wallet imports the SDK's build
 npm run dev -w @blockula/web        # http://localhost:3000, against a local node by default
 npm run build -w @blockula/web      # production build
+npm run start -w @blockula/web      # serve the production build on port 3000
 npm run test:e2e -w @blockula/web   # Playwright (needs `npx playwright install chromium` once)
 npm run test:vectors -w @blockula/sdk
 ```
 
 ## Configuration
 
-Everything is a build-time `NEXT_PUBLIC_*` variable.
+Everything is a build-time `NEXT_PUBLIC_*` variable: set them in the environment of `npm run build`, or in `web/.env.production.local` (not committed), and rebuild after changing them.
+
+### Your chain
+
+With none of these set, the wallet starts on a node on this machine (`http://localhost:7070`, the **Local node** network). To build it for your chain, set these. The wallet lists your chain as its **Testnet** network (the slot the retired public testnet used) and shows the chain's name beside it.
+
+| Variable | Default | |
+|---|---|---|
+| `NEXT_PUBLIC_RP_ID` | `testnet.blockula.app` | The passkey relying-party id: the hostname the wallet is served from (no scheme, no port). Passkeys, and so wallets, are bound to it for good. Payment links point at this host. `localhost` for development |
+| `NEXT_PUBLIC_BLOCKULA_RPC` | (unset) | Your node's URL, `https://` for a hosted wallet: adds the network and makes it the default |
+| `NEXT_PUBLIC_TESTNET_CHAIN_ID` | `blockula-testnet-2` | Your chain id: the node must report it |
+| `NEXT_PUBLIC_TESTNET_GENESIS_HASH` | the retired testnet's | Your chain's genesis hash: the node must report it |
+| `NEXT_PUBLIC_TESTNET_PREFIX` | `tboo` | The address prefix: `boo` for a chain made with `blockula launch` or `summon` |
+| `NEXT_PUBLIC_TESTNET_WITNESSES` | (unset) | Comma-separated `https://` URLs of other nodes of your chain. Names that end up in a signature are proven against them first (audit gap-7-1); without any, a name is the selected node's word and the wallet says so |
+
+The values come from `~/.blockula/<chain id>/LAUNCH.md` or `curl -s <node>/api/status` (`chain_id`, `genesis_hash`, `address_prefix`).
+
+### The project site
+
+`NEXT_PUBLIC_SITE=project` builds Blockula's own landing page (https://blockula.app) instead of a wallet: `/` is the project's page (`components/site/`), and every other route redirects to it (`proxy.ts`). It has no network picker, no wallet and no chain gate. It shows a live demo chain, opens any node's own wallet (`<node>/wallet/`) from an address a visitor pastes, lists the chains in the repo's chain directory ("Join a chain", `components/site/Chains.tsx`), and has the launch and contributor prompts. It follows the system's light or dark (`app/site.css`, scoped to `html[data-site]`, so the wallet builds look as before).
+
+| Variable | Default | |
+|---|---|---|
+| `NEXT_PUBLIC_SITE` | (unset) | `project` makes the project site. Any other value fails the build, and so does combining it with the served build or `NEXT_PUBLIC_NETWORK=mainnet` |
+| `BLOCKULA_CHAINS_DIR` | `../chains` | The chain directory the site lists. `next.config.ts` reads its `<chain id>.json` files at build time, checks them with `lib/chains.ts` (the rules `scripts/check-chains.mjs` runs in CI; a bad listing fails the build) and hands them to the page as `BLOCKULA_SITE_CHAINS`. Each listed `rpc` origin joins the CSP's `connect-src`, so a new listing needs a new deploy. The e2e builds point it at `e2e/fixtures/` |
+| `NEXT_PUBLIC_DEMO_NODE` | (unset) | The demo chain's node: `https://` (plain `http://` only for this machine or a private network, as for the connect field). The page reads its `/api/status` and `/api/blocks` from the browser (nodes send permissive CORS), shows its name, height, validators and newest blocks, links its wallet (`<node>/wallet/`), explorer and invite page, and gives the agent prompt pinned to it. The CSP's `connect-src` allows this origin and the listed chains' nodes, nothing else. Unset, or not answering, the demo section says the demo is resting and points at launching your own. A malformed value fails the build |
+
+```sh
+NEXT_PUBLIC_SITE=project NEXT_PUBLIC_DEMO_NODE=https://demo.example npm run build -w @blockula/web
+```
+
+The demo node must serve the wallet over HTTPS on a hostname of its own (passkeys are bound to it): `tailscale funnel 7070`, or a VPS behind Caddy ([docs/BUILD-ON-IT.md, "Put it online"](../docs/BUILD-ON-IT.md#4-put-it-online)). `e2e/site.spec.ts` and `e2e/site-nodemo.spec.ts` test both builds against a mocked demo node.
+
+**The chain directory.** Each card reads its node's `/api/status` and `/api/validators` from the browser every half minute: live, resting (not answering), or refused when the node reports another chain id or genesis hash than its listing (no wallet button then). A chain with `validators_wanted` gets **Become a validator**: the steps of [docs/RUN-A-NODE.md, "Validate someone else's chain"](../docs/RUN-A-NODE.md#validate-someone-elses-chain) with its node, genesis hash and home filled in, and the way in its set needs (admission, approval or stake). With no listings it shows how to launch and list one. Listing rules: [chains/README.md](../chains/README.md). `e2e/site-chains.spec.ts` tests it against the fixture listings in `e2e/fixtures/chains/`.
+
+### Mainnet build mode (unused)
+
+Left from the mainnet that was planned and dropped in October 2026 ([docs/README.md, "Design history"](../docs/README.md#design-history)). No chain uses it.
 
 | Variable | Default | |
 |---|---|---|
 | `NEXT_PUBLIC_NETWORK` | (unset) | `mainnet` makes a mainnet deployment: mainnet is the default network, browser-only keys are off, and the build fails unless `NEXT_PUBLIC_RP_ID`, `NEXT_PUBLIC_MAINNET_RPC` and `NEXT_PUBLIC_MAINNET_GENESIS_HASH` are set and the rpId isn't on a shared hosting domain (`*.vercel.app`, `*.pages.dev`, …). |
-| `NEXT_PUBLIC_RP_ID` | `testnet.blockula.app` | The passkey relying-party id. Passkeys, and so wallets, are bound to it for good. Mainnet's is `wallet.blockula.app` (DEC-8). Payment links point at this host. |
 | `NEXT_PUBLIC_MAINNET_RPC` | (unset) | Adds the Mainnet network (chain `blockula-1`, prefix `boo`). Hidden until set. |
-| `NEXT_PUBLIC_MAINNET_GENESIS_HASH` | (unset) | Mainnet's genesis hash. Hard-code it in `lib/config.ts` once the ceremony has produced it. |
-| `NEXT_PUBLIC_MAINNET_WITNESSES` | (unset) | Comma-separated `https://` URLs of other mainnet nodes (independent operators'). Names that end up in a signature are proven against them first (audit gap-7-1); without any, a name is the selected node's word and the wallet says so. |
-| `NEXT_PUBLIC_BLOCKULA_RPC` | `https://blockula-testnet.fly.dev` | The testnet's RPC. On a mainnet deployment, the testnet is listed only if this is set. |
-| `NEXT_PUBLIC_TESTNET_CHAIN_ID` | `blockula-testnet-2` | The chain id the testnet node must report (`TESTNET_CHAIN_ID`). A relaunched testnet takes a new chain id, so set this only for another testnet. |
-| `NEXT_PUBLIC_TESTNET_GENESIS_HASH` | `TESTNET_GENESIS_HASH` in `lib/config.ts` (unset until the release after the launch pins it, `scripts/pin-network.sh`) | Pins the testnet's genesis. Set it on Vercel right after a launch (`deploy/launch.sh` prints the hash), before the release that builds it in; when both are set, this one wins. |
-| `NEXT_PUBLIC_TESTNET_PREFIX` | `tboo` | The testnet's address prefix (DEC-7). |
-| `NEXT_PUBLIC_TESTNET_WITNESSES` | (unset) | Comma-separated `https://` URLs of other nodes of the testnet, as for mainnet. The public testnet has one public node today (`blockula-testnet.fly.dev`, the RPC itself, which doesn't count), so leave it unset until there's a second, independently run one. |
+| `NEXT_PUBLIC_MAINNET_GENESIS_HASH` | (unset) | Mainnet's genesis hash (`scripts/pin-network.sh blockula-1 … --mainnet` would build it into `lib/config.ts`; a mainnet build then refuses any other value here). |
+| `NEXT_PUBLIC_MAINNET_WITNESSES` | (unset) | Comma-separated `https://` URLs of other mainnet nodes, as above. |
 
 Witness URLs must be `https://` (or `http://localhost` / `http://127.0.0.1` for development), are deduplicated, and the selected RPC itself is dropped from the list; a malformed one fails the build. The CSP's `connect-src` allows every configured node and witness (`lib/csp.ts`).
 
@@ -62,7 +106,7 @@ Witness URLs must be `https://` (or `http://localhost` / `http://127.0.0.1` for 
 - A kit is an offline ML-DSA-65 key made in the browser and added to the account as an owner key labeled `recovery kit`. Onboarding offers one right after the faucet step; Devices & agents → Recovery kit makes, lists and revokes them.
 - The 32-byte seed is written as **24 words**: the BIP39 English wordlist (vendored in `lib/bip39-english.ts`, hash-checked in the tests) and BIP39's checksum, so a mistyped or swapped word is caught before anything happens. Only the encoding is BIP39: there's no passphrase, PBKDF2 or BIP32, so the words open nothing in other wallets. We chose words over hex because people copy 24 words onto paper far more reliably than 64 hex digits, and the checksum turns most mistakes into an immediate error. Restore accepts numbering, any case and four-letter abbreviations.
 - The kit page shows the words, account, network and chain id, kit key id, date and restore steps, and prints on its own (print stylesheet). It can also be downloaded as text, with a warning that downloads end up in cloud backups. The user confirms two random words before the key is added. Only the key id is used to add it; the seed is wiped as soon as the words exist, and the words are dropped once confirmed. Nothing secret is stored or sent.
-- With no FANG for the fee (mainnet has no faucet), the kit's key id waits in the hint and Home and Devices offer to activate it later.
+- With no FANG for the fee (on a chain without a faucet), the kit's key id waits in the hint and Home and Devices offer to activate it later.
 - **Restore** (`/recover`): type the words → the wallet finds the accounts that key owns (`/api/key/{key_id}`) → creates a passkey on this device → the kit key signs one `add_key` for it → the new passkey takes over. It then offers to revoke the lost device and recommends replacing the kit, whose words have now been typed into a browser.
 
 ## Tests
@@ -80,6 +124,7 @@ Witness URLs must be `https://` (or `http://localhost` / `http://127.0.0.1` for 
 | `stake.spec.ts` | Delegate, unstake an amount and the rest, withdraw once unbonded (each tx checked by the mock node), no CSP violations, a node lying about the stake's value or shares (the amount is signed), a node without staking |
 | `paylink.spec.ts` | Receive links carry their chain and the canonical amount (a zero-padded one still fits a QR code); an absurd amount is refused without crashing; Send fills a link made for this chain, refuses one made for another chain or instance, refuses a malformed chain or genesis with fixed words, names only networks it knows, and fills an older link with a notice |
 | `governance.spec.ts` | Proposals with tallies, quorum and council votes; voting with conviction and changing the vote; releasing locks; hostile on-chain titles and links rendered inert; a node without governance |
+| `site.spec.ts`, `site-chains.spec.ts`, `site-nodemo.spec.ts` | The project site (`NEXT_PUBLIC_SITE=project`, two more builds): the demo chain's live stats and links, a demo that's unreachable, answers garbage or isn't configured, the connect field's checks, wallet routes redirected home, the chain directory's cards (live, resting, another chain), the validator steps and their copy buttons, its empty state, `connect-src` holding the demo node and the listed nodes only, phone layout in light and dark |
 | `explorer.spec.ts` | The node's built-in explorer (`node/src/explorer.html`) on a mocked protocol v1 API: validator pools, Governance and proposal pages, parameters, name expiry, escaping, a dropped tx (not final, nothing charged) apart from one that failed in a block (its fee charged) |
 
 ## Manual release test matrix

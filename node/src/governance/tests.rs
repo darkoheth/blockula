@@ -77,6 +77,7 @@ fn genesis(params: &[(&str, u64)]) -> Genesis {
         upgrades: vec![],
         bootstrap_excluded: vec![],
         pool_repos: Default::default(),
+        brand: None,
     }
 }
 
@@ -143,7 +144,7 @@ impl T {
         let hash = format!("block-{}", self.h);
         let proposer = addr(VALIDATORS[0]);
         let tx_bytes = std::mem::take(&mut self.tx_bytes);
-        self.st.end_block(&BlockInfo { height: self.h, version: crate::upgrade::version_at(&self.st, self.h), hash: &hash, proposer: &proposer, view: self.h, parent_view: self.h - 1, skipped: &[], tx_bytes });
+        self.st.end_block(&BlockInfo { chain_id: CHAIN, height: self.h, version: crate::upgrade::version_at(&self.st, self.h), hash: &hash, proposer: &proposer, view: self.h, parent_view: self.h - 1, skipped: &[], tx_bytes });
         self.st.commit_block().unwrap();
         self.st.debug_check(self.h);
         self.h += 1;
@@ -552,6 +553,26 @@ fn the_bootstrap_council_passes_proposals_until_the_bootstrap_ends() {
     let i = t.propose(ALICE, text());
     t.vote(v1, i, true, 1, 0).unwrap();
     assert!(t.p(i).council.is_empty(), "votes after the bootstrap aren't council votes");
+}
+
+/// Off `blockula-1` (here a v1 chain) a validator's council seat holds the latest vote from its
+/// consensus key's account or its owner's, whichever came last, as it always has: the owner's
+/// precedence is `blockula-1`'s alone (`owner_outranks_key`; `genesis_builder::mainnet_tests`
+/// has that side, and the same launch on a v2 dry-run chain keeping this rule).
+#[test]
+fn off_mainnet_the_latest_vote_holds_a_validators_seat() {
+    let mut t = T::new(&[("bootstrap_end_height", 1_000)]);
+    let v3 = VALIDATORS[2];
+    let seat = |t: &T, id: u64| t.p(id).council.get(&addr(v3)).map(|c| (c.aye, c.voter.clone()));
+    let id = t.propose(ALICE, text());
+    t.vote(OWNER, id, false, 1, 0).unwrap();
+    assert_eq!(seat(&t, id), Some((false, addr(OWNER))));
+    t.vote(v3, id, true, 1, 0).unwrap();
+    assert_eq!(seat(&t, id), Some((true, addr(v3))), "the consensus key's account replaced the owner's vote");
+    assert_eq!(t.st.governance.votes[&IdKey::new(id, &addr(v3))].council, Some(addr(v3)));
+    t.vote(OWNER, id, false, 1, 0).unwrap();
+    assert_eq!(seat(&t, id), Some((false, addr(OWNER))), "and the owner's replaced it back");
+    t.next();
 }
 
 /// Audit F15, F16: governance's own safety parameters change only by a token supermajority, never
@@ -1462,6 +1483,44 @@ fn proposals_are_checked_when_they_are_made() {
     }
 }
 
+/// Programs are a feature from v2 (`upgrade::known_features`), and a proposal to switch a feature
+/// on or off is checked against the version in force at its own block. On a chain at v1,
+/// `ActivateFeature { programs }` and `DeactivateFeature { programs }` are refused when they're
+/// proposed, in the words of a binary without v2, and they stay refused while v2 is only
+/// scheduled, even in a block whose proposals would run after it activates: until then every node
+/// runs the chain's blocks under v1, nodes whose binary doesn't have v2 included (they halt only at
+/// the activation height), and each must reach the same outcome. From the activation height on it
+/// may be proposed, and it runs a vote and a timelock later.
+#[test]
+fn programs_switch_on_only_once_v2_is_in_force() {
+    let programs = || ProposalKind::ActivateFeature { feature: crate::upgrade::PROGRAMS_FEATURE.into() };
+    let off = || ProposalKind::DeactivateFeature { feature: crate::upgrade::PROGRAMS_FEATURE.into() };
+    // What a binary without v2 reports (its feature list is `["ghost"]`), word for word.
+    let v1 = "unknown feature programs (known: ghost)";
+    let v2 = crate::upgrade::PROGRAMS_VERSION;
+    let mut t = T::new(&[]);
+    let lag = t.st.chain_params.voting_blocks + t.st.chain_params.timelock_blocks;
+    for kind in [programs(), off()] {
+        assert_eq!(t.err(ALICE, Action::Propose { kind, deposit: 50 * FANG, title: "x".into(), url: String::new() }), v1);
+    }
+    let a = schedule_v(&mut t, v2);
+    // Scheduled, not in force: refused in the block whose proposals would run at the activation
+    // height, and in the last block before it.
+    t.through(a - lag - 1);
+    refused_upgrade(&mut t, ALICE, programs(), v1);
+    t.through(a - 2);
+    assert_eq!(crate::upgrade::version_at(&t.st, t.h), crate::consensus::PROTOCOL_VERSION);
+    refused_upgrade(&mut t, ALICE, programs(), v1);
+    refused_upgrade(&mut t, ALICE, off(), v1);
+    // In force: proposed at the activation height, it runs a vote and a timelock later.
+    t.through(a - 1);
+    assert_eq!((t.h, crate::upgrade::version_at(&t.st, t.h)), (a, v2));
+    let on = pass_by(&mut t, ALICE, ALICE, programs());
+    t.finish(on);
+    assert_eq!(t.p(on).status, ProposalStatus::Executed, "{}", t.p(on).outcome);
+    assert_eq!(t.st.upgrade.features.get(crate::upgrade::PROGRAMS_FEATURE), Some(&crate::upgrade::Feature { activated_at: a + lag }));
+}
+
 #[test]
 fn merkle_trees_build_and_verify() {
     for n in 1..=9usize {
@@ -1834,6 +1893,67 @@ fn multisig_accounts_need_their_threshold() {
     }
     assert_eq!(t.st.governance.multisigs[&alice].pending.len(), MAX_MULTISIG_PENDING);
     assert!(t.tx_as(&k2, &alice, Action::MultisigPropose { action: send(1) }).unwrap_err().to_string().contains("32 open multisig proposals"));
+}
+
+/// The Hunts program's account (the Hunts plan, D7): a 2-of-3 multisig creates a Hunt and awards
+/// it to an address that doesn't exist yet. No owner key does either alone; the account, not the
+/// winner, pays the burn that opens the winner's account; and a session key on it still sends
+/// transfers (why the program's account carries none).
+#[test]
+fn a_multisig_creates_and_awards_a_hunt_to_a_new_address() {
+    let mut t = T::new(&[]);
+    let alice = addr(ALICE);
+    let (k1, k2, k3) = (keys(ALICE), keys(11), keys(12));
+    for seed in [11, 12] {
+        t.tx(ALICE, add_key(seed, &alice, &format!("device {seed}"), KeyRole::Owner)).unwrap();
+    }
+    t.tx(ALICE, Action::MultisigCreate { owners: vec![kid(ALICE), kid(11), kid(12)], threshold: 2 }).unwrap();
+    let bounty = 25 * FANG;
+    let create = Action::CreateHunt { repo: "jackdishman/blockula".into(), issue: 7, amount: bounty, expires_at: t.h + 1_000, title: "a program hunt".into() };
+    // An owner key alone can't create it: it proposes, and the second approval runs it.
+    assert!(t.tx_as(&k1, &alice, create.clone()).unwrap_err().to_string().contains("2-of-3 multisig: propose this"));
+    let id = t.st.next_hunt_id;
+    let before = t.bal(ALICE);
+    let fee = t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(create) }).unwrap();
+    assert!(t.st.hunts.get(&id).is_none(), "one approval stores it");
+    let p = *t.st.governance.multisigs[&alice].pending.iter().next().unwrap();
+    let fee = fee + t.tx_as(&k2, &alice, t.approve(p)).unwrap();
+    let h = t.st.hunts.get(&id).unwrap().clone();
+    assert_eq!((h.creator, h.amount, h.status), (alice.clone(), bounty, crate::chain::HuntStatus::Open));
+    assert_eq!(t.bal(ALICE), before - bounty - fee, "the bounty is escrowed from the account");
+    // Nor award it alone.
+    let winner = addr(60);
+    assert!(!t.st.accounts.contains_key(&winner));
+    let award = Action::AwardHunt { hunt_id: id, to: winner.clone(), pr: 9, familiar_key: None };
+    assert!(t.tx_as(&k3, &alice, award.clone()).unwrap_err().to_string().contains("2-of-3 multisig: propose this"));
+    let (before, burned) = (t.bal(ALICE), t.st.burned);
+    let fee = t.tx_as(&k3, &alice, Action::MultisigPropose { action: Box::new(award) }).unwrap();
+    assert_eq!(t.st.hunts.get(&id).unwrap().status, crate::chain::HuntStatus::Open);
+    let p = *t.st.governance.multisigs[&alice].pending.iter().next().unwrap();
+    let approve = t.approve(p);
+    let fee = fee + t.tx_as(&k1, &alice, approve).unwrap();
+    // The winner holds the bounty, all of it; the account paid the fees and the opening burn.
+    let open = t.st.chain_params.account_creation_fee;
+    assert_eq!(open, FANG / 10);
+    assert_eq!(t.st.account(&winner).balance, bounty);
+    assert_eq!(t.bal(ALICE), before - fee - open);
+    assert!(t.st.burned >= burned + open, "the opening burn is burned");
+    let h = t.st.hunts.get(&id).unwrap().clone();
+    assert_eq!((h.status, h.awarded_to, h.awarded_by, h.pr), (crate::chain::HuntStatus::Awarded, Some(winner.clone()), Some(alice.clone()), Some(9)));
+    assert!(t.st.governance.multisigs[&alice].pending.is_empty());
+    // A session key on the account can't create or award a Hunt, but it can still send FANG
+    // without any approval: the reason the program's account must carry no session keys.
+    let agent = keys(50);
+    let add = add_key(50, &alice, "agent", KeyRole::Session { limit: 5 * FANG, period_blocks: 100, expires_at: t.h + 1_000 });
+    t.tx_as(&k1, &alice, Action::MultisigPropose { action: Box::new(add) }).unwrap();
+    let p = *t.st.governance.multisigs[&alice].pending.iter().next().unwrap();
+    t.tx_as(&k2, &alice, t.approve(p)).unwrap();
+    let hunt = Action::CreateHunt { repo: "jackdishman/blockula".into(), issue: 8, amount: 10 * FANG, expires_at: t.h + 1_000, title: "t".into() };
+    assert!(t.tx_as(&agent, &alice, hunt).unwrap_err().to_string().contains("session keys can only"));
+    let bob = t.bal(BOB);
+    t.tx_as(&agent, &alice, Action::Transfer { to: addr(BOB), amount: 2 * FANG }).unwrap();
+    assert_eq!(t.bal(BOB), bob + 2 * FANG);
+    t.next();
 }
 
 /// Audit F14: one owner key of a 2-of-3 multisig can't fill the pending list and keep the others
@@ -2234,7 +2354,7 @@ fn records_round_trip_and_journals_roll_back() {
     for (k, from, action) in txs {
         let mut tx = Tx { chain_id: CHAIN.into(), genesis_hash: "00".repeat(32), from: from.clone(), nonce: t.st.account(&from).nonce, fee: 0, tip: 0, valid_until: t.h + 10, action, memo: String::new(), public_key: hex::encode(k.public_key()), signature: "00".repeat(crate::crypto::SIGNATURE_LEN) };
         tx.fee = min_fee(tx.size());
-        assert_eq!(t.st.apply_j(&mut j, &tx, CHAIN, &addr(VALIDATORS[0]), t.h, true).unwrap(), Outcome::Applied, "{:?}", tx.action);
+        assert_eq!(t.st.apply_j(&mut j, &tx, CHAIN, &addr(VALIDATORS[0]), t.h, crate::chain::ApplyMode::Block).unwrap(), Outcome::Applied, "{:?}", tx.action);
     }
     assert_eq!(t.st.governance.next_proposal_id, id + 4, "the approval proposed #{}", id + 3);
     t.st.rollback(j);

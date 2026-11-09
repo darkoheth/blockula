@@ -204,10 +204,15 @@ fn summon_with(name: &str, epoch_blocks: u64, params: &[(&str, u64)]) -> (PathBu
 /// Simulated network: genesis validators as primary peers, `extra` (would-be validators) as
 /// secondary, all linked to each other.
 async fn network(context: &deterministic::Context, genesis: &Genesis, extra: &[PublicKey]) -> Oracle<PublicKey, deterministic::Context> {
+    network_tracking(context, genesis, extra, 4).await
+}
+
+/// [`network`], keeping `tracked` peer sets (production keeps `consensus::TRACKED_PEER_SETS`).
+async fn network_tracking(context: &deterministic::Context, genesis: &Genesis, extra: &[PublicKey], tracked: usize) -> Oracle<PublicKey, deterministic::Context> {
     let participants = consensus::participants(genesis).unwrap();
     let (network, oracle) = Network::new_with_split_peers(
         context.child("network"),
-        NetConfig { max_size: consensus::MAX_MESSAGE_SIZE, max_peers_per_set: NZUsize!(16), disconnect_on_block: true, tracked_peer_sets: NZUsize!(4) },
+        NetConfig { max_size: consensus::MAX_MESSAGE_SIZE, max_peers_per_set: NZUsize!(16), disconnect_on_block: true, tracked_peer_sets: std::num::NonZeroUsize::new(tracked).unwrap() },
         participants.iter().cloned(),
         extra.iter().cloned(),
     )
@@ -679,26 +684,29 @@ async fn wait_for(context: &deterministic::Context, vals: &[&Val], height: u64) 
     panic!("nodes stuck at {heights:?}, wanted {height}");
 }
 
-/// OPS-3: protocol v2 is scheduled at height 60. Validators restart onto a v2 binary one at a
-/// time well before it (and signal v2 in the blocks they propose), the network keeps finalizing
-/// across the activation height with v2 blocks, and the validator left on v1 halts after block 59
-/// without diverging. Upgraded, it rejoins. Old epochs' consensus journals are pruned meanwhile.
+/// OPS-3: the version after this release's (here "v-next") is scheduled at height 60 on a chain
+/// at v1. Validators restart onto a v-next binary one at a time well before it (and signal v-next
+/// in the blocks they propose), the network keeps finalizing across the activation height with
+/// v-next blocks, and the validator left on this release halts after block 59 without diverging.
+/// Upgraded, it rejoins. Old epochs' consensus journals are pruned meanwhile.
 #[test]
 fn validators_upgrade_one_at_a_time_and_a_laggard_halts_at_the_activation_height() {
     let (root, homes, genesis, seeds) = summon("upgrade");
     const AT: u64 = 60;
-    let (v1, v2) = (consensus::SUPPORTED_PROTOCOL_VERSION, consensus::SUPPORTED_PROTOCOL_VERSION + 1);
-    let schedule = vec![crate::upgrade::ScheduledUpgrade { version: v2, activation_height: AT }];
+    // What this release runs (the old binary) and the next one; blocks run `PROTOCOL_VERSION`
+    // until the activation height.
+    let (this, next) = (consensus::SUPPORTED_PROTOCOL_VERSION, consensus::SUPPORTED_PROTOCOL_VERSION + 1);
+    let schedule = vec![crate::upgrade::ScheduledUpgrade { version: next, activation_height: AT }];
     let executor = deterministic::Runner::timed(Duration::from_secs(1_800));
     executor.start(|context| async move {
         let mut oracle = network(&context, &genesis, &[]).await;
-        let old = Node { supported: v1, schedule: schedule.clone(), halt_height: None };
+        let old = Node { supported: this, schedule: schedule.clone(), halt_height: None };
         let mut vals = vec![];
         for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
             vals.push(start_with(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed), old.clone()).await);
         }
         wait_for_height(&context, &vals, 5).await;
-        // Each operator installs the v2 binary in their own window, one at a time.
+        // Each operator installs the next binary in their own window, one at a time.
         for i in 0..3 {
             let mut v = vals.remove(i);
             v.handle.take().unwrap().abort();
@@ -706,43 +714,45 @@ fn validators_upgrade_one_at_a_time_and_a_laggard_halts_at_the_activation_height
             drop(v);
             let h = vals[0].chain.lock().height();
             wait_for_height(&context, &vals, h + 2).await;
-            let upgraded = start_with(&context, &mut oracle, &genesis, i, 1, home, key, Node { supported: v2, schedule: vec![], halt_height: None }).await;
+            let upgraded = start_with(&context, &mut oracle, &genesis, i, 1, home, key, Node { supported: next, schedule: vec![], halt_height: None }).await;
             vals.insert(i, upgraded);
             let h = vals[0].chain.lock().height();
             wait_for_height(&context, &vals, h + 6).await;
         }
-        // Readiness on chain: three of four validators signal v2 in the blocks they propose (the
-        // last one restarted proposes again once it has watched the network for a few views).
+        // Readiness on chain: three of four validators signal the next version in the blocks they
+        // propose (the last one restarted proposes again once it has watched the network for a few
+        // views).
         let ready = || {
             let c = vals[3].chain.lock();
             let active = c.state.active_sets[&c.state.params.epoch_of(c.height() + 1)].clone();
             let signals = crate::upgrade::signals(&active, c.view().headers(u64::MAX, 40).iter().map(|(h, m)| (*h, m.proposer.as_str(), m.signal)));
-            signals.values().filter(|(s, _)| *s >= v2).count()
+            signals.values().filter(|(s, _)| *s >= next).count()
         };
-        wait_until(&context, "three validators signalling v2", || ready() == 3).await;
+        wait_until(&context, "three validators signalling the next version", || ready() == 3).await;
         assert!(vals[0].chain.lock().height() < AT - 10, "the upgrades finished well before the activation height");
-        assert_eq!(crate::upgrade::version_at(&vals[3].chain.lock().state, AT), v2);
-        // Across the activation height: the v1 node stops after AT - 1; the rest go on.
+        assert_eq!(crate::upgrade::version_at(&vals[3].chain.lock().state, AT), next);
+        // Across the activation height: the old node stops after AT - 1; the rest go on.
         let upgraded: Vec<&Val> = vals[..3].iter().collect();
         wait_for(&context, &upgraded, AT + 10).await;
         let laggard = &vals[3];
-        wait_until(&context, "the v1 node halts", || laggard.chain.lock().halt.signal.get().is_some()).await;
+        wait_until(&context, "the old node halts", || laggard.chain.lock().halt.signal.get().is_some()).await;
         let halt = laggard.chain.lock().halt.signal.get().unwrap();
-        assert_eq!(halt, crate::upgrade::Halt::UpgradeRequired { height: AT, version: v2, supported: v1 });
+        assert_eq!(halt, crate::upgrade::Halt::UpgradeRequired { height: AT, version: next, supported: this });
         assert_eq!(halt.exit_code(), crate::upgrade::EXIT_UPGRADE_REQUIRED);
-        assert_eq!(laggard.chain.lock().height(), AT - 1, "it didn't execute the v2 block");
+        assert_eq!(laggard.chain.lock().height(), AT - 1, "it didn't execute the next version's first block");
         {
             let (a, b) = (vals[0].chain.lock(), laggard.chain.lock());
             assert_eq!(a.root_at(AT - 1), b.root_at(AT - 1), "no divergence up to the halt");
             assert_eq!(a.block(AT - 1).unwrap().hash, b.block(AT - 1).unwrap().hash);
-            assert!((1..AT).all(|h| a.block(h).unwrap().version == v1) && (AT..=AT + 10).all(|h| a.block(h).unwrap().version == v2));
+            assert!((1..AT).all(|h| a.block(h).unwrap().version == consensus::PROTOCOL_VERSION) && (AT..=AT + 10).all(|h| a.block(h).unwrap().version == next));
         }
-        // Its operator upgrades it too (the process exited): it executes the v2 blocks and agrees.
+        // Its operator upgrades it too (the process exited): it executes the next version's blocks and
+        // agrees.
         let mut v = vals.pop().unwrap();
         v.handle.take().unwrap().abort();
         let (home, key) = (v.home.clone(), v.key.clone());
         drop(v);
-        vals.push(start_with(&context, &mut oracle, &genesis, 3, 1, home, key, Node { supported: v2, schedule: vec![], halt_height: None }).await);
+        vals.push(start_with(&context, &mut oracle, &genesis, 3, 1, home, key, Node { supported: next, schedule: vec![], halt_height: None }).await);
         let target = vals[0].chain.lock().height() + 8;
         wait_for_height(&context, &vals, target).await;
         let h = vals.iter().map(|v| v.chain.lock().height()).min().unwrap();
@@ -755,24 +765,25 @@ fn validators_upgrade_one_at_a_time_and_a_laggard_halts_at_the_activation_height
             let present = commonware_runtime::Storage::scan(&context, &consensus::simplex_partition("v0", e)).await.is_ok_and(|b| !b.is_empty());
             assert_eq!(present, e + consensus::JOURNAL_EPOCHS_KEPT >= epoch, "epoch {e}'s journal (current epoch {epoch})");
         }
-        println!("✓ upgraded across #{AT} one validator at a time; the v1 node halted at #{}, then caught up", AT - 1);
+        println!("✓ upgraded across #{AT} one validator at a time; the old node halted at #{}, then caught up", AT - 1);
     });
     std::fs::remove_dir_all(root).ok();
 }
 
-/// P7 (docs/PROGRAMS-PLAN.md): a chain whose genesis schedules v2 runs it on every node with no
-/// proposal and no restart (this binary runs v2 there: `upgrade::supported_version`), and a
-/// version-gated rule (the test-only `upgrade::test_gate`, which refuses its memo from v2 on)
-/// flips at the activation height across the network. A gated tx submitted below it is gossiped,
-/// proposed, verified and executed everywhere; from it on every node's mempool refuses one; blocks
-/// carry v1, then v2; roots agree; and a validator rebuilt from its block logs well past the
-/// activation height (its state database deleted) replays both sides of it to the same root.
+/// P7 (docs/PROGRAMS-PLAN.md): a chain whose genesis schedules the preview version runs it on
+/// every node with no proposal and no restart (this binary runs it there:
+/// `upgrade::supported_version`), and a version-gated rule (the test-only `upgrade::test_gate`,
+/// which refuses its memo from the preview version on) flips at the activation height across the
+/// network. A gated tx submitted below it is gossiped, proposed, verified and executed everywhere;
+/// from it on every node's mempool refuses one; blocks carry v1, then the preview version; roots
+/// agree; and a validator rebuilt from its block logs well past the activation height (its state
+/// database deleted) replays both sides of it to the same root.
 #[test]
 fn a_genesis_scheduled_version_and_its_gated_rules_activate_together_on_every_node() {
     const AT: u64 = 30;
     let (root, homes, mut genesis, seeds) = summon("genesis-upgrade");
-    let v2 = crate::upgrade::PREVIEW_PROTOCOL_VERSION;
-    genesis.upgrades = vec![crate::upgrade::ScheduledUpgrade { version: v2, activation_height: AT }];
+    let preview = crate::upgrade::PREVIEW_PROTOCOL_VERSION;
+    genesis.upgrades = vec![crate::upgrade::ScheduledUpgrade { version: preview, activation_height: AT }];
     for h in &homes {
         std::fs::write(h.join("genesis.json"), serde_json::to_string_pretty(&genesis).unwrap()).unwrap();
     }
@@ -780,7 +791,7 @@ fn a_genesis_scheduled_version_and_its_gated_rules_activate_together_on_every_no
     executor.start(|context| async move {
         let mut oracle = network(&context, &genesis, &[]).await;
         let node = Node { supported: crate::upgrade::supported_version(&genesis), schedule: vec![], halt_height: None };
-        assert_eq!(node.supported, v2);
+        assert_eq!(node.supported, preview);
         let mut vals = vec![];
         for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
             vals.push(start_with(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed), node.clone()).await);
@@ -812,10 +823,10 @@ fn a_genesis_scheduled_version_and_its_gated_rules_activate_together_on_every_no
         wait_until(&context, "the ungated tx finalized everywhere", || vals.iter().all(|v| v.chain.lock().has_tx(&plain_id))).await;
         {
             let c = vals[0].chain.lock();
-            assert!((1..AT).all(|h| c.block(h).unwrap().version == 1) && (AT..=c.height()).all(|h| c.block(h).unwrap().version == v2));
+            assert!((1..AT).all(|h| c.block(h).unwrap().version == 1) && (AT..=c.height()).all(|h| c.block(h).unwrap().version == preview));
         }
         // Validator 2's state database is lost after the activation height: it rebuilds from its
-        // block logs, replaying v1 and v2 blocks (the gated tx included), and agrees.
+        // block logs, replaying v1 and preview-version blocks (the gated tx included), and agrees.
         let mut v = vals.remove(2);
         v.handle.take().unwrap().abort();
         let (home, key) = (v.home.clone(), v.key.clone());
@@ -828,7 +839,7 @@ fn a_genesis_scheduled_version_and_its_gated_rules_activate_together_on_every_no
         let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(h).unwrap()).collect();
         assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {h}: {roots:?}");
         assert!(vals[2].chain.lock().has_tx(&early));
-        println!("✓ v2 from genesis at #{AT}: the gated rule flipped there on every node, and a rebuild from the logs agreed");
+        println!("✓ preview from genesis at #{AT}: the gated rule flipped there on every node, and a rebuild from the logs agreed");
     });
     std::fs::remove_dir_all(root).ok();
 }
@@ -1221,6 +1232,62 @@ fn junk_leaders_and_offline_validators_are_jailed_and_come_back() {
     std::fs::remove_dir_all(root).ok();
 }
 
+/// A validator jailed for downtime whose node stays online, with production's peer tracking: it
+/// keeps following the chain after the sets it was in age out (jailed validators stay secondary
+/// peers, `staking::jailed_followers`), and an `Unjail` sent through its own node gets out and
+/// brings it back. Before, its node lost its last peer two epochs after it left the set, froze until
+/// restarted, and kept its `Unjail` in its own mempool.
+#[test]
+fn a_jailed_validator_that_stays_online_keeps_following_and_unjails_through_its_own_node() {
+    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_env("BLOCKULA_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"))).with_test_writer().try_init();
+    let (root, homes, genesis, seeds) = summon_with("jail-follow", EPOCH_BLOCKS, &[("downtime_window", 8), ("downtime_max_missed", 3), ("jail_blocks", 15)]);
+    let executor = deterministic::Runner::timed(Duration::from_secs(6_000));
+    executor.start(|context| async move {
+        let mut oracle = network_tracking(&context, &genesis, &[], consensus::TRACKED_PEER_SETS).await;
+        let mut vals = vec![];
+        for (i, (home, seed)) in homes.iter().zip(&seeds).enumerate() {
+            vals.push(start(&context, &mut oracle, &genesis, i, 0, home.clone(), PrivateKey::from_seed_bytes(*seed)).await);
+        }
+        wait_for_height(&context, &vals, 3).await;
+        let k = Keys::from_seed(seeds[3]);
+        let who = k.address();
+        let others = |vals: &[Val]| vals[..3].iter().map(|v| v.chain.lock().height()).min().unwrap();
+        let jailed = |vals: &[Val]| vals[..3].iter().all(|v| v.chain.lock().state.staking.pools[&who].jail.is_some());
+        let in_set = |vals: &[Val]| vals[..3].iter().all(|v| v.chain.lock().state.validators[&who].status == ValidatorStatus::Active);
+
+        // It proposes junk until it's jailed and out of the set; its node never stops.
+        vals[3].chain.lock().junk_proposals = true;
+        wait_until(&context, "its jailing", || jailed(&vals)).await;
+        wait_until(&context, "its exit", || !in_set(&vals)).await;
+        vals[3].chain.lock().junk_proposals = false;
+
+        // Well past the sets it was in: it still follows.
+        let target = others(&vals) + (consensus::TRACKED_PEER_SETS as u64 + 2) * EPOCH_BLOCKS;
+        wait_until(&context, "the others to move on", || others(&vals) >= target).await;
+        wait_until(&context, "the jailed node to keep up", || vals[3].chain.lock().height() >= target).await;
+
+        // Its own node takes the `Unjail`, and it reaches a block.
+        let until = vals[0].chain.lock().state.staking.pools[&who].jail.as_ref().unwrap().until;
+        wait_until(&context, "the jail to run out", || others(&vals) >= until).await;
+        {
+            let mut c = vals[3].chain.lock();
+            let nonce = c.next_nonce(&who);
+            let mut tx = signed(&genesis, &k, nonce, Action::Unjail { validator: who.clone() });
+            tx.fee *= 4; // the base fee rose while its junk filled blocks
+            c.submit(tx.sign(&k)).unwrap();
+        }
+        wait_until(&context, "the unjail through its own node", || vals[..3].iter().all(|v| v.chain.lock().state.staking.pools[&who].jail.is_none())).await;
+        wait_until(&context, "its return to the set", || in_set(&vals)).await;
+        let target = others(&vals) + 2 * EPOCH_BLOCKS;
+        wait_for_height(&context, &vals, target).await;
+        let h = vals.iter().map(|v| v.chain.lock().height()).min().unwrap();
+        let roots: Vec<String> = vals.iter().map(|v| v.chain.lock().root_at(h).unwrap().to_string()).collect();
+        assert!(roots.windows(2).all(|w| w[0] == w[1]), "state roots diverged at {h}: {roots:?}");
+        println!("✓ a jailed validator kept following with {} tracked peer sets, unjailed through its own node and rejoined; 4 nodes agree at height {h}", consensus::TRACKED_PEER_SETS);
+    });
+    std::fs::remove_dir_all(root).ok();
+}
+
 /// 👻 Ghost Mode through real consensus: a shield, an unsigned private transfer and an unshield,
 /// each submitted to one validator, gossiped (the unsigned ones carry no sender at all), proposed
 /// by whoever leads, proof-checked by every verifier before it votes and executed by every node
@@ -1275,3 +1342,6 @@ fn ghost_txs_finalize_through_consensus() {
 }
 
 mod byzantine;
+mod programs;
+
+

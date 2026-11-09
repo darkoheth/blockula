@@ -6,17 +6,18 @@
   "scripts": {
     "dev": "next dev --port 3000",
     "build": "next build",
+    "build:served": "BLOCKULA_SERVED=1 next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "test:e2e": "playwright test",
     "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test 'lib/*.test.mjs'"
   },
   "dependencies": {
-    "@blockula/sdk": "^0.5.0",
+    "@blockula/sdk": "^1.0.0",
     "@noble/hashes": "2.4.0",
-    "next": "^16.4.0",
-    "react": "^19.3.0",
-    "react-dom": "^19.3.0"
+    "next": "^16.4.3",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
   },
   "devDependencies": {
     "@noble/post-quantum": "0.7.1",

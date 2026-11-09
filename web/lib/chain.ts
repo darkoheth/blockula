@@ -95,9 +95,16 @@ function saveClock(chainId: string, genesisHash: string, c: GenesisClock) {
   }
 }
 
+/**
+ * Networks pinned on first use and remembered per node URL: a custom node, and the node that
+ * served this wallet (config.ts `SERVED`: the code came from it, so its first answer is trusted
+ * as far as the code is).
+ */
+export const remembersPin = (net: Network) => net.key === "custom" || net.key === "served";
+
 /** The pin to start from for a network: its configured chain, or a custom node's remembered one. */
 export function initialPin(net: Network): ChainPin {
-  if (net.key === "custom") return (typeof window !== "undefined" && savedCustomPin(net.rpc)) || {};
+  if (remembersPin(net)) return (typeof window !== "undefined" && savedCustomPin(net.rpc)) || {};
   return { chainId: net.chainId, genesisHash: net.genesisHash, prefix: net.prefix };
 }
 
@@ -114,6 +121,15 @@ export class PinnedClient extends Client {
     // `Wallet.address` renders with the client's prefix: use the pinned one before the first
     // status arrives (which still checks it, through `status()` below).
     if (pin.prefix) this.prefix = pin.prefix;
+  }
+
+  /**
+   * The chain it's pinned to, for the SDK's rule that wallets sign on blockula-1 only through a
+   * client pinned to it (DEV-1). It pins the chain itself (`status()`: the configured chain, or the
+   * one a custom node reported first), and the network is the user's choice in the header.
+   */
+  protected override chainPin(): string | undefined {
+    return this.pin.chainId;
   }
 
   private clock?: Promise<GenesisClock | undefined>;
@@ -175,7 +191,7 @@ export function networkClient() {
     NETWORK.rpc.replace(/\/$/, ""),
     initialPin(NETWORK),
     (pin) => {
-      if (NETWORK.key === "custom") saveCustomPin(NETWORK.rpc, pin);
+      if (remembersPin(NETWORK)) saveCustomPin(NETWORK.rpc, pin);
     },
     NETWORK.witnesses ?? [],
     NETWORK.genesisClock,

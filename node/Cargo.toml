@@ -1,6 +1,6 @@
 [package]
 name = "blockula"
-version = "0.5.2"
+version = "1.0.2"
 edition = "2024"
 
 [dependencies]
@@ -54,12 +54,16 @@ borsh = { version = "=1.8.1", features = ["derive", "de_strict_order"] }
 # and indexes (its file format is ours to keep, so pinned exactly), and the per-block read view
 # the API serves from without the consensus lock (src/view.rs).
 redb = "=4.4.0"
-arc-swap = "=1.9.2"
+arc-swap = "=1.9.3"
 # Genesis specs and operator files (src/genesis_builder.rs).
 toml = "1.1"
 # Ghost Mode's cryptographic core (keys, notes, the commitment tree, the Action STARK on Plonky3,
 # note encryption): its own workspace, pinned there. Disabled at genesis (src/ghost.rs).
 blockula-ghost = { path = "ghost", version = "=0.1.0" }
+# Programs (protocol v2): the VM, upload validation, the host ABI, metering and the storage
+# overlay, on soroban-wasmi: its own workspace, pinned there. Dormant until governance switches
+# the `programs` feature on (src/programs).
+blockula-vm = { path = "vm", version = "=0.1.0" }
 
 # ML-DSA and consensus are slow unoptimized; keep our crate debuggable but optimize deps.
 [profile.dev.package."*"]
@@ -120,18 +124,47 @@ overflow-checks = true
 [profile.release.package.p3-util]
 overflow-checks = true
 
+# Programs run untrusted code: an arithmetic overflow in the VM or the engine must panic (which
+# the VM catches and reports as a node fault, never a transaction outcome) instead of wrapping.
+# Only this workspace's profiles apply to them (node/vm/README.md, "Overflow checks"), so they're
+# listed here; `programs::tests::release_profile_covers_the_vm` fails if one in Cargo.lock is
+# missing. `panic` stays "unwind": the VM's catch_unwind relies on it.
+[profile.release.package.blockula-vm]
+overflow-checks = true
+[profile.release.package.soroban-wasmi]
+overflow-checks = true
+[profile.release.package.wasmi_arena]
+overflow-checks = true
+[profile.release.package.wasmi_core]
+overflow-checks = true
+[profile.release.package.wasmparser]
+overflow-checks = true
+[profile.release.package.wasmparser-nostd]
+overflow-checks = true
+
+[build-dependencies]
+# build.rs gzips the embedded wallet's text files (src/wallet.rs): the same crate and features as
+# the dependency above, so nothing new is built.
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+
 [dev-dependencies]
 proptest = "1.12"
 tower = { version = "0.5", features = ["util"] }
 # SHA-256 of known-answer outputs (src/kat.rs).
 sha2 = "0.11"
 
+[features]
+# A binary that trusts the runbook test's release key instead of the real one, for
+# scripts/test-release-runbook.sh only (src/release_cli.rs `BUILTIN_KEY_ID`). Releases, the image
+# and reproductions never enable it (scripts/check-pins.sh).
+test-release-key = []
+
 # The vendored stream crate is a member only so its tests run against this lockfile:
 # `cargo test --manifest-path node/Cargo.toml -p commonware-stream`. Plain `cargo test` and
 # `cargo build` still act on `blockula` alone.
 [workspace]
 members = ["vendor/commonware-stream"]
-exclude = ["fuzz", "ghost"]
+exclude = ["fuzz", "ghost", "vm"]
 
 # p2p key exchange: hybrid X25519 + ML-KEM-768 instead of X25519 alone (docs/PQ-TRANSPORT.md).
 [patch.crates-io]

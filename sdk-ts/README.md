@@ -1,6 +1,8 @@
 # @blockula/sdk
 
-🧛 TypeScript SDK for **Blockula**, a post-quantum blockchain. It covers ML-DSA-65 (FIPS 204) wallets, `.boo` names, transfers, multi-key accounts, agent session keys, and passkey-unlocked wallets.
+🧛 TypeScript SDK for **Blockula**, a blockchain with post-quantum signatures (ML-DSA-65, FIPS 204). It covers wallets, `.boo` names, transfers, multi-key accounts, agent session keys, and passkey-unlocked wallets.
+
+> Blockula is experimental software, provided as is under the MIT license. Each chain's FANG has no value: its faucet hands it out, and it pays fees. Apps, services and bots: [docs/INTEGRATION.md](https://github.com/jackdishman/blockula/blob/main/docs/INTEGRATION.md).
 
 ```bash
 npm install @blockula/sdk
@@ -9,8 +11,8 @@ npm install @blockula/sdk
 ```ts
 import { Client, Wallet, encodeKeyGrant } from "@blockula/sdk";
 
-const wallet = Wallet.generate(new Client("http://localhost:7070"));
-await wallet.faucet();                        // test chains: 100 FANG
+const wallet = Wallet.generate(Client.local());   // `blockula dev` on this machine
+await wallet.faucet();                        // dev chains: 100 FANG
 await wallet.registerName("vlad");            // vlad.boo
 await wallet.send("alice.boo", "1.5", { memo: "trick or treat" });
 
@@ -19,6 +21,101 @@ await wallet.send("alice.boo", "1.5", { memo: "trick or treat" });
 const agentGrantCode = encodeKeyGrant(await agent.keyGrant(wallet.account));
 await wallet.addSessionKey(agentGrantCode, "claude", { limit: "10", periodBlocks: 86_400, expiresInBlocks: 30 * 86_400 });
 ```
+
+For a chain you launched (`blockula summon`), pass its node: `new Client("https://<your node>", { chainId, genesisHash })`.
+
+## Which network?
+
+```ts
+Client.local();                                     // blockula dev on this machine
+new Client("http://localhost:7171", { network: "testnet" });  // a blockula-testnet-2 node you run, held to its pins
+new Client("http://<your node>:7070", { chainId: "mychain", genesisHash: "…" });  // a chain of your own
+```
+
+The public testnet (`blockula-testnet-2`) was retired in November 2026 and has no public node, so the `testnet` preset has no RPC: `Client.testnet()` and `new Client({ network: "testnet" })` throw unless you pass a node's URL (`Client.testnet({ rpc })`). `NETWORKS` lists what each preset pins: the chain id, the genesis hash, the address prefix and the genesis clock. A client made for a network checks them on every status it reads, including the one each signature is made against, and refuses a node on another chain (`ChainMismatchError`). The prefix is known up front, so `wallet.address` is `tboo1…` on the testnet before the first request. Pins you pass as well must agree with the network's.
+
+A wallet signs nothing for a node that says it's on `blockula-1` unless its client pins that chain (`chainId: "blockula-1"`): it throws `MainnetNotAllowedError` instead.
+
+## Balances
+
+```ts
+const b = await wallet.balances();   // { balance, transferable, locked, exists, display }
+b.transferable;                      // bigint drops: what it can pay now
+await wallet.balance();              // "12.5 FANG": everything it holds
+```
+
+- `transferable` is the "can pay" number: what the account can send now, fees included. Vesting and vote locks hold the rest (`locked`). Staked FANG isn't in the balance (`client.staking(account)`).
+- `balance()` and `balances()` throw when the node can't answer (down, rate limited, a timeout, another chain). They return 0 only for an account that doesn't exist yet. Never show a failed read as an empty account.
+
+## Costs
+
+```ts
+const q = await wallet.quote("alice.boo", "0.02");
+q.total;          // amount + fee + creationFee, in drops
+q.creationFee;    // 0.1 FANG if this payment opens alice's account, else 0
+q.enough;         // whether the account can pay it
+```
+
+- **Fees.** Every tx pays its block's base fee (priced per byte and burned) plus its tip. A transfer is about 5.5 KB, about 0.000065 FANG at the floor. `/api/fees` fixes the base fee 17 blocks ahead, and it rises while blocks are full.
+- **Opening an account.** A payment to an address the chain hasn't seen burns `creation_fee` (0.1 FANG with the default parameters) from the payer, on top of the amount. That payment must carry at least 0.01 FANG. `quote()` counts both. The result of a finalized `send` that opened an account says so (`opened_account`, `creation_fee`), since its `summary` and `fee` don't: show it next to the summary.
+- **Zero.** `send` refuses an amount of 0 before signing: it would move nothing and pay a fee.
+- **Names.** Registering a name costs what `client.name(n).price` says. With the default parameters: 100 FANG for 3 characters, 25 for 4, 5 for 5 or more. A year's renewal (`renewal_price`) is a fifth of that.
+- **Headroom.** `send(to, amount, { feeHeadroom: 3 })` lets the fee rise to 3× today's base fee before the tx is included, and `{ maxFee }` sets it outright. Only the including block's base fee and the tip are charged, so headroom costs nothing. Without it, a tx stuck behind full blocks for more than 17 blocks can stop covering the base fee and be dropped (with every later tx from the account). `wallet.feeHeadroom = 2` sets a default.
+
+## Receiving payments
+
+```ts
+import { watchPayments } from "@blockula/sdk";
+
+await watchPayments(client, shopAddress, {
+  fromHeight: await db.get("next"),           // resume where you stopped
+  onPayment: async (p) => {                   // in chain order
+    await db.creditOrderOnce(p.id, p.memo, p.amount);
+  },
+  onProgress: async (next) => db.set("next", next),
+  signal,                                     // abort to stop
+});
+```
+
+- **Finalized is final.** Blocks run only once they're finalized, so there are no reorgs and no confirmations to wait for. `watchPayments` reads only finalized blocks.
+- **Match a unique memo.** Give each order its own memo (an order id you made up) and match it. Memos are public, and anyone can write anything in one: never act on what a memo says.
+- **Credit by `id`.** If your `onPayment` throws, the watch stops; resuming from the last stored height delivers that block again. Credit each payment once, by its tx id.
+- **Watch an address,** not a name: names expire and change hands. `p.to_name` says which name the payer used.
+- **Only transfers.** Other ways FANG arrives (a hunt's award, staking) aren't payments here. `client.history(account, { before, limit })` pages through everything an account did, newest first.
+- **Pruned history.** Nodes keep a limited window of blocks (`/api/status` `history_from`). If you resume from before it, `watchPayments` throws `HistoryPrunedError` rather than skip payments: ask a node that keeps every block, or pass `skipPruned`.
+- `paymentsIn(block, account)` reads one `/api/block/{height}` answer, for your own scanner. `client.blocks({ limit, before })` pages block headers backwards; fetch only blocks with `tx_count > 0`.
+
+## Sending a lot
+
+- **One wallet, many sends.** A wallet signs and submits its txs one at a time, in nonce order, so `Promise.all` of many `send`s works: each gets the next nonce. Waiting for them happens in parallel.
+- **`sendMany`** pays a list, with at most `concurrency` (default 16) waiting to finalize at once. A node allows 64 pending txs per sender. On a 429 (rate limited) or "too many pending", it resubmits the same signed bytes once the node says to retry. Each payment gets a result, `{ ok, tx }` or `{ ok: false, error }`.
+- **Rate limits.** A public node takes about 120 txs a minute and 50 reads a second per IP, and answers `429` with `Retry-After` (`ApiError.retryAfterMs`). Your own node doesn't limit you (loopback isn't limited), but the validator it forwards to does.
+- **Never re-sign a payment you're unsure of.** A tx that comes back pending, dropped or timed out may still run until its `valid_until`. Resubmitting the same bytes (`client.post(tx)`) is safe: it runs at most once. A new signature is a new payment. See [Timeouts and pending transactions](#timeouts-and-pending-transactions).
+- **Store first, then send.** `send(to, amount, { onSigned: (tx, id) => outbox.save(id, tx) })` (and `sendMany(payments, { onSigned })`) hands you each signed tx and its id before it's submitted, in the wallet's queue, so parallel sends still get one nonce each. If `onSigned` throws, nothing is submitted. `wallet.build()` followed by your own `client.post(tx)` takes no nonce from the queue: two builds in a row get the same nonce, so build and post one tx at a time per key that way.
+- **The wire form** (`new Client(rpc, { wireTxs: true })`) posts txs as their binary wire form, about half the bytes of JSON.
+
+## Your own RPC node
+
+Any node serves the same API, and one on your machine isn't rate limited. To run one of a chain you know a node of:
+
+```bash
+blockula join --genesis https://<a node of the chain> --home ~/blockula-node --port 7171
+```
+
+```ts
+const pins = { chainId: "mychain", genesisHash: "…" };              // a node on another chain is refused
+const client = new Client("http://localhost:7171", {
+  ...pins,
+  witnesses: [new Client("https://<another node>", pins)],          // names proven against a second node
+});
+```
+
+- It fast-syncs from a certified snapshot in seconds, so it holds history only from there (`history_from`). Pass `--full` to replay from genesis.
+- Txs you send through it are forwarded to a validator. That needs a node release that relays through another full node; an older node answers "forwarding loop" when it can only reach the public node.
+- A second, independent node as a witness means no single node's word decides who a name pays (see "Which chain? Pinning and proofs" below).
+- [docs/INTEGRATION.md](https://github.com/jackdishman/blockula/blob/main/docs/INTEGRATION.md) covers pruning, checkpoints and the weak-subjectivity window.
+
+## Accounts, keys and fees
 
 Adding a key needs the key's consent (audit gap-7-2): `AddKey` carries the key's public key and its signature over the chain, the account and its key id, so nobody can put your key on their account (and pad `client.keyAccounts(keyId)`, which pages with `{ after }`). The key's holder makes it with `keyGrant(account)`; `encodeKeyGrant`/`decodeKeyGrant` turn it into a pasteable `bkgrant1.…` code, `verifyKeyGrant` checks one, and `addOwnerKey`/`addSessionKey` take either and refuse a grant made for another account or chain.
 
@@ -43,7 +140,7 @@ await juror.revealVotes(s.id, sealed.votes, sealed.spam, sealed.salt);  // after
 await wallet.withdrawVested();
 ```
 
-Amounts are FANG strings (`"1.5"`) or bigint drops (1 FANG = 10⁹ drops). Every transaction result includes a plain-English `summary`.
+Amounts are FANG strings (`"1.5"`) or bigint drops (1 FANG = 10⁹ drops). A JS number still works but is deprecated: floats can't hold most decimal amounts exactly. Every transaction result includes a plain-English `summary`.
 
 Fees, tips and expiry (protocol v1):
 
@@ -59,11 +156,11 @@ wallet.validForBlocks = 600;
 - `txBytes(tx)` is the binary wire form nodes gossip and put in blocks, and `txId(tx)` its id, known before you submit.
 - Every transaction names the chain it's for by `chain_id` and `genesis_hash` (the chain instance, from `/api/status`), so it can't replay on a relaunched chain that reuses the id. `wallet.build` fills both in; to sign offline, put the chain's `genesis_hash` in the `UnsignedTx` you pass to `wallet.sign`.
 
-Addresses are bech32m with the chain's prefix: `boo1…` on mainnet, `tboo1…` on public testnets. `isAddress(s)` accepts any known prefix and `isAddress(s, "tboo")` exactly one; `addressFromPublicKey(pk, prefix)` renders one. A `Client` learns its chain's prefix from `/api/status` (`await client.addressPrefix()`), and wallets using that client sign with it (`wallet.address`, `wallet.account`). Pin it with `new Client(rpc, { prefix: "boo" })` to refuse a node on another network (see "Which chain?" below). Nodes reject addresses of another network's prefix.
+Addresses are bech32m with the chain's prefix: `boo1…` by default, `tboo1…` on public testnets. `isAddress(s)` accepts any known prefix and `isAddress(s, "tboo")` exactly one; `addressFromPublicKey(pk, prefix)` renders one. A `Client` learns its chain's prefix from `/api/status` (`await client.addressPrefix()`), and wallets using that client sign with it (`wallet.address`, `wallet.account`). Pin it with `new Client(rpc, { prefix: "boo" })` to refuse a node on another network (see "Which chain?" below). Nodes reject addresses of another network's prefix.
 
-- Names in a signature (audit gap-7-1). Where the chain resolves a name itself (`send`, `awardHunt`, `vouch`/`unvouch`, `grantSoul`, `flagSybil`, `clawback`, `transferName`, proposal targets), a client with `witnesses` (below) signs the name's proven owner, and one without signs the **name itself** (`alice.boo`): the chain pays whoever owns it when the tx runs, so a lying node can't point it at another account now. It could still hold the signed tx and release it later in its validity window, which counts from the height that node reported, by when the name may have lapsed and been registered again: pay a name that's about to expire by address. `Wallet.build` refuses a height more than `maxHeadLeadBlocks` (30) ahead of the lowest head the witnesses report (every witness must answer, so one honest witness is enough), or past what a `genesisClock: { createdAtMs, blockTimeMs }` pin allows by this machine's clock (`HeightAheadError`, nothing signed); without either the height is the node's word. `client.recipient(name)` says which (`signed`, `byChain`, and `how` to show before signing); the address it reports for an unproven name is the node's word, for display. Where an address is needed (`delegate`, `undelegate`, `redelegate`, `unjail`, `actAs`, `keyGrant`), a name is resolved (`client.resolution`: `proven` and `how`), and on mainnet nothing is signed with one only a single node vouched for: it throws `UnprovenNameError` (checked against the very status each tx is signed for). Pass the address once its owner has confirmed it, or give the client witnesses.
-- `wallet.address` uses the chain's prefix once the client knows it. Before the first request it shows the `boo` form, so `await client.addressPrefix()` first if you display it on a testnet.
-- Node errors throw `ApiError` (`.status`: 429 means rate limited). A transaction the node reports as failed throws `TxFailedError` from `waitForTx` (`dropped` says whether it ran: see "Timeouts and pending transactions").
+- Names in a signature (audit gap-7-1). Where the chain resolves a name itself (`send`, `awardHunt`, `vouch`/`unvouch`, `grantSoul`, `flagSybil`, `clawback`, `transferName`, proposal targets), a client with `witnesses` (below) signs the name's proven owner, and one without signs the **name itself** (`alice.boo`): the chain pays whoever owns it when the tx runs, so a lying node can't point it at another account now. It could still hold the signed tx and release it later in its validity window, which counts from the height that node reported, by when the name may have lapsed and been registered again: pay a name that's about to expire by address. `Wallet.build` refuses a height more than `maxHeadLeadBlocks` (30) ahead of the lowest head the witnesses report (every witness must answer, so one honest witness is enough), or past what a `genesisClock: { createdAtMs, blockTimeMs }` pin allows by this machine's clock (`HeightAheadError`, nothing signed); without either the height is the node's word. `client.recipient(name)` says which (`signed`, `byChain`, and `how` to show before signing); the address it reports for an unproven name is the node's word, for display. Where an address is needed (`delegate`, `undelegate`, `redelegate`, `unjail`, `actAs`, `keyGrant`), a name is resolved (`client.resolution`: `proven` and `how`), and on `blockula-1` nothing is signed with one only a single node vouched for: it throws `UnprovenNameError` (checked against the very status each tx is signed for). Pass the address once its owner has confirmed it, or give the client witnesses.
+- `wallet.address` uses the chain's prefix once the client knows it. A client made for a network (`Client.testnet({ rpc })`) or pinned with `prefix` knows it up front. Otherwise it shows the `boo` form until the first request, so `await client.addressPrefix()` first if you display it.
+- Node errors throw `ApiError` (`.status`: 429 means rate limited, and `.retryAfterMs` says how long the node asked you to wait). A transaction the node reports as failed throws `TxFailedError` from `waitForTx` (`dropped` says whether it ran: see "Timeouts and pending transactions").
 - Pass `rpId` to `createPasskeyWallet`/`unlockPasskeyWallet` to pin wallets to your production domain. Passkeys are bound to that hostname for good.
 
 ### Staking, governance and names (protocol v1)
@@ -90,13 +187,36 @@ await wallet.multisigCreate([phoneKeyId, laptopKeyId, kitKeyId], 2);
 - `convictionWeight(amount, conviction)` is a vote's weight: 0.1× with no lock, then 1×–6× for 1, 2, 4, 8, 16 or 32 lock periods (`CONVICTION_PERIODS`).
 - Reads: `client.staking(account)`, `client.proposals()`, `client.proposal(id)`, `client.params()`, `client.fees()`, `client.upgrade()`, `client.distribution(id)`, `client.multisig(account)`. `stakeSummary`, `proposalSummary` and `paramsOf` turn them into stable shapes, tolerating renamed or missing fields.
 
+### Programs (protocol v2)
+
+Programs are third-party WebAssembly, on a chain that has switched the `programs` feature on (`blockula dev --programs` does). Everything a program or its deployer chooses (method, argument and event names, an abort message, what a method returns) is a stranger's claim: the SDK keeps those as the node serves them, under `untrusted_*`. A failure's words (`ProgramFailedError.message`) hold only numbers and the chain's own names, never what the program wrote: an abort message is on the error as `untrusted_message`. Any other text of a node or a program that an error quotes is stripped of control, format (bidi, zero-width), private-use and separator characters. Every node answer is checked before it's used: digests are 64 lowercase hex, heights whole numbers the clock allows, amounts decimal strings, and a program's `version_digest` is the one its own code, interface and version compute (`ProgramAnswerError` otherwise).
+
+```ts
+import { Client, Wallet, reconcileSigner } from "@blockula/sdk";
+import { readFileSync } from "node:fs";
+
+const wasm = readFileSync("counter.wasm"), iface = readFileSync("counter.iface"); // format-1 interface bytes: `blockula program interface encode`
+const up = await wallet.uploadCode(wasm, iface);                         // bonds a deposit (v0 never gives it back); resolves once the block after it is sealed
+const { address, receipt } = await wallet.createProgram({ wasmHash: up.wasmHash, interfaceHash: up.interfaceHash }); // the address, only once the create has applied
+await wallet.call(address, "increment", "", { storageLimit: "1" });      // a call's storage limit is 0 unless given: a method that writes needs one
+(await client.view(address, "get")).return_data;                         // a read, as the node's newest block has it: the program's claim, as hex
+const proven = await client.provenProgram(address, { witnesses });       // its record, Merkle-proven; the digest recomputed from it
+```
+
+- **Fees include fuel.** A program tx reserves fuel (`fuelLimit`, default `min(program_max_tx_fuel, program_max_block_fuel − load)`, plus the load of the code it declares) and pays for all of it, never refunded; its `fee` is the bytes' base fee plus `suggested_rate × reserved / 1000`, and `feeHeadroom`, `maxFee` and the tip cap count it. A reservation no block could carry (`program_max_block_fuel`) is refused before signing (`FuelReservationError`).
+- **Sign what was shown.** A call binds the program's `versionDigest`. Pass the one you showed the user (`call(..., { versionDigest })`) and the call is refused if the program isn't the one it names; without it the SDK recomputes it from the record (proven against the client's `witnesses` when it has some), never signing a digest because a node reported it. A binding without a digest gets the version in force, never "any version" (`ANY_PROGRAM_VERSION` is explicit).
+- **Waiting.** Upload and create are one step per block: each resolves after its block is final and the next one sealed, and a create or call first waits for the code or program to be usable (`waitMs`), instead of being refused by the mempool.
+- **Receipts.** Each result has `receipt`: facts the chain applied (`facts`: outcome, balance changes, fuel, fees, `outside_vm` deposits and the creation fee, `burned_by_programs`: the creation fees of accounts a program's own sends opened) apart from claims (`claims`: return data, events). A signer's balance moves by exactly −(fee + `outside_vm.total`) + its entry in `facts.balance_changes`: `reconcileSigner(receipt, signer, before, after)` checks it (and that the receipt conserves FANG: Σ balance changes + (bonded − record deposit − upload deposit − refunded) + `burned_by_programs` = 0, which `checkReceipt` holds every receipt to), and `cost` says what it debited. A failed call throws `ProgramFailedError` (its fee was charged; `.receipt`, `.words`; a `storage_limit` trap says to pass a limit).
+- Reads: `client.program(address)`, `client.code(hash, { wasm })`, `client.interface(hash)`, `client.view(address, method, input, { bindings, fuel })`, `client.provenProgram(address, { witnesses })`, `client.programFuel()`, `client.programParams()`. Programs are named by address, never by a `.boo` name. `wallet.programsPause()` is for a validator's own key.
+- There's no interface JSON codec in the SDK yet: `uploadCode` takes the format-1 bytes (`blockula program interface encode` prints them).
+
 ### Which chain? Pinning and proofs
 
 ```ts
-const client = new Client("https://rpc.example", { chainId: "blockula-1", genesisHash: "…", prefix: "boo" });
+const client = new Client("https://rpc.example", { chainId: "mychain", genesisHash: "…", prefix: "boo" });
 ```
 
-A pinned client checks every `/api/status` it reads, including the one each signature is made against, and throws `ChainMismatchError` instead of signing for another chain.
+A pinned client checks every `/api/status` it reads, including the one each signature is made against, and throws `ChainMismatchError` instead of signing for another chain. `network` (see "Which network?") sets these pins for you. Wallets sign for a node on `blockula-1` only through a client with that pin.
 
 A node can still lie about the state of the right chain. Give a client witnesses and the names it resolves for signatures are proven (without them, see "Names in a signature" above) (`new Client(rpc, { …pins, witnesses: [new Client(rpc2, pins), …], requireProvenNames: true })`; `requireProvenNames` refuses any name it can't prove). `Wallet.propose`'s default deposit must be the same on the node and every witness, and at most `maxDeposit` (default `DEFAULT_MAX_PROPOSAL_DEPOSIT`, 1,000 FANG): a node can report any deposit, and all of it burns if the vote misses quorum (audit gap-7-5). Session-key and hunt expiries count from the same status read as `valid_until`, so a node lying about the height can stretch them by at most `max_tx_validity_blocks` (audit gap-7-3).
 
@@ -129,8 +249,15 @@ Every request has a timeout (`new Client(rpc, { timeoutMs })`, default 15 s, at 
 
 `verifyReleaseSignature(sig, checksumsFile, trustedKeyId)` checks a release's offline ML-DSA-65 signature (docs/OPERATIONS.md "Releases").
 
-The public testnet is `https://blockula-testnet.fly.dev`, and the wallet is https://testnet.blockula.app.
+Tests: `npm run test:vectors` (offline: passkey derivation, state-proof and tx-encoding vectors from the node, every protocol v1 helper against a fake node, pinning, proof freshness, timeouts, release signatures, and `test/integrators.ts`: network presets, the `blockula-1` pin, balances, the nonce queue, `sendMany`, `quote`, history, `watchPayments` and `onSigned`; `test/programs.ts` (programs: every answer check, the fuel and deposit arithmetic, receipts and balance reconciliation, `provenProgram`'s refusals one by one, and the Wallet's helpers against a fake node serving answers recorded from a dev chain), and `test/examples.ts`, which runs `examples/pay-from-a-script.mjs` against a fake node, so build first), `npm run test:kat` (ML-DSA known answers), `npm test` (end to end against `blockula dev`: `test/e2e.ts` and `test/e2e-integrators.ts`, on a chain with programs or without), `npm run test:programs` (`test/e2e-programs.ts`, which needs `blockula dev --programs`: on a chain without programs it says so and passes, and `BLOCKULA_E2E_PROGRAMS=1` makes that a failure, as CI sets it). The `examples/` directory at the repository's root has two runnable scripts: receiving payments, and paying from a script.
 
-Tests: `npm run test:vectors` (offline: passkey derivation, state-proof and tx-encoding vectors from the node, every protocol v1 helper against a fake node, pinning, proof freshness, timeouts, release signatures), `npm run test:kat` (ML-DSA known answers), `npm test` (end to end against `blockula dev`).
+## Changes in 0.6
 
-⚠️ Early and unaudited: test chains only.
+Two changes need a look when you upgrade:
+
+- **`balance()` throws** when the node can't answer, instead of returning `"0 FANG"`. It's `"0 FANG"` only for an account that doesn't exist yet. `balances()` is new.
+- **`blockula-1` needs a pin.** A wallet whose client isn't pinned to `blockula-1` (`chainId: "blockula-1"`) throws `MainnetNotAllowedError` instead of signing for a node on it.
+
+Also new: network presets (`NETWORKS`, `Client.testnet()`), a nonce queue in each wallet, `sendMany`, `quote`, `feeHeadroom` and `maxFee`, zero amounts refused, `opened_account` and `creation_fee` on receipts, `client.blocks({ limit, before })`, `client.history`, `watchPayments`, `client.post`, `wireTxs`, `onSigned`, and `ApiError.retryAfterMs`.
+
+Blockula is experimental software, provided as is under the MIT license, without warranty of any kind.

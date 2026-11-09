@@ -6,6 +6,7 @@ import { Bars, Cadence, Ribbon } from "@/components/explorer/charts";
 import { Fang, Section, Stat, Term, useMe, useNow, Who, whoText, plural } from "@/components/explorer/kit";
 import { Ledger } from "@/components/explorer/Ledger";
 import { WatchingList } from "@/components/explorer/Watch";
+import { NETWORK } from "@/lib/config";
 import { type NodeError, useNode } from "@/lib/explorer/node";
 import { usePulse, useRecentTxs } from "@/lib/explorer/pulse";
 import { to } from "@/lib/explorer/routes";
@@ -59,7 +60,11 @@ export default function ExplorePage() {
         <section className="card">
           <span className="eyebrow">The node is silent</span>
           <h1>Can&apos;t reach the node</h1>
-          <p className="dim">{(status.error ?? error)?.message}. Pick another network at the top, or start a local node with <code>blockula dev</code>.</p>
+          <p className="dim">
+            {(status.error ?? error)?.message}.{" "}
+            {/* `blockula dev` only helps a local node; anywhere else the node or the network is down. */}
+            {NETWORK.key === "served" ? "The node that serves this wallet isn&apos;t answering. Check it&apos;s still running, then reload." : NETWORK.key === "local" ? <>Start a local node with <code>blockula dev</code>, or pick another network at the top.</> : "Try again in a minute, or pick another node at the top."}
+          </p>
         </section>
       </main>
     );
@@ -69,7 +74,7 @@ export default function ExplorePage() {
     <main className="wide stack-lg">
       <div className="page-head">
         <span className="eyebrow">The pulse</span>
-        <h1>{s ? s.chain_id : "…"}, live</h1>
+        <h1>{s ? (s.name ?? s.chain_id) : "…"}, live</h1>
         <span className="sub">
           A new block about every {(blockMs / 1000).toLocaleString("en-US")}s, final the moment it&apos;s sealed. Click any block, name or transaction to dig in, or press <span className="kbd">⌘K</span> to search.
         </span>

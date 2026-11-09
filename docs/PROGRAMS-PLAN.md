@@ -1,5 +1,13 @@
 # Programs: implementation plan
 
+> **Programs v0 was built from this plan and cut down from it; [PROGRAMS-V0.md](PROGRAMS-V0.md)
+> is what the node runs** (its section 0 lists the differences). The plan's calendar and its
+> audit gates are superseded by the launch kit's scope: programs are optional and off by default
+> (PROGRAMS-V0.md sections 0 and 9.3). The fuzz targets as built are in PROGRAMS.md section 13's
+> "As built for v0".
+
+> **Update, 2026-10-22: there's no mainnet.** Blockula 1.0 is a kit for launching your own ledger ([LAUNCH.md](LAUNCH.md)), and programs are an optional feature with no deadline: built into the node and switched off. The plan's mainnet step (Phase 5, D2, section 9.2) is dropped. LAUNCH-PLAN.md and COUNSEL_BRIEF.md, which it mentions, were removed with the mainnet plan.
+
 Status: plan, 2026-10-19, against main at `2bbecde` (after v0.5.2). It turns the design in
 [PROGRAMS.md](PROGRAMS.md) (revision 3, 2026-10-19) into milestones and pull requests. The design
 says what to build. This plan says:
@@ -26,8 +34,7 @@ as v0.5.2's (`397061c`).
      least 8 weeks of public testing.
   6. **Phase 4, the audit.** Claude runs it with Fable agents: continuously on every consensus
      PR, at three milestones, and in full once the formats freeze.
-  7. **Phase 5, mainnet.** Programs go live as soon as they're ready: on at genesis if they're
-     ready first, otherwise switched on by a council vote proposed the day the last gate closes.
+  7. **Phase 5, mainnet: dropped** (2026-10-22). There's no mainnet; programs stay optional.
 - **Size.** About 50 PRs:
   - 8 prerequisites;
   - 21 core PRs, holding about 10–11k lines of consensus-critical code;
@@ -44,8 +51,7 @@ as v0.5.2's (`397061c`).
 - **Calendar:**
   - formats frozen about May 2027;
   - audit closed about June 2027;
-  - testnet-2 activation about June 2027;
-  - ready for mainnet about mid-August 2027, once the 8 weeks have passed.
+  - testnet-2 activation about June 2027, then 8 weeks of public testing.
 
   The critical path isn't writing code. It's calibration, the testnet soak, and one maintainer
   reviewing every consensus PR. With no external audit there's no audit queue to wait for.
@@ -82,7 +88,7 @@ each correction):
 |---|---|---|
 | N1 | Build on PROGRAMS.md revision 2: wasmi, Rust programs, and the specification in sections 4–14 | **Yes** |
 | N2 | Where the work lands | **Main, behind version gates, with v2 dev-only until the release** (section 4) |
-| D2 | When programs go live on mainnet | **As soon as they're ready.** "Ready" means: the formats are frozen (M6), the audit has closed with no open critical or high finding (section 9), and testnet-2 has run them for at least 8 weeks (section 8). If that happens before mainnet's genesis, the genesis lists `programs` in `features`, so they're on from block 1. Otherwise the council's activation vote opens the day the last gate closes and takes about 9 days (section 9.2). Either way the mainnet binary carries v2 |
+| D2 | When programs go live on mainnet | **Dropped with the mainnet (2026-10-22).** It was: **as soon as they're ready.** "Ready" means: the formats are frozen (M6), the audit has closed with no open critical or high finding (section 9), and testnet-2 has run them for at least 8 weeks (section 8). If that happens before mainnet's genesis, the genesis lists `programs` in `features`, so they're on from block 1. Otherwise the council's activation vote opens the day the last gate closes and takes about 9 days (section 9.2). Either way the mainnet binary carries v2 |
 | D3 | Who audits | **Claude, with Fable agents, not an external firm. Blockula is an experiment.** Section 9 describes the audit. The docs label programs "reviewed by AI agents, not externally audited", the same honesty as Ghost Mode's "NOT AUDITED" banner |
 | N3 | Calibration hardware | **The existing stack** (below) |
 | N4 | Archive testnet-2's history | **Yes. Done**: P0 runs daily |
@@ -144,7 +150,7 @@ each correction):
      releases.
    - So testnet-2's blocks keep signaling 1, and nobody can schedule v2 there by mistake. O3's
      release flips this for testnet-2.
-   - Mainnet's genesis refuses v2 until the audit closes.
+   - A `blockula-1` genesis refuses programs (`Genesis::check`).
 3. **Formats get their own PRs.** Tx tags, state records, the receipt, the interface and the host
    ABI are consensus formats. Each lands in one PR with Rust-written vectors that TypeScript
    checks, and a fuzz target. After M6 they change only with a new protocol version.
@@ -219,14 +225,14 @@ root.
 | PR | What | Key files | Tests |
 |---|---|---|---|
 | **C1** | VM core: engine configuration, upload validation, the versioned fuel schedule, the engine wrapper with its per-block lifetime | `node/vm/` (a new crate in its own workspace, pinned exactly to S5's pick: soroban-wasmi 29.x unless phase 0 picks wasmi 2.0); `node/Cargo.toml` (`exclude`, overflow-check profiles for every engine crate, and a test that they're all listed) | The Wasm spec suite under this configuration; the `program_validate` fuzz target |
-| **C2** | Host ABI v1 and execution: the engine-neutral host table, written in full because it's the contract with `program-sdk`; frames; the meter; the overlay; `MemHost` | `node/vm/src/{abi,exec,testing}.rs` | Unit tests for each function on `MemHost`; the `host_abi` fuzz target |
+| **C2** | Host ABI v1 and execution: the engine-neutral host table, written in full because it's the contract with `program-sdk`; frames; the meter; the overlay; `MemHost` | `node/vm/src/{abi,exec,testing}.rs` | Unit tests for each function on `MemHost`; the `host_abi` fuzz target (as built: part of `program_exec`) |
 | **C3** | The interface format: codec, checks, digests, selectors | `node/vm/src/interface.rs`; `sdk-ts/src/program.ts` (the codec only); `sdk-ts/test/interface-vectors.json` | Rust-written vectors checked by TypeScript; the `interface_codec` fuzz target |
-| **C4** | Tx formats for tags 62–70 | `types.rs` (`encode`, `decode` with the nested refusals, `check_format`, `json_ints`, `kind`, `addresses`, `put_bytes`, `Tx::max_bytes`); `sdk-ts/src/{tx,describe}.ts`; `tx-vectors.json`; the tag list in `tx-vectors.ts`; the hash group in `e2e.ts`; `node/fuzz` (`program_tx_codec`, seeds, the program tags in `state_machine`) | Every tag round-trips. Every one is `Err` at admission below v2 |
+| **C4** | Tx formats for tags 62–70 | `types.rs` (`encode`, `decode` with the nested refusals, `check_format`, `json_ints`, `kind`, `addresses`, `put_bytes`, `Tx::max_bytes`); `sdk-ts/src/{tx,describe}.ts`; `tx-vectors.json`; the tag list in `tx-vectors.ts`; the hash group in `e2e.ts`; `node/fuzz` (`program_tx_codec`, seeds; as built the program ops live in `state_machine_programs`, and v1's `state_machine` is unchanged) | Every tag round-trips. Every one is `Err` at admission below v2 |
 | **C5** | State: namespaces 66–73, the `Programs` sub-state and its journal, the optional META `programs` record, `ByteKey`, schema 10, `begin_block`, `known_features(version)` | `state/{mod,codec}.rs`; `chain.rs` (`modules()` from 6 to 7, `absorb`, `rollback`); `snapshot.rs`; `upgrade.rs`; `proof_vectors.rs`; `sdk-ts/src/proof.ts` (`NAMESPACES`, decoders) | A v2 binary opens schema-9 state and snapshots. `begin_block` is idempotent on every path. Invariants hold |
 | **C6** | Fuel and fees: the fuel ring; reservations, multisig cases included; load pricing; `check_fee` and `check_tip` in u128; verify's stateless Σ; the block counters; the fuel controller and its clamp; `TipRate`; a fuel section in `/api/fees` | `programs/fuel.rs`, `econ.rs`, `consensus.rs`, `chain.rs`, `api.rs` | 10,000 consecutive full blocks with no overflow. Fees agree across the activation boundary |
 | **C7** | Upload and create: validation in a throwaway engine; `BlobRef`; the deposit curve and escrow accounting; program addresses; adoption; init; no program as a tx's `from` | `programs/{mod,lifecycle}.rs`; `chain.rs` (`admit`, the `apply_action` dispatch) | Mallory's front-run-then-remove case; an adopted balance counted once; vectors for program addresses |
 | **C8** | Calls: the host over `&State` (input, return, abort, storage with deposits and `storage_limit`, context and chain reads, hashes); commit with the conservation and who-was-debited checks; `CallProgram` with batches; the `catch_unwind` backstop and an engine rebuilt after a fault; mempool paths that skip the VM; proposers including `Failed` program txs | `programs/{host,commit,exec}.rs`; `chain.rs` (`apply_j`'s `run_programs`); `consensus.rs` | The `program_exec` and `program_commit` fuzz targets; an injected fault compared against a fresh node |
-| **C9** | Receipts: the codec and fail codes; the receipts root (namespace 70) and its sweep; `BlockMeta`; `/api/receipt/{tx}`; a program section in `/api/tx`, with facts kept apart from the program's claims | `programs/receipt.rs`, `store.rs`, `api.rs`; the SDK's receipt codec; receipt vectors | Rewording every programs error moves no receipt digest; the `receipt_codec` fuzz target |
+| **C9** | Receipts: the codec and fail codes; the receipts root (namespace 70) and its sweep; `BlockMeta`; `/api/receipt/{tx}`; a program section in `/api/tx`, with facts kept apart from the program's claims | `programs/receipt.rs`, `store.rs`, `api.rs`; the SDK's receipt codec; receipt vectors | Rewording every programs error moves no receipt digest; the `receipt_codec` fuzz target (as built: `program_receipt`, beside `program_commit` and `state_machine_programs`) |
 | **C10** | Reads and a minimal CLI: `/api/program/{address}` with `/interface` and `/storage`; `/api/code/{hash}`; `POST …/view`; program txs in `/api/simulate`; `blockula program upload\|create\|call\|view\|show`; `blockula dev` at v2 | `api.rs`, `view.rs`, `program_cli.rs`, `main.rs`, `explorer.html` | A CLI run on a v2 dev chain in `local-testnet.sh` |
 
 ### M2: programs hold FANG
@@ -301,7 +307,7 @@ Tag that commit. After it, a format changes only with a new protocol version.
 | **T5** | **`@blockula/sdk/program`:**<br>• Borsh arguments with `bigint`<br>• `versionDigest`, `programAddress`, selectors<br>• `client.program()` with `.view()` and `.simulate()`<br>• `wallet.call`, which sizes the call, builds it, re-simulates the exact bytes and refuses on any difference<br>• `provenProgram`, `provenProgramStorage`, `provenGrants`, `provenReceipt`<br>• helpers for tags 62–68 and 70<br>• e2e for every tag | C10, C13 |
 | **T6** | **The MCP:**<br>• `program_show`, `program_view`, `program_simulate`, `program_call`, `program_events`, `program_upload`, `program_create`<br>• elicitation and the confirm digest<br>• `BLOCKULA_PROGRAMS` (empty by default) and `BLOCKULA_UNCONFIRMED_MAX`<br>• the refusals and the `programText` pass<br>• the spend ledger counting `storage_limit`<br>• `use_account` with programs | T5 |
 | **T7** | **The web wallet and explorer:**<br>• deployed programs in `/programs`; `/program/{address}`; `/code/{hash}`; `Program.id` widened<br>• `specFromInterface`<br>• new `ParamType`s in `fields.ts` and `ActionForm`: `bool`, 64- and 128-bit integers as `bigint`, `hex`, `select`, `list`, `json`<br>• `ActionSpec.prepare` with re-simulation<br>• previews and receipts that keep facts apart from claims; 6-word fingerprints<br>• ledger and preflight for tags 62–70<br>• agent scopes in "Give an agent a budget"<br>• the e2e world, mock node and page list<br>• a CI check that `v1-vectors.json` is current | T5 |
-| **T8** | **Docs and developer experience:**<br>• AGENTS.md/CLAUDE.md rows and rules<br>• GOVERNANCE.md keys<br>• OPERATIONS.md: memory, `--serve-simulate`, the replay policy, the schema change<br>• COUNSEL_BRIEF.md questions; PLAN.md known limits; `llms.txt`; the READMEs<br>• BUG_BOUNTY.md: the VM in scope from testnet-2's activation<br>• AUDIT_SCOPE.md: the tags 62–70 codec in engagement A; the VM and its integration are audited by AI agents (section 9), outside its scope<br>• `seed-dev.mjs` deploys the templates and a scoped agent<br>• `local-testnet.sh` exercises programs | Per milestone |
+| **T8** | **Docs and developer experience:**<br>• AGENTS.md/CLAUDE.md rows and rules<br>• GOVERNANCE.md keys<br>• OPERATIONS.md: memory, `--serve-simulate`, the replay policy, the schema change<br>• PLAN.md known limits; `llms.txt`; the READMEs<br>• BUG_BOUNTY.md: the VM in scope from testnet-2's activation<br>• AUDIT_SCOPE.md: the tags 62–70 codec in engagement A; the VM and its integration are audited by AI agents (section 9), outside its scope<br>• `seed-dev.mjs` deploys the templates and a scoped agent<br>• `local-testnet.sh` exercises programs | Per milestone |
 
 **Exit** (design 16.1):
 - An outside developer ships a program built from a template on `blockula dev` in a day, from
@@ -317,7 +323,7 @@ Tag that commit. After it, a format changes only with a new protocol version.
 |---|---|---|
 | **O1** | **Size the testnet for programs.** Move the validators to the floor spec: they're `shared-cpu-2x` with 2 GB today, and program state alone can reach ~3 GiB of RAM at its ceiling (twice the default soft cap). Add one aarch64 validator | Operator. The testnet's cost rises |
 | **O2** | **Ship T4's reader release** at least 4 weeks before activation | Maintainer |
-| **O3** | **The programs release.** `supported_version()` returns 2 for testnet-2, while mainnet stays refused. Operators install it with `blockula release install` and signal 2 | The release session; operators |
+| **O3** | **The programs release.** `supported_version()` returns 2 for testnet-2, while `blockula-1` stays refused. Operators install it with `blockula release install` and signal 2 | The release session; operators |
 | **O4** | **`ScheduleUpgrade { version: 2, activation_height }`** once ⅔ of validators signal. The council may pass it (`governance.rs:748-757`) | Council |
 | **O5** | **At H.** `begin_block` adds META `programs` and moves the schema to 10, and v1-only nodes halt with exit code 11 | The chain |
 | **O6** | **`ActivateFeature { programs }`** | Council |
@@ -351,8 +357,8 @@ blind spots. It runs at three levels.
 **What it can't replace, and the backstops that stay:**
 - a model reading code misses some things however it's prompted. The fuzzing, the differentials
   and C19's gate are independent evidence, not opinion;
-- the bug bounty covers the VM from testnet-2's activation on ([BUG_BOUNTY.md](BUG_BOUNTY.md), a
-  draft that opens with the incentivized testnet, gains a programs row: T8);
+- the bug bounty's scope covers the VM from testnet-2's activation on ([BUG_BOUNTY.md](BUG_BOUNTY.md)
+  gains a programs row: T8);
 - Hunts for breaking programs during the 8 weeks;
 - the training wheels:
   - the 10M FANG value cap;
@@ -360,24 +366,13 @@ blind spots. It runs at three levels.
   - exit-only;
   - the freeze.
 
-  They matter more without an external audit. Retire the cap only after a year on mainnet
+  They matter more without an external audit. Retire the cap only after a year live
   without an incident (design D4).
 
-### 9.2 Mainnet (D2: as soon as they're ready)
+### 9.2 Mainnet (D2: dropped)
 
-- **The mainnet binary carries v2,** whichever path applies. The tx codec for tags 62–70 is
-  reachable in it even while programs are off, so it joins the protocol's own review scope.
-- **If programs are ready before mainnet's genesis,** the genesis lists `programs` in
-  `features`. Today `chain.rs:516` refuses Ghost Mode in `blockula-1`'s genesis. Programs get no
-  such refusal once their gates have closed, and the genesis builder checks that the audit
-  report exists and that testnet-2's 8 weeks have passed.
-- **If not,** mainnet launches at v2 with `programs` off, and the council proposes activating
-  them the day the last gate closes. That vote takes about 9 days, and the bootstrap council can
-  pass it only in mainnet's first year (after that, the ⅔ token vote).
-- **If M6's format freeze lands after mainnet's own,** mainnet launches at v1 and upgrades to
-  v2 as testnet-2 did.
-- **Counsel's questions** (design 9.7) are still asked before activation. They're legal
-  questions, not code review.
+There's no mainnet (decided 2026-10-22), so this step is gone. A `blockula-1` genesis still
+can't list `programs` (`Genesis::check`).
 
 ---
 
@@ -394,7 +389,7 @@ blind spots. It runs at three levels.
 | May to June | The full audit and its fixes |
 | January to June | Tooling. T4 ships by about mid-May |
 | June | testnet-2 activation |
-| Mid-August | Its 8 weeks pass: programs are ready for mainnet (D2) |
+| Mid-August | Its 8 weeks pass |
 
 **The critical path:** S3's calibration → C6's numbers → C19's gate → the freeze → the full
 audit → the testnet release → 8 weeks. The review queue runs alongside it: about 30 consensus
@@ -421,6 +416,5 @@ PRs and one approver.
 1. ~~Decide N1–N4, D2 and D3~~ (done, section 3).
 2. ~~P0: archive testnet-2's history~~ (done).
 3. P1: land PROGRAMS.md revision 3 and this plan in `docs/`, together with
-   `scripts/archive-chain.mjs`. Revision 3 records D2 and D3 and updates LAUNCH-PLAN.md's
-   "separate VM/host-interface audit" to match.
+   `scripts/archive-chain.mjs`. Revision 3 records D2 and D3.
 4. Start S1 (soroban-wasmi and wasmi 2.0 side by side) and P7 in parallel.

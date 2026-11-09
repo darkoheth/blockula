@@ -1,14 +1,14 @@
 // The MCP's network handling (WAL-4) and install_node's release checks, offline:
 //   npm test -w @blockula/mcp      (builds first: the last part runs the real server over stdio)
 // 1. resolveNetwork: the network comes from --network / BLOCKULA_NETWORK / BLOCKULA_RPC only;
-//    with nothing set it's the public testnet, never whatever answers on localhost.
+//    with nothing set it's a `blockula dev` node on this machine (the public testnet was retired).
 // 2. Pins: chain id, genesis hash, prefix, known genesis per chain id, trust on first use.
 // 3. fetchVerifiedRelease: version binding, checksum, provenance and signature outcomes.
 // 4. The built server against a fake node: refuses a wrong chain before signing anything,
 //    remembers the chain across restarts, and notices a node that switches mid-session.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -18,8 +18,8 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { RELEASE_SIGNATURE_FORMAT, releaseMessage } from "@blockula/sdk";
-import { KNOWN_GENESIS, KnownChains, LOCAL_RPC, TESTNET_RPC, completePin, effectivePin, mismatch, networkArg, resolveNetwork } from "../src/network.js";
+import { MAINNET_CHAIN_ID, RELEASE_SIGNATURE_FORMAT, releaseMessage } from "@blockula/sdk";
+import { BLOCKULA_1, KNOWN_CLOCKS, KNOWN_GENESIS, KnownChains, LOCAL_RPC, canonicalUrl, checkRpcUrl, completePin, defaultWitnesses, effectivePin, mismatch, networkArg, networkLabel, resolveNetwork, unpinnedBlockula1, unusableChain } from "../src/network.js";
 import { RELEASE_KEY_ID, binPaths, checkBinaryVersion, fetchVerifiedRelease, latestTagFrom, pickNodeBinary, readReleasePin, releaseKeyIdFrom, type ReleaseDeps } from "../src/release.js";
 
 const G1 = "11".repeat(32);
@@ -29,43 +29,92 @@ const G2 = "22".repeat(32);
 
 assert.deepEqual(
   [resolveNetwork({}).key, resolveNetwork({}).rpc, resolveNetwork({}).pin.chainId],
-  ["testnet", TESTNET_RPC, "blockula-testnet-2"],
-  "nothing configured: the public testnet, never a local node",
+  ["local", LOCAL_RPC, undefined],
+  "nothing configured: a dev node on this machine (the public testnet was retired)",
 );
+// The retired public testnet has no public node: naming it takes your node's URL.
+const RETIRED_TESTNET = "https://blockula-testnet.fly.dev";
+assert.throws(() => resolveNetwork({}, ["--network", "testnet"]), /public testnet \(blockula-testnet-2\) was retired in November 2026 and has no public node/);
+assert.throws(() => resolveNetwork({ BLOCKULA_NETWORK: "testnet" }), /BLOCKULA_RPC/);
 assert.equal(resolveNetwork({}, ["--network", "local"]).rpc, LOCAL_RPC);
 assert.equal(resolveNetwork({}, ["--network=local"]).key, "local");
 assert.equal(resolveNetwork({ BLOCKULA_NETWORK: "local" }).key, "local");
-assert.equal(networkArg(["--foo", "--network", "mainnet"]), "mainnet");
+assert.equal(networkArg(["--foo", "--network", "local"]), "local");
 assert.equal(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7391/" }).key, "local", "a localhost RPC is the local network");
 assert.equal(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7391/" }).rpc, "http://127.0.0.1:7391");
-assert.equal(resolveNetwork({ BLOCKULA_RPC: TESTNET_RPC }).key, "testnet", "the testnet's own URL keeps its pins");
+assert.equal(resolveNetwork({ BLOCKULA_RPC: RETIRED_TESTNET }).key, "custom", "the retired public node's URL is no longer the testnet");
 assert.equal(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" }).key, "custom");
 assert.equal(resolveNetwork({ BLOCKULA_RPC: "http://10.0.0.5:7070" }).key, "custom", "plain http on a private network");
-const main = resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "mainnet"]);
-assert.deepEqual([main.key, main.mainnet, main.pin.chainId, main.pin.prefix], ["mainnet", true, "blockula-1", "boo"]);
-assert.equal(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "blockula-1" }).mainnet, true, "a custom node pinned to blockula-1 is real money");
+// There's no mainnet network: a node on blockula-1 is reached with BLOCKULA_CHAIN_ID, like any chain.
+const onBlockula1 = resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "blockula-1" });
+assert.deepEqual([onBlockula1.key, onBlockula1.pin.chainId, onBlockula1.pin.prefix], ["custom", "blockula-1", undefined]);
 const pinned = resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "x", BLOCKULA_GENESIS_HASH: G1.toUpperCase() });
 assert.deepEqual(pinned.pin, { chainId: "x", genesisHash: G1 });
 const refusals: [Record<string, string>, string[], RegExp][] = [
-  [{}, ["--network", "mainnet"], /no public mainnet RPC/],
+  [{ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "mainnet"], /unknown network "mainnet" \(testnet, local or custom\)/],
+  [{ BLOCKULA_NETWORK: "Mainnet" }, [], /unknown network "mainnet"/],
   [{}, ["--network", "custom"], /needs BLOCKULA_RPC/],
+  [{}, ["--network", "testnet"], /retired/],
   [{ BLOCKULA_NETWORK: "moon" }, [], /unknown network/],
   [{ BLOCKULA_RPC: "http://rpc.example" }, [], /must use https/],
   [{ BLOCKULA_RPC: "https://user:pw@rpc.example" }, [], /without credentials/],
   [{ BLOCKULA_RPC: "ftp://rpc.example" }, [], /http\(s\)/],
   [{ BLOCKULA_RPC: "not a url" }, [], /isn't a URL/],
   [{ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "local"], /on this machine/],
-  [{ BLOCKULA_CHAIN_ID: "blockula-1" }, ["--network", "testnet"], /contradicts/],
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "blockula-1" }, ["--network", "testnet"], /contradicts/],
   [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_GENESIS_HASH: "abc" }, [], /64 hex/],
   [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "http://w.example" }, [], /BLOCKULA_WITNESSES must use https/],
   [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://rpc.example/" }, [], /other nodes than BLOCKULA_RPC/],
   [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://w.example,https://w.example" }, [], /twice/],
+  // Audit MCK-1: a node spelled two ways is one node, for the guards as for the defaults.
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://RPC.example:443/." }, [], /other nodes than BLOCKULA_RPC/],
+  [{ BLOCKULA_RPC: "https://Rpc.Example:443/.", BLOCKULA_WITNESSES: "https://rpc.example" }, [], /other nodes than BLOCKULA_RPC/],
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://w.example,https://W.example:443/" }, [], /twice/],
+  // What the client appends /api/… to is a node's URL: a query or a fragment would be dropped or misread.
+  [{ BLOCKULA_RPC: "https://rpc.example/?key=1" }, [], /without a query or a fragment/],
+  [{ BLOCKULA_RPC: "https://rpc.example/#x" }, [], /without a query or a fragment/],
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: "https://w.example/?k=1" }, [], /BLOCKULA_WITNESSES must be a node's URL, without a query or a fragment/],
+  // Audit MCK-3: a pinned chain id is one this MCP can key its ledger and files by.
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "../x" }, [], /BLOCKULA_CHAIN_ID must be a chain id/],
+  [{ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "a".repeat(65) }, [], /BLOCKULA_CHAIN_ID must be a chain id/],
 ];
 // gap-7-1: witnesses names are proven against.
 assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_WITNESSES: " https://a.example/ , https://b.example ," }).witnesses, ["https://a.example", "https://b.example"]);
 assert.deepEqual(resolveNetwork({}).witnesses, []);
+// OPERATOR-6: no chain has public RPCs built in any more (the public testnet was retired), so no
+// node gets a default witness; BLOCKULA_WITNESSES lists them (`none` says so explicitly).
+const own = resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }, ["--network", "testnet"]);
+assert.deepEqual([own.key, own.rpc, own.witnesses, own.witnessesSet, own.pin.chainId], ["testnet", "http://127.0.0.1:7171", [], false, "blockula-testnet-2"]);
+assert.deepEqual([resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171", BLOCKULA_WITNESSES: "none" }, ["--network", "testnet"]).witnesses, resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171", BLOCKULA_WITNESSES: "None" }, ["--network", "testnet"]).witnessesSet], [[], true]);
+assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171", BLOCKULA_WITNESSES: "https://w.example" }, ["--network", "testnet"]).witnesses, ["https://w.example"], "listed witnesses");
+assert.deepEqual([defaultWitnesses("blockula-testnet-2", "http://127.0.0.1:7171"), defaultWitnesses("blockula-testnet-2", RETIRED_TESTNET), defaultWitnesses("blockula-dev", "http://127.0.0.1:7070"), defaultWitnesses("blockula-1", "http://127.0.0.1:7171"), defaultWitnesses(undefined, "x")], [[], [], [], [], []]);
+// Audit MCK-1: a node under any spelling is one node.
+for (const spelled of ["https://Blockula-Testnet.fly.dev", "https://BLOCKULA-TESTNET.FLY.DEV/", "https://blockula-testnet.fly.dev:443", "https://blockula-testnet.fly.dev/.", "https://blockula-testnet.fly.dev./", "https://blockula-testnet.fly.dev:443/./"]) {
+  assert.equal(canonicalUrl(spelled), RETIRED_TESTNET, spelled);
+}
+// A URL has one spelling: the node's own, as the URL parser normalizes it, without the trailing slash.
+for (const [typed, canonical] of [
+  ["https://rpc.example/", "https://rpc.example"],
+  ["HTTPS://Rpc.Example:443", "https://rpc.example"],
+  ["http://LocalHost:80/a/./b//", "http://localhost/a/b"],
+  ["https://rpc.example./", "https://rpc.example"],
+  ["https://rpc.example.:8443/x/", "https://rpc.example:8443/x"],
+  ["http://[::1]:7070/", "http://[::1]:7070"],
+  ["https://rpc.example/Node1", "https://rpc.example/Node1"], // a path is case-sensitive
+  ["http://127.1:7070", "http://127.0.0.1:7070"],
+  ["ftp://rpc.example/", "ftp://rpc.example/"], // not a node URL: as it is
+  ["not a url", "not a url"],
+]) assert.equal(canonicalUrl(typed), canonical, typed);
+for (const u of [LOCAL_RPC]) assert.equal(canonicalUrl(u), u, `${u}: the built-in RPCs are in canonical spelling`);
+assert.deepEqual(resolveNetwork({ BLOCKULA_RPC: "https://Rpc.Example:443/.", BLOCKULA_WITNESSES: "https://W.example/ , https://x.example:8443/" }).witnesses, ["https://w.example", "https://x.example:8443"]);
+// A node on this machine is "your node on" blockula-testnet-2 once its chain is known.
+assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }), "blockula-testnet-2"), "your node on blockula-testnet-2");
+assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }), "blockula-dev"), "local dev node");
+assert.equal(networkLabel(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "testnet"]), "blockula-testnet-2"), "testnet");
 for (const [env, argv, re] of refusals) assert.throws(() => resolveNetwork(env, argv), re, JSON.stringify([env, argv]));
-console.log("✓ the network comes from the configuration only (default: the public testnet)");
+for (const ok of ["http://localhost:7070", "http://192.168.1.20:7070", "http://10.0.0.5:7070", "http://100.64.0.7:7070", "http://100.127.255.254:7070", "http://jacks-mac.tail1234.ts.net:7070"]) assert.doesNotThrow(() => checkRpcUrl(ok), ok);
+for (const no of ["http://100.63.0.1:7070", "http://100.128.0.1:7070", "http://8.8.8.8:7070", "http://ts.net.example:7070"]) assert.throws(() => checkRpcUrl(no), /must use https/, no);
+console.log("✓ the network comes from the configuration only (default: a local dev node; the retired testnet takes BLOCKULA_RPC); a node is one node however its URL is spelled");
 
 // ---- 2. pins ----
 
@@ -76,13 +125,31 @@ assert.match(mismatch({ genesisHash: G2 }, status("a", G1)) ?? "", /genesis/);
 assert.match(mismatch({ prefix: "tboo" }, status("a", G1)) ?? "", /"boo1…" addresses/);
 assert.match(mismatch({}, { genesis_hash: G1 }) ?? "", /chain id/);
 assert.equal(mismatch({ genesisHash: G1 }, status("a", G1.toUpperCase())), null, "hex case doesn't matter");
-// A known chain id must come with its known genesis, whatever the configuration says.
+// A known chain id must come with its known genesis, whatever the configuration says. (A stand-in
+// for blockula-1's: the one the launch release pins, if any, is put back after.)
+const blockula1Genesis: string | undefined = KNOWN_GENESIS["blockula-1"];
 KNOWN_GENESIS["blockula-1"] = G1;
 assert.match(mismatch({}, status("blockula-1", G2)) ?? "", /genesis/);
 assert.equal(mismatch({}, status("blockula-1", G1)), null);
-assert.equal(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "mainnet"]).pin.genesisHash, G1);
-assert.throws(() => resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_GENESIS_HASH: G2 }, ["--network", "mainnet"]), /contradicts blockula-1's known genesis/);
-delete KNOWN_GENESIS["blockula-1"];
+assert.equal(resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "blockula-1" }).pin.genesisHash, G1);
+assert.throws(() => resolveNetwork({ BLOCKULA_RPC: "https://rpc.example", BLOCKULA_CHAIN_ID: "blockula-1", BLOCKULA_GENESIS_HASH: G2 }), /contradicts blockula-1's known genesis/);
+if (blockula1Genesis === undefined) delete KNOWN_GENESIS["blockula-1"];
+else KNOWN_GENESIS["blockula-1"] = blockula1Genesis;
+// A node that says it's on blockula-1 is used only where the user pinned that chain: it's never
+// trusted on first use (as the CLI doesn't), so a configuration that never named it can't land there.
+assert.equal(BLOCKULA_1, MAINNET_CHAIN_ID, "the same chain id as the SDK's");
+assert.match(unpinnedBlockula1({}, status("blockula-1", G1)) ?? "", /says it's on blockula-1, and this MCP isn't pinned to that chain.*BLOCKULA_CHAIN_ID=blockula-1/);
+assert.match(unpinnedBlockula1({ genesisHash: G1, prefix: "boo" }, status("blockula-1", G1)) ?? "", /isn't pinned to that chain/, "a genesis hash or prefix isn't the chain");
+assert.equal(unpinnedBlockula1({ chainId: "blockula-1" }, status("blockula-1", G1)), null);
+assert.equal(unpinnedBlockula1({}, status("a", G1)), null);
+assert.match(unpinnedBlockula1({ chainId: "a" }, status("blockula-1", G1)) ?? "", /isn't pinned to that chain/, "a pin on another chain isn't a pin on blockula-1 (mismatch says so first)");
+assert.match(mismatch({ chainId: "a" }, status("blockula-1", G1)) ?? "", /chain "blockula-1", not "a"/);
+assert.throws(() => resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "mainnet"]), /there's no mainnet network, and a node that says it's on blockula-1 is used only with BLOCKULA_CHAIN_ID=blockula-1/);
+// Every known genesis comes with its clock (scripts/pin-network.sh pins them together).
+for (const [id, hash] of Object.entries(KNOWN_GENESIS)) {
+  assert.match(hash, /^[0-9a-f]{64}$/, id);
+  assert.ok(KNOWN_CLOCKS[id] && Number.isSafeInteger(KNOWN_CLOCKS[id].createdAtMs) && KNOWN_CLOCKS[id].blockTimeMs >= 1, `${id}: KNOWN_CLOCKS has its genesis clock`);
+}
 assert.deepEqual(completePin({ chainId: "a" }, status("a", G1.toUpperCase(), "tboo")), { chainId: "a", genesisHash: G1, prefix: "tboo" });
 const dir = mkdtempSync(join(tmpdir(), "blockula-mcp-test-"));
 const known = new KnownChains(join(dir, "known-chains.json"));
@@ -96,7 +163,7 @@ assert.deepEqual(effectivePin(pinned, { chainId: "other", genesisHash: G2 }), { 
 // isn't held against the new one, which is pinned on first use.
 // Its genesis is built in once a release pins it (scripts/pin-network.sh); until then it's pinned
 // on first use. Either way these hold.
-const testnet = resolveNetwork({});
+const testnet = resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" }, ["--network", "testnet"]);
 const builtIn: string | undefined = KNOWN_GENESIS["blockula-testnet-2"];
 assert.deepEqual([testnet.pin.chainId, testnet.pin.prefix, testnet.pin.genesisHash], ["blockula-testnet-2", "tboo", builtIn], "its genesis is built in only once a release pins it");
 assert.deepEqual(effectivePin(testnet, { chainId: "blockula-testnet", genesisHash: G2, prefix: "boo" }), { chainId: "blockula-testnet-2", genesisHash: builtIn, prefix: "tboo" });
@@ -106,10 +173,32 @@ if (builtIn) {
   assert.match(mismatch(testnet.pin, status("blockula-testnet-2", G1 === builtIn ? G2 : G1, "tboo")) ?? "", /genesis/, "a node on another instance of the testnet is refused");
   assert.equal(mismatch(testnet.pin, status("blockula-testnet-2", builtIn, "tboo")), null);
 }
+// Audit MCK-3: a node's chain id is a ledger key and part of file names, so a node reporting one
+// this MCP can't key by (a path, a space, past 64 characters) isn't pinned at all.
+assert.equal(unusableChain(status("fake-chain", G1)), null);
+assert.equal(unusableChain(status("blockula_dev.1", G1.toUpperCase())), null);
+assert.equal(unusableChain({ chain_id: "a".repeat(64) }), null, "a node that reports no genesis hash is pinned by its chain id alone");
+for (const bad of ["../../escaped/x", "a/b", "a\\b", "a b", "", "a".repeat(65), "x\n", "é"]) assert.match(unusableChain(status(bad, G1)) ?? "", /the node reports the chain id .*1 to 64 letters/, JSON.stringify(bad));
+assert.match(unusableChain(status("a".repeat(100), G1)) ?? "", /"a{80}…"/, "a long id is cut short in the message");
+for (const bad of ["abc", "zz".repeat(32), `${G1}0`, 5, ""]) assert.match(unusableChain({ chain_id: "a", genesis_hash: bad }) ?? "", /genesis hash that isn't 64 hex/, JSON.stringify(bad));
+assert.equal(unusableChain({ chain_id: 5 }), null, "(not a string: `mismatch` says it reports no chain id)");
+// A release before canonicalUrl remembered a node's URL as it was typed. That entry is the same
+// node's, so its pin holds (the node isn't pinned afresh on trust) and moves to the canonical spelling.
+const legacyFile = join(dir, "legacy-known-chains.json");
+const clockEntry = { created_at_ms: 1, block_time_ms: 1000 };
+writeFileSync(legacyFile, JSON.stringify({ "custom https://Rpc.Example:443/.": { chainId: "a", genesisHash: G1 }, "custom https://other.example": { chainId: "b", genesisHash: G2 }, "testnet http://127.0.0.1:7171/.": { chainId: "t", genesisHash: G2 }, [`clock a ${G1}`]: clockEntry }));
+const legacy = new KnownChains(legacyFile);
+const rpcExample = resolveNetwork({ BLOCKULA_RPC: "https://rpc.example" });
+assert.deepEqual(legacy.get(rpcExample), { chainId: "a", genesisHash: G1 });
+assert.deepEqual(JSON.parse(readFileSync(legacyFile, "utf8")), { "custom https://rpc.example": { chainId: "a", genesisHash: G1 }, "custom https://other.example": { chainId: "b", genesisHash: G2 }, "testnet http://127.0.0.1:7171/.": { chainId: "t", genesisHash: G2 }, [`clock a ${G1}`]: clockEntry }, "moved: the entry an error names is the only one");
+assert.deepEqual(new KnownChains(legacyFile).get(rpcExample), { chainId: "a", genesisHash: G1 });
+assert.equal(legacy.get(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }, ["--network", "custom"])), undefined, "another network's entry for the same URL isn't this one's");
+assert.deepEqual(legacy.get(resolveNetwork({ BLOCKULA_RPC: "http://127.0.0.1:7171" }, ["--network", "testnet"])), { chainId: "t", genesisHash: G2 });
+assert.equal(legacy.get(resolveNetwork({ BLOCKULA_RPC: "https://elsewhere.example" })), undefined);
 const local = resolveNetwork({}, ["--network", "local"]);
 known.save(local, { chainId: "blockula-dev", genesisHash: G1 });
 assert.equal(known.get(local), undefined, "dev chains are re-pinned each session (a reset makes a new genesis)");
-console.log("✓ pins: chain id, genesis, prefix, known genesis, trust on first use");
+console.log("✓ pins: chain id, genesis, prefix, known genesis, trust on first use; a chain id that can't key files and ledgers isn't pinned; a pin remembered under another spelling of a URL moves to the canonical one");
 
 // ---- 3. release checks ----
 
@@ -240,6 +329,8 @@ const fake: Server = createServer((req, res) => {
   req.on("end", () => {
     const reply = (code: number, v: unknown) => res.writeHead(code, { "content-type": "application/json" }).end(JSON.stringify(v));
     if (req.url === "/api/status") return reply(200, nodeStatus);
+    if (req.url?.startsWith("/api/hunts")) return reply(200, { hunts: [] });
+    if (req.url === "/api/contributions") return reply(200, { pool: { balance_display: "0 FANG" }, repos: [], claims: [], rules: {} });
     if (req.method === "POST") posted.push(body);
     if (req.url?.startsWith("/api/account/")) return reply(404, { error: "no account" });
     return reply(404, { error: `fake node: no route for ${req.url}` });
@@ -249,8 +340,8 @@ await new Promise<void>((r) => fake.listen(0, "127.0.0.1", r));
 const rpc = `http://127.0.0.1:${(fake.address() as AddressInfo).port}`;
 const home = join(dir, "home");
 
-async function server(env: Record<string, string>) {
-  const transport = new StdioClientTransport({ command: process.execPath, args: [new URL("../dist/index.js", import.meta.url).pathname], env: { PATH: process.env.PATH ?? "", BLOCKULA_HOME: home, ...env }, stderr: "ignore" });
+async function server(env: Record<string, string>, argv: string[] = []) {
+  const transport = new StdioClientTransport({ command: process.execPath, args: [new URL("../dist/index.js", import.meta.url).pathname, ...argv], env: { PATH: process.env.PATH ?? "", BLOCKULA_HOME: home, ...env }, stderr: "ignore" });
   const c = new McpClient({ name: "test", version: "0" });
   await c.connect(transport);
   const call = async (name: string, args: Record<string, unknown> = {}) => {
@@ -271,7 +362,7 @@ const tools = await s.tools();
 for (const name of ["stake", "unstake", "my_stake", "withdraw_stake", "list_proposals", "vote", "renew_name"]) assert.ok(tools.some((t) => t.name === name), `tool ${name}`);
 for (const name of ["list_hunts", "lookup", "list_proposals"]) assert.match(tools.find((t) => t.name === name)?.description ?? "", /untrusted_\*/, `${name} says its chain text is untrusted`);
 for (const name of ["list_hunts", "fund_hunt", "contribution_pool", "submit_contribution", "my_contributions"]) {
-  assert.match(tools.find((t) => t.name === name)?.description ?? "", /Testnet FANG, Hunts and Soul have no monetary value/, `${name} carries the disclaimer`);
+  assert.match(tools.find((t) => t.name === name)?.description ?? "", / FANG, Hunts and Soul have no value\.$/, `${name} carries the disclaimer`);
 }
 r = await s.call("status");
 assert.ok(r.error && /Refusing .*chain "fake-chain", not "another-chain"/.test(r.text), r.text);
@@ -302,6 +393,111 @@ r = await s.call("status");
 assert.ok(r.error && /starts from genesis .*not 2222/.test(r.text) && r.text.includes("known-chains.json"), r.text);
 await s.close();
 
+// A pin remembered under another spelling of the node's URL (before canonicalUrl) still holds after
+// the upgrade, and the entry the error names is the one in the file (audit MCK-1).
+const legacyHome = join(dir, "legacy-home");
+mkdirSync(legacyHome, { recursive: true });
+writeFileSync(join(legacyHome, "known-chains.json"), JSON.stringify({ [`custom ${rpc}/.`]: { chainId: "fake-chain", genesisHash: G2 } }));
+s = await server({ BLOCKULA_RPC: rpc, BLOCKULA_NETWORK: "custom", BLOCKULA_HOME: legacyHome });
+r = await s.call("status");
+assert.ok(r.error && /starts from genesis .*not 2222/.test(r.text) && r.text.includes(`("custom ${rpc}")`), r.text);
+assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(legacyHome, "known-chains.json"), "utf8"))), [`custom ${rpc}`]);
+await s.close();
+
+// A node whose chain can't key the ledger, the locks or a file name isn't pinned: every tool refuses
+// it for that reason (not for a missing genesis hash), and nothing is written outside BLOCKULA_HOME
+// (audit MCK-3: `use_account` used to say the node reported no genesis hash).
+mkdirSync(join(dir, "escaped"));
+const outside = readdirSync(dir).sort();
+for (const [chain_id, genesis_hash, why] of [
+  ["x/../../escaped/y", G1, /the node reports the chain id "x\/\.\.\/\.\.\/escaped\/y", and a chain id here is 1 to 64/],
+  ["a".repeat(65), G1, /the node reports the chain id "a{65}", and a chain id here/],
+  ["fake-chain", "zz".repeat(32), /the node reports a genesis hash that isn't 64 hex characters/],
+] as const) {
+  nodeStatus = { ...nodeStatus, chain_id, genesis_hash };
+  s = await server({ BLOCKULA_RPC: rpc });
+  for (const [tool, args] of [["status", {}], ["create_wallet", {}], ["use_account", { account: "self" }]] as const) {
+    r = await s.call(tool, args);
+    assert.ok(r.error && /^Error: Refusing .*Nothing was signed or sent\.$/.test(r.text) && why.test(r.text), `${tool}: ${r.text}`);
+    assert.ok(!/genesis hash, so the account can't be kept|relaunched|start_dev_node/.test(r.text), `${tool}: the reason is the chain's, and forgetting a remembered chain wouldn't help: ${r.text}`);
+  }
+  await s.close();
+}
+assert.deepEqual(readdirSync(dir).sort(), outside, "nothing was written outside BLOCKULA_HOME");
+assert.deepEqual(readdirSync(join(dir, "escaped")), [], "where a chain id like that would have put a grant file");
+assert.ok(!readdirSync(home).some((f) => f.startsWith("grant-")), "no grant file");
+// A node that reports no genesis hash can be used, but can't keep an account: that's what use_account says.
+const { genesis_hash: _none, ...noGenesis } = { ...nodeStatus, chain_id: "fake-chain", genesis_hash: G1 };
+nodeStatus = noGenesis as typeof nodeStatus;
+s = await server({ BLOCKULA_RPC: rpc });
+r = await s.call("use_account", { account: "self" });
+assert.ok(r.error && /doesn't report its chain's genesis hash, so the account can't be kept for this chain/.test(r.text), r.text);
+await s.close();
+nodeStatus = { ...nodeStatus, chain_id: "fake-chain", genesis_hash: G1 };
+
+// Hunts and the contribution pool say FANG is worth nothing, in a tool's description and in a
+// result, on every chain: a pinned test chain, a node whose chain isn't known until it answers, and
+// a node on blockula-1 alike.
+const NO_VALUE = /FANG, Hunts and Soul have no value\.$/;
+const VALUE_TOOLS = ["list_hunts", "fund_hunt", "contribution_pool", "submit_contribution", "my_contributions"];
+const described = async (srv: Awaited<ReturnType<typeof server>>) => {
+  const all = await srv.tools();
+  return VALUE_TOOLS.map((n) => all.find((t) => t.name === n)?.description ?? "");
+};
+const sayNoValue = async (srv: Awaited<ReturnType<typeof server>>, what: string) => {
+  for (const d of await described(srv)) assert.ok(NO_VALUE.test(d) && !/mainnet|real money|testnet|test chains/i.test(d), `${what}: "${d}"`);
+  for (const tool of ["list_hunts", "contribution_pool"]) {
+    const res = await srv.call(tool);
+    assert.ok(!res.error && /FANG, Hunts and Soul have no value\.$/.test(JSON.parse(res.text).note), `${what} ${tool}: ${res.text}`);
+  }
+};
+nodeStatus = { ...nodeStatus, chain_id: "fake-chain" };
+s = await server({ BLOCKULA_RPC: rpc });
+await sayNoValue(s, "a node whose chain isn't pinned");
+await s.close();
+s = await server({ BLOCKULA_RPC: rpc, BLOCKULA_CHAIN_ID: "fake-chain" });
+await sayNoValue(s, "a node pinned to a test chain");
+await s.close();
+// (Reporting blockula-1's genesis once a release pins it: any other is refused.)
+nodeStatus = { ...nodeStatus, chain_id: "blockula-1", genesis_hash: KNOWN_GENESIS["blockula-1"] ?? G1 };
+s = await server({ BLOCKULA_RPC: rpc, BLOCKULA_CHAIN_ID: "blockula-1" });
+await sayNoValue(s, "a node pinned to blockula-1");
+await s.close();
+nodeStatus = { ...nodeStatus, chain_id: "fake-chain", genesis_hash: G1 };
+console.log("✓ FANG, Hunts and Soul are called worthless on every chain, in descriptions and results");
+
+// A node that says it's on blockula-1 is refused unless the user pinned that chain: BLOCKULA_RPC
+// alone (a "local" or "custom" network) at such a node gets nothing signed, sent or remembered, from
+// every tool. With BLOCKULA_CHAIN_ID=blockula-1 it's used, and remembered as pinned.
+nodeStatus = { ...nodeStatus, chain_id: "blockula-1", genesis_hash: KNOWN_GENESIS["blockula-1"] ?? G1 };
+const b1Home = join(dir, "blockula-1-home");
+for (const env of [{ BLOCKULA_RPC: rpc }, { BLOCKULA_RPC: rpc, BLOCKULA_NETWORK: "custom" }]) {
+  s = await server({ ...env, BLOCKULA_HOME: b1Home });
+  for (const [tool, args] of [["status", {}], ["create_wallet", {}], ["list_hunts", {}], ["send", { to: "boo1x", amount: "1" }], ["use_account", { account: "self" }]] as const) {
+    r = await s.call(tool, args);
+    assert.ok(r.error && /^Error: Refusing .*the node says it's on blockula-1, and this MCP isn't pinned to that chain.*BLOCKULA_CHAIN_ID=blockula-1.*Nothing was signed or sent\.$/.test(r.text), `${JSON.stringify(env)} ${tool}: ${r.text}`);
+    assert.ok(!/relaunched|known-chains/.test(r.text), `forgetting a remembered chain wouldn't help: ${r.text}`);
+  }
+  await s.close();
+}
+assert.equal(posted.length, 0, "nothing was sent");
+assert.ok(!readdirSync(join(dir)).includes("blockula-1-home") || !readdirSync(b1Home).some((f) => f === "known-chains.json" || f === "agent-wallet.json"), "the node wasn't remembered, and no wallet was made for it");
+s = await server({ BLOCKULA_RPC: rpc, BLOCKULA_NETWORK: "custom", BLOCKULA_CHAIN_ID: "blockula-1", BLOCKULA_HOME: b1Home });
+r = await s.call("status");
+assert.ok(!r.error && JSON.parse(r.text).pinned.chain_id === "blockula-1", r.text);
+await s.close();
+s = await server({ BLOCKULA_RPC: rpc, BLOCKULA_NETWORK: "custom", BLOCKULA_HOME: b1Home });
+r = await s.call("status");
+assert.ok(!r.error, `a pin the user's configuration named, remembered, still counts: ${r.text}`);
+await s.close();
+// Another chain id pinned: that's the refusal the pin always gave.
+s = await server({ BLOCKULA_RPC: rpc, BLOCKULA_CHAIN_ID: "fake-chain", BLOCKULA_HOME: b1Home });
+r = await s.call("status");
+assert.ok(r.error && /chain "blockula-1", not "fake-chain"/.test(r.text), r.text);
+await s.close();
+nodeStatus = { ...nodeStatus, chain_id: "fake-chain", genesis_hash: G1 };
+console.log("✓ a node that says it's on blockula-1 is refused (nothing signed, sent or remembered) unless BLOCKULA_CHAIN_ID pins that chain");
+
 // A broken configuration fails every tool with the reason, instead of guessing a network.
 s = await server({ BLOCKULA_NETWORK: "moon" });
 r = await s.call("status");
@@ -310,4 +506,4 @@ await s.close();
 
 fake.close();
 rmSync(dir, { recursive: true, force: true });
-console.log("✓ the server refuses the wrong chain, notices a switch, and remembers chains across restarts");
+console.log("✓ the server refuses the wrong chain, notices a switch, remembers chains across restarts (and across a URL's spellings), and refuses a node whose chain id or genesis hash can't be pinned");

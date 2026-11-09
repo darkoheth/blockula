@@ -7,12 +7,16 @@ import { Heartbeat } from "@/components/explorer/Heartbeat";
 import { useMe } from "@/components/explorer/kit";
 import { Ledger } from "@/components/explorer/Ledger";
 import { Apparition } from "@/components/Haunt";
+import { BalanceBreakdown, NameExpiryBanner, OnePasskeyBanner } from "@/components/HomeNotes";
+import { Landing } from "@/components/Landing";
+import { ProjectSite } from "@/components/site/ProjectSite";
 import { Tutorial, useTutorial } from "@/components/Tutorial";
 import { Copy, ExplorerLink, Spinner } from "@/components/ui";
-import { explorer } from "@/lib/config";
+import { explorer, SITE } from "@/lib/config";
 import { fangParts, shortAddr } from "@/lib/format";
 import type { TxView } from "@/lib/types";
-import { useUnlocked } from "@/lib/wallet";
+import { useUnlocked, useWallet } from "@/lib/wallet";
+import { Unit } from "@/components/Unit";
 
 /**
  * Ids of payments into `me` that showed up since the last poll (none on first load), held for a
@@ -38,7 +42,15 @@ function useArrivals(txs: TxView[] | undefined, me: string | undefined) {
   return fresh;
 }
 
-export default function HomePage() {
+/** `/`: the wallet (or, on a first visit, the landing page), or on the project site its page. */
+export default function Page() {
+  return SITE ? <ProjectSite /> : <HomePage />;
+}
+
+function HomePage() {
+  const { ready, hint } = useWallet();
+  // A first visit (no wallet on this device) gets the landing page; the wallet is a click away.
+  if (ready && !hint) return <Landing />;
   return (
     <RequireWallet>
       <Home />
@@ -67,8 +79,9 @@ function Home() {
         <div className="balance" aria-label={`${account.balance_display}`}>
           {whole}
           {frac && <span className="frac">.{frac}</span>}
-          <span className="unit">FANG</span>
+          <span className="unit"><Unit /></span>
         </div>
+        <BalanceBreakdown account={account} />
         <div className="actions">
           <Link className="btn primary" href="/send">Send</Link>
           <Link className="btn" href="/receive">Receive</Link>
@@ -81,6 +94,8 @@ function Home() {
           <b>Your recovery kit isn&apos;t active yet.</b> <Link href="/devices#recovery">Activate it</Link> once you have a little FANG for the fee.
         </div>
       )}
+      <OnePasskeyBanner account={account} />
+      <NameExpiryBanner account={account} />
 
       <Tutorial state={tutorial} update={updateTutorial} />
 

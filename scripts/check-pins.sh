@@ -4,6 +4,8 @@
 #   - a container image without an @sha256 digest (Dockerfile, compose, workflow containers)
 #   - a rust image whose version differs from rust-toolchain.toml
 #   - a cargo build/test/clippy/run/install without --locked
+#   - cargo features in a release, reproduction or image build, or a manifest that turns the test
+#     release key's feature on by itself
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
@@ -32,7 +34,7 @@ while read -r where image; do
   [[ $image =~ @sha256:[0-9a-f]{64}$ ]] || bad "image not pinned by digest: $where $image"
 done < <( {
   grep -nE '^FROM ' deploy/Dockerfile | sed -E 's/^([0-9]+):FROM ([^ ]+).*/deploy\/Dockerfile:\1 \2/'
-  grep -nE '^RELEASE_IMAGE=' scripts/reproduce-release.sh | sed -E 's/^([0-9]+):RELEASE_IMAGE=/scripts\/reproduce-release.sh:\1 /'
+  grep -nE '^(RELEASE|WALLET)_IMAGE=' scripts/reproduce-release.sh | sed -E 's/^([0-9]+):[A-Z]+_IMAGE=/scripts\/reproduce-release.sh:\1 /'
   grep -noE '(image|container): *"?[^"}, ]+' deploy/monitoring/docker-compose.yml "${workflows[@]}" /dev/null \
     | grep -vF "\${{" | sed -E 's/^([^:]+:[0-9]+):(image|container): *"?/\1 /'
 } || true)
@@ -46,11 +48,34 @@ while IFS= read -r hit; do
 done < <(grep -noE 'rust:[0-9][0-9.]*-[a-z]+' deploy/Dockerfile scripts/reproduce-release.sh "${workflows[@]}" /dev/null || true)
 grep -qE 'rust:[0-9]' deploy/Dockerfile || bad "deploy/Dockerfile must build FROM a versioned rust image"
 
+# The wallet every binary embeds is built (release.yml) and rebuilt (reproduce-release.sh) in one
+# Node.js image: its export is only the same bytes there.
+wallet_image=$(sed -nE 's/^WALLET_IMAGE=//p' scripts/reproduce-release.sh)
+[ -n "$wallet_image" ] || bad "scripts/reproduce-release.sh has no WALLET_IMAGE"
+while IFS= read -r hit; do
+  [ "${hit#*container: }" = "\"$wallet_image\"" ] || bad "a node image in release.yml isn't WALLET_IMAGE ($wallet_image): $hit"
+done < <(grep -nE 'container: *"node:' .github/workflows/release.yml || true)
+[ "$(grep -cE 'container: *"node:' .github/workflows/release.yml)" -ge 2 ] || bad "release.yml's wallet and reproduce-wallet jobs must run in WALLET_IMAGE"
+
 # --locked on every cargo build/test/clippy/run/install in CI, scripts and the image.
 while IFS= read -r hit; do
   printf '%s' "$hit" | grep -q -- '--locked' || bad "cargo without --locked: $hit"
 done < <(grep -nE '(^|[^-])cargo (build|test|clippy|run|install)\b' "${workflows[@]}" scripts/*.sh deploy/*.sh deploy/Dockerfile /dev/null \
   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' | grep -vE 'echo |Build from source' || true)
+
+# What ships is built with no cargo features: the release workflow, its build and reproduction
+# scripts and the images. (`test-release-key` makes a binary trust the runbook test's published
+# key, node/src/release_cli.rs.)
+while IFS= read -r hit; do
+  bad "a release or image build enables cargo features: $hit"
+done < <(grep -nE -- '--(all-)?features|test-release-key' .github/workflows/release.yml scripts/release-build.sh scripts/reproduce-release.sh deploy/Dockerfile /dev/null 2>/dev/null || true)
+# … nor by a manifest: test-release-key is named only where node/Cargo.toml defines it, so no
+# `default = […]`, other feature or dependency turns it on in a plain `cargo build --release`
+# (where the Rust tests that hold the built-in key to the real one are compiled out).
+manifests=$(git ls-files -- Cargo.toml '*/Cargo.toml') || bad "git ls-files can't list the Cargo manifests"
+while IFS= read -r hit; do
+  bad "a manifest names test-release-key outside its definition (it could ship enabled): $hit"
+done < <(for m in $manifests; do grep -nHF -- test-release-key "$m"; done | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' | grep -vxE 'node/Cargo\.toml:[0-9]+:test-release-key = \[\]' || true)
 
 # Every exactly pinned (`=`) crate is in Dependabot's solo consensus-and-crypto group, so its bumps
 # never ride along in the weekly catch-all PR (audit F78).
@@ -66,12 +91,14 @@ while IFS= read -r crate; do
   done
   [ $hit = 1 ] || bad "$crate is pinned with = but isn't in dependabot.yml's consensus-and-crypto group"
 done < <( {
-  for m in node/Cargo.toml node/ghost/Cargo.toml; do
+  # The node, the Ghost Mode core, and the programs engine with its test guests (each its own
+  # workspace and lockfile).
+  for m in node/Cargo.toml node/ghost/Cargo.toml node/vm/Cargo.toml node/vm/guests/Cargo.toml node/vm/guests/*/Cargo.toml; do
     sed -nE 's/^([a-z0-9_-]+) *= *(\{ *version *= *)?"=[^"]+".*/\1/p' "$m"
   done
   # Table-form pins: `[dependencies.NAME]` followed by `version = "=…"`.
   awk '/^\[dependencies\./{n=$0; sub(/^\[dependencies\./, "", n); sub(/\].*/, "", n)} /^version *= *"=/{ if (n) print n } /^\[/ && !/^\[dependencies\./{n=""}' node/vendor/commonware-stream/Cargo.toml
 } | grep -vx 'blockula-ghost' | sort -u)
 
-[ $fail = 0 ] && echo "✓ pins: actions by SHA, images by digest, rust $channel everywhere, cargo --locked, exact crate pins in their own Dependabot group"
+[ $fail = 0 ] && echo "✓ pins: actions by SHA, images by digest, rust $channel everywhere, cargo --locked, no features in what ships, exact crate pins in their own Dependabot group"
 exit $fail

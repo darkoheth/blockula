@@ -16,6 +16,7 @@ mod ghost;
 mod github;
 mod gov_cli;
 mod governance;
+mod launch_cli;
 mod snapshot;
 mod staking;
 mod state;
@@ -24,6 +25,8 @@ mod node;
 mod params;
 mod pq;
 mod poc;
+mod program_cli;
+mod programs;
 mod protection;
 mod release_cli;
 mod replay;
@@ -32,6 +35,8 @@ mod types;
 mod upgrade;
 mod validator_cli;
 mod view;
+mod wallet;
+mod webapp;
 
 #[cfg(test)]
 mod sim;
@@ -44,8 +49,12 @@ use cli_net::blockula_dir;
 use node::NetOpts;
 use std::path::PathBuf;
 
+/// `blockula --help`'s tagline, in the brand wording (D10): "post-quantum
+/// signatures (ML-DSA-65)", and no "never dies" on a surface people read before they take a risk.
+const ABOUT: &str = "🧛 Blockula: a blockchain with post-quantum signatures (ML-DSA-65)";
+
 #[derive(Parser)]
-#[command(name = "blockula", version, about = "🧛 Blockula — a post-quantum blockchain that never dies")]
+#[command(name = "blockula", version, about = ABOUT)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -53,9 +62,18 @@ struct Cli {
 
 #[derive(Args, Clone)]
 struct Net {
-    /// Interface to listen on for HTTP and p2p: 127.0.0.1 (default), 0.0.0.0 or :: for servers
+    /// Interface to listen on for HTTP and p2p: 127.0.0.1 (default), 0.0.0.0 or :: for servers.
+    /// --http-bind and --p2p-bind set one of them apart
     #[arg(long, default_value = "127.0.0.1")]
     bind: String,
+    /// Interface the HTTP API listens on (default: --bind). A validator's stays private: keep it
+    /// on 127.0.0.1, or a private network its own full nodes reach
+    #[arg(long)]
+    http_bind: Option<String>,
+    /// Interface p2p listens on (default: --bind). A validator on a public chain needs 0.0.0.0
+    /// (or ::) here, so the other validators can dial it
+    #[arg(long)]
+    p2p_bind: Option<String>,
     /// IP of a proxy or full node whose `X-Blockula-Client-IP` header is trusted for faucet/tx
     /// rate limits (repeatable)
     #[arg(long = "trusted-forwarder")]
@@ -99,6 +117,16 @@ struct Net {
     /// Longest an HTTP request may take, in seconds
     #[arg(long, default_value_t = api::HTTP_TIMEOUT.as_secs())]
     http_timeout_secs: u64,
+    /// Serve `POST /api/program/{address}/view` (a program's read-only methods, run on this node
+    /// for whoever asks) from a validator. Full nodes serve it without the flag; a validator's
+    /// HTTP is private by convention, and a view runs a VM for the caller (docs/PROGRAMS-V0.md §8.2)
+    #[arg(long)]
+    program_views: bool,
+    /// The most fuel one program view may use (default: the transaction maximum; at most what a
+    /// transaction may declare, 20,000,000). A view never gets more than the chain's current
+    /// `program_max_tx_fuel` either, so lowering that parameter lowers this at once
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=blockula_vm::meter::MAX_TX_FUEL))]
+    view_max_fuel: Option<u64>,
     /// Execute this height, then stop: validators exit (code 10) and don't vote past it, full
     /// nodes keep serving reads. For coordinated restarts and incidents (docs/OPERATIONS.md)
     #[arg(long)]
@@ -113,6 +141,12 @@ struct Net {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Launch your own chain: name it, choose who can reach it and how it runs, and start it. It
+    /// asks a step at a time, or takes every answer as a flag with --yes
+    Launch {
+        #[command(flatten)]
+        args: launch_cli::LaunchArgs,
+    },
     /// Start a local single-validator dev chain with a faucet and the built-in explorer
     Dev {
         #[arg(long, default_value = "7070")]
@@ -120,6 +154,13 @@ enum Cmd {
         /// Wipe the dev chain and start fresh
         #[arg(long)]
         reset: bool,
+        /// Start a new dev chain with programs on from block 1 (protocol v2 and the `programs`
+        /// feature in its genesis), to upload, create, call and view WebAssembly programs with
+        /// `blockula program`. A chain already made without it keeps its genesis: add --reset.
+        /// Programs are experimental and not yet audited: a chain made with them now may need to be
+        /// recreated after an update
+        #[arg(long)]
+        programs: bool,
         #[command(flatten)]
         net: Net,
     },
@@ -130,7 +171,9 @@ enum Cmd {
         home: Option<PathBuf>,
         #[arg(long)]
         no_faucet: bool,
-        #[arg(long, default_value = "1000")]
+        /// Milliseconds between blocks. 5 seconds keeps an idle validator's traffic and a node's
+        /// disk growth to about a fifth of 1-second blocks (docs/LAUNCH.md); 1000 for faster blocks
+        #[arg(long, default_value = "5000")]
         block_time_ms: u64,
         /// Number of genesis validators. With N > 1, `home/v0 … home/vN-1` are created.
         #[arg(long, default_value = "1")]
@@ -138,9 +181,15 @@ enum Cmd {
         /// Season 0 validator admin account (repeatable). Default: the first validator's account.
         #[arg(long = "admin")]
         admins: Vec<String>,
-        /// Blocks per epoch; the validator set changes only at epoch boundaries
-        #[arg(long, default_value = "600")]
-        epoch_blocks: u64,
+        /// Blocks per epoch; the validator set changes only at epoch boundaries (default: about
+        /// 10 minutes of blocks)
+        #[arg(long)]
+        epoch_blocks: Option<u64>,
+        /// Where other machines reach this chain's validators: this machine's IP or DNS name (a
+        /// Tailscale address works). Validator i is published at port 30300+i (p2p) and 7070+i
+        /// (HTTP). Default: 127.0.0.1, for a chain on this machine only
+        #[arg(long)]
+        host: Option<String>,
         /// Minimum validator bond in FANG (default: 50 with a faucet, 10000 without)
         #[arg(long)]
         min_bond: Option<String>,
@@ -161,6 +210,24 @@ enum Cmd {
         /// open at once. For local multi-validator chains that exercise those flows end to end.
         #[arg(long)]
         dev_durations: bool,
+        /// Programs on from block 1: protocol v2 and the `programs` feature in the genesis, so
+        /// anyone can upload, create and call WebAssembly programs (`blockula program`). Without
+        /// it the chain starts as before, and governance can switch programs on later. Programs are
+        /// experimental and not yet audited: a chain made with them now may need to be recreated
+        /// after an update
+        #[arg(long)]
+        programs: bool,
+        /// The chain's name, as wallets and explorers show it ("Jack in the Block"). Up to 48
+        /// bytes. The genesis hash binds it
+        #[arg(long)]
+        name: Option<String>,
+        /// A sentence about the chain, shown under its name. Up to 280 bytes; needs --name
+        #[arg(long, requires = "name")]
+        description: Option<String>,
+        /// The chain's ticker: 2–8 characters, A–Z and 0–9 (default FANG). Wallets and explorers
+        /// show amounts in it; the protocol still counts in drops (a billion to one)
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Run a validator (a home with validator.key) or a joined full node
     Run {
@@ -258,6 +325,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: contrib_cli::NameCmd,
     },
+    /// 🧩 Programs: upload, create, call and view WebAssembly programs (on a chain that has them on)
+    Program {
+        #[command(subcommand)]
+        cmd: program_cli::ProgramCmd,
+    },
     /// 🥩 Stake: delegate to validator pools, unbond, withdraw
     Stake {
         #[command(subcommand)]
@@ -307,6 +379,11 @@ enum Cmd {
     },
 }
 
+/// A block time as people read it: "5 s", or "250 ms" when it isn't whole seconds.
+fn fmt_block_time(ms: u64) -> String {
+    if ms % 1000 == 0 { format!("{} s", ms / 1000) } else { format!("{ms} ms") }
+}
+
 fn net_opts(net: Net, http_port: Option<u16>, p2p_preset: Option<String>, ephemeral_p2p: bool) -> NetOpts {
     let client_ip = api::ClientIpPolicy {
         trusted_forwarders: net.trusted_forwarders,
@@ -314,13 +391,13 @@ fn net_opts(net: Net, http_port: Option<u16>, p2p_preset: Option<String>, epheme
         header: net.client_ip_header.map(|h| h.to_lowercase()),
         hops: net.client_ip_hops as usize,
     };
-    let http = node::HttpOpts { read_rps: net.read_rps, read_burst: net.read_burst, timeout: std::time::Duration::from_secs(net.http_timeout_secs.max(1)) };
+    let http = node::HttpOpts { read_rps: net.read_rps, read_burst: net.read_burst, timeout: std::time::Duration::from_secs(net.http_timeout_secs.max(1)), program_views: net.program_views, view_max_fuel: net.view_max_fuel };
     let pruning = match (net.archive, net.prune_blocks) {
         (true, _) => node::Pruning::Archive,
         (_, Some(n)) => node::Pruning::Keep(n),
         _ => node::Pruning::Default,
     };
-    NetOpts { bind: net.bind, http_port, p2p_preset, ephemeral_p2p, client_ip, peer_http: net.peer_http, force_key: net.force_key, full: net.full, pruning, http, halt_height: net.halt_height, network_halted_at: net.network_halted_at }
+    NetOpts { bind: net.bind, http_bind: net.http_bind, p2p_bind: net.p2p_bind, http_port, p2p_preset, ephemeral_p2p, client_ip, peer_http: net.peer_http, force_key: net.force_key, full: net.full, pruning, http, halt_height: net.halt_height, network_halted_at: net.network_halted_at }
 }
 
 fn main() -> Result<()> {
@@ -332,7 +409,18 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     match Cli::parse().cmd {
-        Cmd::Dev { port, reset, net } => {
+        Cmd::Launch { args } => {
+            let launched = launch_cli::launch(&args)?;
+            if args.no_start {
+                return Ok(());
+            }
+            println!("\n▶  Starting it. Ctrl-C stops it; the command above starts it again.\n");
+            // The defaults of `blockula run`, listening where the others reach it.
+            let mut net = <Net as clap::FromArgMatches>::from_arg_matches(&Net::augment_args(clap::Command::new("launch")).get_matches_from(["launch"]))?;
+            net.bind = launched.plan.bind().into();
+            node::run_validator(launched.home, net_opts(net, None, None, false))
+        }
+        Cmd::Dev { port, reset, programs, net } => {
             let home = blockula_dir().join("dev");
             let stale = home.join("genesis.json").exists() && (chain::Genesis::load(&home.join("genesis.json")).is_err() || node::dev_is_stale(&home));
             if reset || stale {
@@ -344,16 +432,30 @@ fn main() -> Result<()> {
             if !home.join("genesis.json").exists() {
                 // One-minute epochs: unbonding, jail, Séances and the beacon move in minutes.
                 let dev = SummonOpts { epoch_blocks: 60, ..SummonOpts::new("blockula-dev", 1) };
+                let dev = if programs { dev.with_programs() } else { dev };
                 let params = params::ChainParams::dev_overrides(dev.block_time_ms, dev.epoch_blocks);
                 Chain::summon(&home, &SummonOpts { http_port: Some(port), contribution: Some(poc::PocTimes::dev(dev.block_time_ms)), params, ..dev })?;
             }
-            node::run_validator(home, net_opts(net, Some(port), Some("local".into()), true))
+            let programs_on = chain::Genesis::load(&home.join("genesis.json"))?.features.iter().any(|f| f == upgrade::PROGRAMS_FEATURE);
+            if programs && !programs_on {
+                // A genesis is the chain's: asking for programs can't change one that's running.
+                anyhow::bail!("the dev chain at {} was made without programs, and a chain's genesis can't change; start a new one with `blockula dev --programs --reset`", home.display());
+            }
+            if programs_on {
+                println!("🧩 Programs are on from block 1: `blockula program --help` uploads, creates, calls and views them. Programs are experimental and not yet audited: a chain made with them now may need to be recreated after an update");
+            }
+            // The dev validator is the one node, and its HTTP is the RPC: it serves program views
+            // (`/api/program/{address}/view`) as a full node would, with no --program-views.
+            let mut opts = net_opts(net, Some(port), Some("local".into()), true);
+            opts.http.program_views = true;
+            node::run_validator(home, opts)
         }
-        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, min_bond, seance_blocks, claim_maturity_blocks, vesting_blocks, address_prefix, dev_durations } => {
+        Cmd::Summon { chain_id, home, no_faucet, block_time_ms, validators, admins, epoch_blocks, host, min_bond, seance_blocks, claim_maturity_blocks, vesting_blocks, address_prefix, dev_durations, programs, name, description, token } => {
             let home = home.unwrap_or_else(|| blockula_dir().join(&chain_id));
             if home.join("genesis.json").exists() {
                 anyhow::bail!("{} already has a chain", home.display());
             }
+            let epoch_blocks = epoch_blocks.unwrap_or_else(|| chain::summon_epoch_blocks(block_time_ms));
             let opts = SummonOpts {
                 chain_id: chain_id.clone(),
                 faucet: !no_faucet,
@@ -370,20 +472,41 @@ fn main() -> Result<()> {
                 }),
                 address_prefix,
                 params: if dev_durations { params::ChainParams::dev_overrides(block_time_ms, epoch_blocks) } else { Default::default() },
+                host: host.clone(),
+                upgrades: vec![],
+                features: vec![],
+                token,
+                brand: name.map(|name| chain::Brand { name, description: description.unwrap_or_default() }),
             };
+            let opts = if programs { opts.with_programs() } else { opts };
             let homes = Chain::summon(&home, &opts)?;
             let g = chain::Genesis::load(&homes[0].join("genesis.json"))?;
+            if let Some(b) = &g.brand {
+                println!("🦇 {} ({})", b.name, g.token);
+            }
             println!("🪦 Summoned chain `{chain_id}` with {validators} validator{} at {}", if validators == 1 { "" } else { "s" }, home.display());
+            // Published at another host, a validator listens on every interface (`::` for an IPv6 one).
+            let bind = match &host {
+                Some(h) if h.contains(':') => " --bind ::",
+                Some(_) => " --bind 0.0.0.0",
+                None => "",
+            };
             for (h, v) in homes.iter().zip(&g.validators) {
-                println!("   blockula run --home {}    # http://{}  p2p {}", h.display(), v.http_addr, v.p2p_addr);
+                println!("   blockula run --home {}{bind}    # http://{}  p2p {}", h.display(), v.http_addr, v.p2p_addr);
             }
             println!("   genesis hash: {}  (joiners can pin it with --genesis-hash)", hex::encode(consensus::genesis_block(&g).digest_bytes()));
-            println!("   epochs: {} blocks · min self-bond: {} · validator admins: {}", g.epoch_blocks, types::fmt_fang(g.chain_params()?.min_self_bond), g.validator_admins.join(", "));
+            println!("   a block every {} · epochs: {} blocks (about {} min) · min self-bond: {} · validator admins: {}", fmt_block_time(block_time_ms), g.epoch_blocks, g.epoch_blocks.saturating_mul(block_time_ms).div_ceil(60_000), types::fmt_fang(g.chain_params()?.min_self_bond).replace(" FANG", &format!(" {}", g.token)), g.validator_admins.join(", "));
+            if programs {
+                println!("   programs are on from block 1 (protocol v2): `blockula program` uploads, creates, calls and views them. Full nodes serve program views; a validator serves them only with --program-views. Programs are experimental and not yet audited: a chain made with them now may need to be recreated after an update");
+            }
             if dev_durations {
                 let cp = g.chain_params()?;
                 println!("   dev durations: unbonding {} blocks · voting {} · timelock {} · deposit {}", cp.unbonding_blocks, cp.voting_blocks, cp.timelock_blocks, types::fmt_fang(cp.proposal_deposit));
             }
-            println!("   (Edit validators[].p2p_addr / http_addr in genesis.json before the first start if nodes will be reached at other addresses; every node must use the same file.)");
+            match &host {
+                Some(_) => println!("   others join with: blockula join --genesis {} --home ~/.blockula/{chain_id}   (docs/LAUNCH.md)", chain::http_url(&g.validators[0].http_addr)),
+                None => println!("   (These validators are published at 127.0.0.1, so other machines can't reach them: to run a chain with others, summon it with --host <this machine's IP or DNS name>. docs/LAUNCH.md)"),
+            }
             Ok(())
         }
         Cmd::Run { home, port, p2p_preset, net } => {
@@ -450,6 +573,7 @@ fn main() -> Result<()> {
         Cmd::Gov { cmd } => gov_cli::gov(cmd, &blockula_dir()),
         Cmd::Multisig { cmd } => gov_cli::multisig(cmd, &blockula_dir()),
         Cmd::Name { cmd } => contrib_cli::name(cmd, &blockula_dir()),
+        Cmd::Program { cmd } => program_cli::program(cmd, &blockula_dir()),
         Cmd::Stake { cmd } => contrib_cli::stake(cmd, &blockula_dir()),
         Cmd::Keygen { prefix } => {
             anyhow::ensure!(crypto::is_prefix(&prefix), "prefix must be one of {:?}", crypto::KNOWN_PREFIXES);
@@ -469,5 +593,91 @@ mod cli_tests {
     fn the_cli_is_well_formed() {
         use clap::CommandFactory;
         super::Cli::command().debug_assert();
+    }
+
+    /// OPERATOR-2: without --http-bind and --p2p-bind, HTTP and p2p both listen where --bind says
+    /// (so today's deploys, which pass `--bind ::`, are unchanged); each flag moves one of them.
+    #[test]
+    fn http_and_p2p_bind_where_bind_says_unless_told_apart() {
+        use clap::Parser;
+        let opts = |args: &[&str]| match super::Cli::try_parse_from(["blockula"].iter().chain(args)).unwrap().cmd {
+            super::Cmd::Run { net, port, p2p_preset, .. } => super::net_opts(net, port, p2p_preset, false),
+            super::Cmd::Join { net, port, .. } => super::net_opts(net, Some(port), None, false),
+            super::Cmd::Dev { net, port, .. } => super::net_opts(net, Some(port), Some("local".into()), true),
+            _ => unreachable!(),
+        };
+        let ifaces = |n: crate::node::NetOpts| (n.http_iface().to_string(), n.p2p_iface().to_string());
+        let same = |i: &str| (i.to_string(), i.to_string());
+        assert_eq!(ifaces(opts(&["run", "--home", "h"])), same("127.0.0.1"));
+        assert_eq!(ifaces(opts(&["run", "--home", "h", "--bind", "::"])), same("::"), "the Fly entrypoint's flags");
+        assert_eq!(ifaces(opts(&["join", "--genesis", "g.json", "--home", "h", "--bind", "0.0.0.0"])), same("0.0.0.0"));
+        assert_eq!(ifaces(opts(&["dev"])), same("127.0.0.1"));
+        assert_eq!(ifaces(opts(&["run", "--home", "h", "--p2p-bind", "0.0.0.0"])), ("127.0.0.1".to_string(), "0.0.0.0".to_string()), "what `validator init` suggests");
+        assert_eq!(ifaces(opts(&["run", "--home", "h", "--bind", "::", "--http-bind", "127.0.0.1"])), ("127.0.0.1".to_string(), "::".to_string()));
+        assert_eq!(ifaces(opts(&["run", "--home", "h", "--http-bind", "10.0.0.2", "--p2p-bind", "::"])), ("10.0.0.2".to_string(), "::".to_string()));
+        let n = opts(&["run", "--home", "h", "--http-bind", "::1", "--p2p-bind", "0.0.0.0"]);
+        assert_eq!((crate::node::socket(n.http_iface(), 7070).unwrap().to_string(), crate::node::socket(n.p2p_iface(), 30300).unwrap().to_string()), ("[::1]:7070".to_string(), "0.0.0.0:30300".to_string()));
+        assert!(crate::node::socket("localhost", 1).unwrap_err().to_string().contains("--http-bind"));
+    }
+
+    /// Chains people launch default to 5-second blocks and about 10-minute epochs, lighter on home
+    /// connections and disks (docs/LAUNCH.md); every one of them can still be set.
+    #[test]
+    fn summoned_chains_default_to_light_blocks() {
+        use clap::Parser;
+        let summon = |args: &[&str]| match super::Cli::try_parse_from(["blockula", "summon", "mychain"].iter().chain(args)).unwrap().cmd {
+            super::Cmd::Summon { block_time_ms, epoch_blocks, host, .. } => (block_time_ms, epoch_blocks.unwrap_or_else(|| crate::chain::summon_epoch_blocks(block_time_ms)), host),
+            _ => unreachable!(),
+        };
+        assert_eq!(summon(&[]), (5_000, 120, None));
+        assert_eq!(summon(&["--block-time-ms", "1000"]), (1_000, 600, None), "the old default, as the test scripts pin it");
+        assert_eq!(summon(&["--epoch-blocks", "20", "--host", "100.64.0.7"]), (5_000, 20, Some("100.64.0.7".into())));
+        assert_eq!((super::fmt_block_time(5_000), super::fmt_block_time(1_500)), ("5 s".to_string(), "1500 ms".to_string()));
+    }
+
+    /// `--programs` asks `dev` and `summon` for a chain with programs on from block 1 (WBS S6b), and
+    /// `--program-views` and `--view-max-fuel` reach the HTTP options (the view fuel is at most what a
+    /// transaction may declare, and at least 1).
+    #[test]
+    fn the_programs_flags_parse() {
+        use clap::Parser;
+        let parse = |args: &[&str]| super::Cli::try_parse_from(["blockula"].iter().chain(args));
+        match parse(&["dev", "--programs"]).unwrap().cmd {
+            super::Cmd::Dev { programs, reset, .. } => assert!(programs && !reset),
+            _ => unreachable!(),
+        }
+        match parse(&["dev"]).unwrap().cmd {
+            super::Cmd::Dev { programs, .. } => assert!(!programs, "off unless asked"),
+            _ => unreachable!(),
+        }
+        match parse(&["summon", "mychain", "--programs"]).unwrap().cmd {
+            super::Cmd::Summon { programs, .. } => assert!(programs),
+            _ => unreachable!(),
+        }
+        match parse(&["summon", "mychain"]).unwrap().cmd {
+            super::Cmd::Summon { programs, .. } => assert!(!programs),
+            _ => unreachable!(),
+        }
+        let http = |args: &[&str]| match parse(args).unwrap().cmd {
+            super::Cmd::Run { net, port, p2p_preset, .. } => super::net_opts(net, port, p2p_preset, false).http,
+            _ => unreachable!(),
+        };
+        let h = http(&["run", "--home", "h"]);
+        assert!(!h.program_views && h.view_max_fuel.is_none(), "a validator serves no views unless told to");
+        let h = http(&["run", "--home", "h", "--program-views", "--view-max-fuel", "123456"]);
+        assert!(h.program_views && h.view_max_fuel == Some(123_456));
+        let max = blockula_vm::meter::MAX_TX_FUEL.to_string();
+        assert!(parse(&["run", "--home", "h", "--view-max-fuel", &max]).is_ok());
+        for bad in ["0", "20000001", "-1", "lots"] {
+            assert!(parse(&["run", "--home", "h", "--view-max-fuel", bad]).is_err(), "--view-max-fuel {bad}");
+        }
+    }
+
+    /// D10: the tagline makes no "never dies" claim.
+    #[test]
+    fn the_tagline_follows_the_brand_wording() {
+        use clap::CommandFactory;
+        let about = super::Cli::command().get_about().map(|a| a.to_string()).unwrap_or_default();
+        assert!(about.contains("post-quantum signatures (ML-DSA-65)") && !about.contains("never dies"), "{about}");
     }
 }

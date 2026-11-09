@@ -1,0 +1,65 @@
+name: 🖥️ Run a node or validator
+description: Tell us about a node you run, or ask for help running one.
+title: "Node: "
+labels: [node-operator]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Running a node is a real contribution. The how-to is [docs/RUN-A-NODE.md](https://github.com/jackdishman/blockula/blob/main/docs/RUN-A-NODE.md), and the operator's reference is [docs/OPERATIONS.md](https://github.com/jackdishman/blockula/blob/main/docs/OPERATIONS.md). Launching a chain of your own: [docs/LAUNCH.md](https://github.com/jackdishman/blockula/blob/main/docs/LAUNCH.md).
+
+        **This issue is public.** Put nothing secret here: no key files, no recovery words, no private IPs you'd rather not share. A validator's p2p address is public on-chain anyway.
+  - type: dropdown
+    id: role
+    attributes:
+      label: What you run, or want to run
+      options:
+        - A full node (blockula join)
+        - A public RPC node
+        - A validator on a chain someone launched
+        - A chain of my own (blockula summon)
+    validations:
+      required: true
+  - type: dropdown
+    id: ask
+    attributes:
+      label: What you need
+      options:
+        - Help getting it running
+        - Nothing, just letting you know it runs
+        - Something else
+    validations:
+      required: true
+  - type: input
+    id: address
+    attributes:
+      label: Validator or account address
+      description: The `tboo1…` or `boo1…` address `blockula validator init` printed, if it helps.
+      placeholder: tboo1…
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`blockula --version`, or `version` from your node's `/api/status`."
+      placeholder: "blockula 0.5.2"
+  - type: input
+    id: hosting
+    attributes:
+      label: Hosting
+      description: Provider and country, or "at home". It helps us see how spread out the network is.
+      placeholder: "OVHcloud, France"
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: What you tried, what happened, and any log lines. Remove anything private first.
+      render: text
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before you send it
+      options:
+        - label: I made my own keys, and nobody else holds them.
+          required: true
+        - label: I know this issue is public.
+          required: true
