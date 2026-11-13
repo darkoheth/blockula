@@ -8,6 +8,7 @@ import { isExplorerPath, to } from "@/lib/explorer/routes";
 import { useWallet } from "@/lib/wallet";
 import { CommandPalette, openPalette } from "./CommandPalette";
 import { Alerts } from "./explorer/Alerts";
+import { Places } from "./Places";
 
 /** Which network this is, on every screen. Anything but a known mainnet is stamped as such. */
 export function NetworkBadge() {
@@ -43,10 +44,12 @@ export function Header() {
   const known = Object.values(NETWORKS).filter((n): n is Network => !!n);
   // A program's records (a hunt, a claim, a Séance) belong to Programs; every other chain page to Explore.
   const programs = /^\/(programs?|hunt|claim|seance)(\/|$)/.test(path);
-  const boos = /^\/(boos|guestbook)(\/|$)/.test(path);
+  const boos = /^\/(boos?|guestbook)(\/|$)/.test(path);
   const explore = isExplorerPath(path) && !programs && !boos;
   return (
     <>
+      {/* The served wallet sits beside its node's explorer: the same bar leads to it, and back to blockula.app. */}
+      {SERVED && <Places here="wallet" />}
       <header className="top">
         <span className="masthead">
           <Link href="/" className="brand" aria-label="Blockula wallet, home">
