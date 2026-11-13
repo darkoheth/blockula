@@ -41,8 +41,14 @@ async fn open_url(url: String) -> std::io::Result<()> {
     if status.success() { Ok(()) } else { Err(std::io::Error::other(format!("opener exited with {status}"))) }
 }
 
-pub async fn open_when_ready(bind: SocketAddr) {
+async fn try_open_when_ready<F, Fut>(bind: SocketAddr, opener: F) -> Result<(), String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>>,
+{
     let origin = origin(bind);
+    // If readiness fails, offer the explorer. Once selected, preserve the exact attempted URL.
+    let mut fallback = format!("{origin}/");
     let result = async {
         let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(2)).build()?;
@@ -54,11 +60,16 @@ pub async fn open_when_ready(bind: SocketAddr) {
         }).await?;
         // Print the chosen link even if a platform opener reports success but shows no window.
         println!("Open in your browser: {url}");
-        open_url(url).await?;
+        fallback = url.clone();
+        opener(url).await?;
         Ok::<_, anyhow::Error>(())
     }.await;
-    if let Err(error) = result {
-        eprintln!("Could not open a browser ({error}). Open {origin}/ in your browser; the node is still running.");
+    result.map_err(|error| format!("Could not open a browser ({error}). Open {fallback} in your browser; the node is still running."))
+}
+
+pub async fn open_when_ready(bind: SocketAddr) {
+    if let Err(message) = try_open_when_ready(bind, open_url).await {
+        eprintln!("{message}");
     }
 }
 
@@ -96,4 +107,32 @@ mod tests {
         assert_eq!(ready_url(&client, &origin).await, Some(format!("{origin}/")));
         server.abort();
     }
+
+    #[tokio::test]
+    async fn failed_opener_reports_the_selected_wallet_or_explorer_url() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let wallet = Arc::new(AtomicBool::new(true));
+        let app = Router::new()
+            .route("/api/health", get(|| async { StatusCode::OK }))
+            .route("/api/status", get({ let wallet = wallet.clone(); move || {
+                let wallet = wallet.clone(); async move {
+                    Json(serde_json::json!({"wallet": if wallet.load(Ordering::SeqCst) { Some("/wallet/") } else { None }}))
+                }
+            }}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (available, path) in [(true, "/wallet/"), (false, "/")] {
+            wallet.store(available, Ordering::SeqCst);
+            let expected = format!("{}{path}", origin(bind));
+            let message = try_open_when_ready(bind, |url| async move {
+                assert_eq!(url, expected);
+                Err(std::io::Error::other("headless test opener"))
+            }).await.unwrap_err();
+            assert_eq!(message, format!("Could not open a browser (headless test opener). Open {}{path} in your browser; the node is still running.", origin(bind)));
+            assert!(reqwest::Client::new().get(format!("{}/api/health", origin(bind))).send().await.unwrap().status().is_success());
+        }
+        server.abort();
+    }
+
 }
