@@ -9,9 +9,11 @@ import { Amount, Fang, Hash, Loading, NotFound, plural, Section, Stat, StatusPil
 import { Ledger } from "@/components/explorer/Ledger";
 import { RequestPay } from "@/components/explorer/RequestPay";
 import { WatchButton } from "@/components/explorer/Watch";
+import { XChip, XLinkManage, useXLink } from "@/components/explorer/XLink";
 import { blocksToHuman, keyCode } from "@/lib/format";
 import { nodeExplorer } from "@/lib/config";
 import { multisigRule, multisigShape } from "@/lib/creators";
+import { sharedHref } from "@/lib/multisig";
 import { activityCsv } from "@/lib/explorer/csv";
 import { bySigner, deltaFor, flowsOf, formatDrops, parseDrops } from "@/lib/explorer/ledger";
 import { useNode } from "@/lib/explorer/node";
@@ -47,6 +49,8 @@ export default function AccountPage() {
   if (multisig.data && !msPoll) setMsPoll(true);
   const [filter, setFilter] = useState<Filter>({ by: "all" });
   const [requesting, setRequesting] = useState(false);
+  // The X handle its newest record names (docs/X-LINKING.md): its claim, shown beside the proof post.
+  const xLink = useXLink(acct.data);
 
   if (acct.error && !acct.data) {
     // A name nobody has registered isn't an account yet; it might be yours to claim.
@@ -109,6 +113,7 @@ export default function AccountPage() {
             </span>
           )}
           {a.github && <GithubChip link={a.github} account={addr} />}
+          {xLink && <XChip link={xLink} />}
           {a.familiars.length > 0 && <span className="chip agent">{plural(a.familiars.length, "familiar")}</span>}
           {pc && pc.soul.points > 0 && <span className="chip">soul · {pc.soul.display}</span>}
           {pc?.sybil && <span className="pill failed" title={pc.sybil.reason}>flagged as a sybil</span>}
@@ -130,6 +135,7 @@ export default function AccountPage() {
                 Request
               </button>
               <Link className="btn small ghost" href="/devices">Devices &amp; agents</Link>
+              {xLink !== undefined && <XLinkManage linked={!!xLink} />}
             </>
           )}
         </div>
@@ -230,6 +236,11 @@ export default function AccountPage() {
           </Section>
 
           {ms && <MultisigActions ms={ms} address={addr} head={status.data?.height} />}
+          {ms && (
+            <Link className="small" href={sharedHref(addr)} data-testid="multisig-manage">
+              {yours ? "Propose and approve in Shared accounts →" : "One of its owners? Open it in Shared accounts →"}
+            </Link>
+          )}
 
           {!!a.locks?.length && (
             <Section title={<Term k="locked">Locked</Term>} aside={<span className="dim small">can be staked, not sent</span>}>

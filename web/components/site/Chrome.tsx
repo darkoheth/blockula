@@ -4,6 +4,7 @@ import { usePathname } from "next/navigation";
 import { MotionToggle } from "@/components/Haunt";
 import { Ornament } from "@/components/Ornament";
 import { CHAIN_GUIDE, REPO } from "@/components/Landing";
+import { X_ACCOUNT, X_URL } from "@/lib/site";
 
 export const DOCS = `${REPO}/tree/main/docs`;
 
@@ -12,7 +13,7 @@ export const DOCS = `${REPO}/tree/main/docs`;
  * wallet links: blockula.app is the project's page, and every chain's wallet is on its own node.
  */
 export function SiteHeader() {
-  // On the legal pages the sections are the home page's.
+  // On /x and the legal pages the sections are the home page's.
   const home = usePathname() === "/" ? "" : "/";
   return (
     <header className="top site-top">
@@ -27,6 +28,7 @@ export function SiteHeader() {
         <a href={`${home}#start`}>Start your own</a>
         <a href={`${home}#chains`}>Join a chain</a>
         <a href={REPO}>GitHub</a>
+        <a href={X_URL} className="site-nav-wide" rel="me" aria-label={`@${X_ACCOUNT} on X`}>X</a>
       </nav>
     </header>
   );
@@ -39,6 +41,8 @@ export function SiteFooter() {
       <span className="caps">Quantum-safe ML-DSA-65 keys · Unlocked by passkeys</span>
       <span className="site-footer-links">
         <a href={REPO}>GitHub</a>
+        <a href={X_URL} rel="me" data-testid="x-account">@{X_ACCOUNT} on X</a>
+        <a href="/x" data-testid="site-x-link">Link X</a>
         <a href={DOCS}>Docs</a>
         <a href={CHAIN_GUIDE}>Guide</a>
         <a href={`${REPO}/blob/main/CONTRIBUTING.md`}>Contributing</a>
